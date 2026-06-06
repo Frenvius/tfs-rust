@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Compiled binary copied to repo root by build.ps1
+/tfs-rust.exe
+
+# IDE / editor
+/.idea/
+/.vscode/
+
+# Logs and captured server output
+*.log
+final_boot.log
+final_err.log
+server_err.txt
+server_out.txt
+server_parity_out.txt
+server_parity_err.txt
+test_stderr.txt
+test_stdout.txt
+rust_parity_err.txt
+rust_parity_out.txt
+clippy_out.txt
+
+# Local config (keep the committed .dist)
+/config.lua
+
+# Temporary upstream XML scratch dir (see CLAUDE.md migration workflow)
+/data/legacy_xml/
