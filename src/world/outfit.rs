@@ -1,41 +1,11 @@
 use std::path::Path;
 use std::sync::OnceLock;
 
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use thiserror::Error;
 
-use crate::util::json5::{self, Json5LoadError};
-
-/// Deserialize an optional boolean that the XML→JSON5 migration may emit as a
-/// bool, an integer (1/0), or a string ("yes"/"no"/"true"/"false"/"1"/"0").
-fn de_yesno_opt<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
-    struct V;
-    impl<'de> serde::de::Visitor<'de> for V {
-        type Value = Option<bool>;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("an optional yes/no boolean")
-        }
-        fn visit_none<E>(self) -> Result<Option<bool>, E> { Ok(None) }
-        fn visit_unit<E>(self) -> Result<Option<bool>, E> { Ok(None) }
-        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Option<bool>, D2::Error> {
-            struct Inner;
-            impl serde::de::Visitor<'_> for Inner {
-                type Value = bool;
-                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    f.write_str("yes/no boolean")
-                }
-                fn visit_bool<E>(self, v: bool) -> Result<bool, E> { Ok(v) }
-                fn visit_u64<E>(self, v: u64) -> Result<bool, E> { Ok(v != 0) }
-                fn visit_i64<E>(self, v: i64) -> Result<bool, E> { Ok(v != 0) }
-                fn visit_str<E>(self, v: &str) -> Result<bool, E> {
-                    Ok(matches!(v.trim(), "1" | "yes" | "true"))
-                }
-            }
-            d.deserialize_any(Inner).map(Some)
-        }
-    }
-    deserializer.deserialize_option(V)
-}
+use crate::util::xml::{self, XmlLoadError};
+use crate::util::xml::deser::tfs_bool_opt;
 
 static G_OUTFITS: OnceLock<Outfits> = OnceLock::new();
 
@@ -82,8 +52,8 @@ pub struct Outfits {
 }
 
 impl Outfits {
-    pub fn load_from_json5(path: impl AsRef<Path>) -> Result<Self, OutfitError> {
-        let data: OutfitsJson5 = json5::load_from_path(path)?;
+    pub fn load_from_xml(path: impl AsRef<Path>) -> Result<Self, OutfitError> {
+        let data: OutfitsXml = xml::load_from_path(path)?;
         let mut outfits = [Vec::new(), Vec::new()];
 
         for entry in data.outfits {
@@ -124,28 +94,30 @@ impl Outfits {
 #[derive(Debug, Error)]
 pub enum OutfitError {
     #[error(transparent)]
-    Json5(#[from] Json5LoadError),
+    Xml(#[from] XmlLoadError),
     #[error("invalid outfit type {0}")]
     InvalidOutfitType(u8),
 }
 
 #[derive(Debug, Deserialize)]
-struct OutfitsJson5 {
-    #[serde(default)]
-    outfits: Vec<OutfitJson5>,
+struct OutfitsXml {
+    #[serde(rename = "outfit", default)]
+    outfits: Vec<OutfitXml>,
 }
 
 #[derive(Debug, Deserialize)]
-struct OutfitJson5 {
-    #[serde(default, deserialize_with = "de_yesno_opt")]
+struct OutfitXml {
+    #[serde(rename = "@enabled", default, deserialize_with = "tfs_bool_opt")]
     enabled: Option<bool>,
-    #[serde(rename = "type")]
+    #[serde(rename = "@type")]
     outfit_type: u8,
+    #[serde(rename = "@looktype")]
     looktype: u16,
+    #[serde(rename = "@name")]
     name: Option<String>,
-    #[serde(default, deserialize_with = "de_yesno_opt")]
+    #[serde(rename = "@premium", default, deserialize_with = "tfs_bool_opt")]
     premium: Option<bool>,
-    #[serde(default, deserialize_with = "de_yesno_opt")]
+    #[serde(rename = "@unlocked", default, deserialize_with = "tfs_bool_opt")]
     unlocked: Option<bool>,
 }
 
@@ -156,26 +128,24 @@ mod tests {
     use super::{Outfits, PlayerSex};
 
     #[test]
-    fn load_from_json5_should_filter_disabled_outfits() {
-        let path = std::env::temp_dir().join("tfs-rust-outfits.json5");
+    fn load_from_xml_should_filter_disabled_outfits() {
+        let path = std::env::temp_dir().join("tfs-rust-outfits.xml");
         fs::write(
             &path,
             r#"
-{
-  outfits: [
-    { type: 0, looktype: 128, name: "Citizen", premium: false },
-    { type: 1, looktype: 129, name: "Citizen", premium: false, unlocked: true },
-    { type: 0, looktype: 130, name: "Hidden", enabled: false },
-  ],
-}
+<outfits>
+    <outfit type="0" looktype="128" name="Citizen" premium="no" />
+    <outfit type="1" looktype="129" name="Citizen" premium="no" unlocked="yes" />
+    <outfit type="0" looktype="130" name="Hidden" enabled="no" />
+</outfits>
 "#,
         )
-        .expect("temp outfits json5 should be writable");
+        .expect("temp outfits xml should be writable");
 
-        let outfits = Outfits::load_from_json5(&path).expect("outfits should load");
+        let outfits = Outfits::load_from_xml(&path).expect("outfits should load");
         assert_eq!(outfits.get_outfits(PlayerSex::Female).len(), 1);
         assert!(outfits.get_outfit_by_look_type_any(129).is_some());
 
-        fs::remove_file(path).expect("temp outfits json5 should be removable");
+        fs::remove_file(path).expect("temp outfits xml should be removable");
     }
 }

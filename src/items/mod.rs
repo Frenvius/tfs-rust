@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
-use serde_json::Value;
 use thiserror::Error;
 use tracing::warn;
 
@@ -15,7 +14,7 @@ use crate::map::tile::{
     TILESTATE_FLOORCHANGE_NORTH, TILESTATE_FLOORCHANGE_SOUTH, TILESTATE_FLOORCHANGE_SOUTH_ALT,
     TILESTATE_FLOORCHANGE_WEST,
 };
-use crate::util::json5::{self, Json5LoadError};
+use crate::util::xml::{self, XmlLoadError};
 
 use std::sync::{Arc, OnceLock};
 
@@ -121,7 +120,7 @@ pub enum ItemKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ItemAttribute {
     pub key: String,
-    pub value: Value,
+    pub value: String,
     pub attributes: Vec<ItemAttribute>,
 }
 
@@ -365,9 +364,9 @@ impl Items {
         self.load_with_loader(&mut loader)
     }
 
-    pub fn load_from_json5(&mut self, path: impl AsRef<Path>) -> Result<(), ItemsError> {
-        let data: ItemsJson5 = json5::load_from_path(path)?;
-        self.apply_json5(data)
+    pub fn load_from_xml(&mut self, path: impl AsRef<Path>) -> Result<(), ItemsError> {
+        let data: ItemsXml = xml::load_from_path(path)?;
+        self.apply_xml(data)
     }
 
     pub fn major_version(&self) -> u32 {
@@ -530,10 +529,10 @@ impl Items {
         Ok(())
     }
 
-    fn apply_json5(&mut self, data: ItemsJson5) -> Result<(), ItemsError> {
+    fn apply_xml(&mut self, data: ItemsXml) -> Result<(), ItemsError> {
         for item in data.items {
             if let Some(id) = item.id {
-                self.apply_json5_item(&item, id)?;
+                self.apply_xml_item(&item, id)?;
                 continue;
             }
 
@@ -545,14 +544,14 @@ impl Items {
             };
 
             for id in from_id..=to_id {
-                self.apply_json5_item(&item, id)?;
+                self.apply_xml_item(&item, id)?;
             }
         }
 
         Ok(())
     }
 
-    fn apply_json5_item(&mut self, item: &ItemJson5, id: u16) -> Result<(), ItemsError> {
+    fn apply_xml_item(&mut self, item: &ItemXml, id: u16) -> Result<(), ItemsError> {
         if id > 0 && id < 100 {
             let item_type = self.get_item_type_mut_or_default(id);
             item_type.id = id;
@@ -568,24 +567,21 @@ impl Items {
         }
 
         let lowercase_name = item.name.as_deref().map(lowercase_string);
-        let mut attributes = item.attributes.clone().unwrap_or_default();
-        if let Some(attribute) = item.attribute.clone() {
-            attributes.insert(0, attribute);
-        }
+        let attributes = &item.attributes;
         {
             let item_type = self.get_item_type_mut_or_default(id);
             item_type.name = item.name.clone().unwrap_or_default();
             item_type.article = item.article.clone().unwrap_or_default();
             item_type.plural_name = item.plural.clone().unwrap_or_default();
 
-            for attribute in &attributes {
+            for attribute in attributes {
                 apply_item_attribute(item_type, attribute)?;
             }
             item_type.attributes =
                 attributes.iter().cloned().map(ItemAttribute::from).collect();
         }
 
-        for attribute in &attributes {
+        for attribute in attributes {
             match lowercase_string(&attribute.key).as_str() {
                 "maletransformto" | "malesleeper" => {
                     let value = parse_u16(&attribute.value)?;
@@ -653,7 +649,7 @@ pub enum ItemsError {
     #[error(transparent)]
     Otb(#[from] OtbError),
     #[error(transparent)]
-    Json5(#[from] Json5LoadError),
+    Xml(#[from] XmlLoadError),
     #[error("invalid root version block length: expected 140 bytes, got {actual}")]
     InvalidRootVersionLength { actual: usize },
     #[error("unsupported items.otb major version: {0}")]
@@ -675,7 +671,7 @@ pub enum ItemsError {
     #[error("item range starting at {from_id} is missing `toid`")]
     MissingToId { from_id: u16 },
     #[error("invalid item attribute value: {value}")]
-    InvalidAttributeValue { value: Value },
+    InvalidAttributeValue { value: String },
     #[error("unknown floorchange value: {0}")]
     UnknownFloorChange(String),
     #[error("unsigned item attribute out of range: {value}")]
@@ -768,18 +764,17 @@ fn has_bit_set(flag: u32, flags: u32) -> bool {
 
 fn apply_item_attribute(
     item_type: &mut ItemType,
-    attribute: &ItemAttributeJson5,
+    attribute: &ItemAttributeXml,
 ) -> Result<(), ItemsError> {
     let key = lowercase_string(&attribute.key);
 
     match key.as_str() {
         "type" => {
-            let value = parse_string(&attribute.value)?;
-            apply_item_kind(item_type, &value);
+            apply_item_kind(item_type, &attribute.value);
         }
-        "description" => item_type.description = parse_string(&attribute.value)?,
+        "description" => item_type.description = attribute.value.clone(),
         "weight" => item_type.weight = parse_u32(&attribute.value)?,
-        "showcount" => item_type.show_count = parse_bool(&attribute.value)?,
+        "showcount" => item_type.show_count = parse_bool(&attribute.value),
         "armor" => item_type.armor = parse_i32(&attribute.value)?,
         "defense" => item_type.defense = parse_i32(&attribute.value)?,
         "extradef" => item_type.extra_defense = parse_i32(&attribute.value)?,
@@ -791,16 +786,16 @@ fn apply_item_attribute(
             }
         }
         "rotateto" => item_type.rotate_to = parse_u16(&attribute.value)?,
-        "moveable" | "movable" => item_type.moveable = parse_bool(&attribute.value)?,
-        "blockprojectile" => item_type.block_projectile = parse_bool(&attribute.value)?,
-        "ignoreblocking" => item_type.ignore_blocking = parse_bool(&attribute.value)?,
-        "allowpickupable" | "pickupable" => item_type.pickupable = parse_bool(&attribute.value)?,
-        "forceserialize" | "forcesave" => item_type.force_serialize = parse_bool(&attribute.value)?,
+        "moveable" | "movable" => item_type.moveable = parse_bool(&attribute.value),
+        "blockprojectile" => item_type.block_projectile = parse_bool(&attribute.value),
+        "ignoreblocking" => item_type.ignore_blocking = parse_bool(&attribute.value),
+        "allowpickupable" | "pickupable" => item_type.pickupable = parse_bool(&attribute.value),
+        "forceserialize" | "forcesave" => item_type.force_serialize = parse_bool(&attribute.value),
         "floorchange" => apply_floor_change(item_type, &attribute.value)?,
         "containersize" => item_type.max_items = parse_u16(&attribute.value)?,
-        "readable" => item_type.can_read_text = parse_bool(&attribute.value)?,
+        "readable" => item_type.can_read_text = parse_bool(&attribute.value),
         "writeable" => {
-            item_type.can_write_text = parse_bool(&attribute.value)?;
+            item_type.can_write_text = parse_bool(&attribute.value);
             item_type.can_read_text = item_type.can_write_text;
         }
         "maxtextlen" => item_type.max_text_len = parse_u16(&attribute.value)?,
@@ -808,30 +803,30 @@ fn apply_item_attribute(
         "transformequipto" => item_type.transform_equip_to = parse_u16(&attribute.value)?,
         "transformdeequipto" => item_type.transform_de_equip_to = parse_u16(&attribute.value)?,
         "duration" => item_type.decay_time = parse_u32(&attribute.value)?,
-        "showduration" => item_type.show_duration = parse_bool(&attribute.value)?,
+        "showduration" => item_type.show_duration = parse_bool(&attribute.value),
         "charges" => item_type.charges = parse_u32(&attribute.value)?,
-        "showcharges" => item_type.show_charges = parse_bool(&attribute.value)?,
-        "showattributes" => item_type.show_attributes = parse_bool(&attribute.value)?,
+        "showcharges" => item_type.show_charges = parse_bool(&attribute.value),
+        "showattributes" => item_type.show_attributes = parse_bool(&attribute.value),
         "hitchance" => item_type.hit_chance = clamp_i8(parse_i32(&attribute.value)?),
         "maxhitchance" => {
             item_type.max_hit_chance = clamp_i32(parse_i32(&attribute.value)?, 0, 100)
         }
-        "replaceable" => item_type.replaceable = parse_bool(&attribute.value)?,
+        "replaceable" => item_type.replaceable = parse_bool(&attribute.value),
         "leveldoor" => item_type.level_door = parse_u32(&attribute.value)?,
         "transformto" => item_type.transform_to_free = parse_u16(&attribute.value)?,
         "partnerdirection" => {
-            item_type.bed_partner_dir = parse_direction(&parse_string(&attribute.value)?)
+            item_type.bed_partner_dir = parse_direction(&attribute.value)
         }
         "destroyto" => item_type.destroy_to = parse_u16(&attribute.value)?,
-        "walkstack" => item_type.walk_stack = parse_bool(&attribute.value)?,
-        "blocking" => item_type.block_solid = parse_bool(&attribute.value)?,
-        "allowdistread" => item_type.allow_dist_read = parse_bool(&attribute.value)?,
-        "storeitem" => item_type.store_item = parse_bool(&attribute.value)?,
+        "walkstack" => item_type.walk_stack = parse_bool(&attribute.value),
+        "blocking" => item_type.block_solid = parse_bool(&attribute.value),
+        "allowdistread" => item_type.allow_dist_read = parse_bool(&attribute.value),
+        "storeitem" => item_type.store_item = parse_bool(&attribute.value),
         "worth" => item_type.worth = parse_u64(&attribute.value)?,
-        "stopduration" => item_type.stop_time = parse_bool(&attribute.value)?,
-        "nofieldblockpath" => item_type.no_field_block_path = parse_bool(&attribute.value)?,
-        "supporthangable" => item_type.supports_hangable = parse_bool(&attribute.value)?,
-        "runespellname" => item_type.rune_spell_name = parse_string(&attribute.value)?,
+        "stopduration" => item_type.stop_time = parse_bool(&attribute.value),
+        "nofieldblockpath" => item_type.no_field_block_path = parse_bool(&attribute.value),
+        "supporthangable" => item_type.supports_hangable = parse_bool(&attribute.value),
+        "runespellname" => item_type.rune_spell_name = attribute.value.clone(),
         "runemagicallevel" | "runemagLevel" => {
             item_type.rune_mag_level = parse_i32(&attribute.value)?;
         }
@@ -867,7 +862,7 @@ fn apply_item_attribute(
             item_type.element_type = COMBAT_HOLYDAMAGE;
         }
         "wieldinfo" => item_type.wield_info = parse_u32(&attribute.value)?,
-        "vocationstring" => item_type.vocation_string = parse_string(&attribute.value)?,
+        "vocationstring" => item_type.vocation_string = attribute.value.clone(),
         "minlevel" | "minimumlevel" => item_type.min_req_level = parse_u32(&attribute.value)?,
         "minmagiclevel" | "minimummagiclevel" => item_type.min_req_magic_level = parse_u32(&attribute.value)?,
         _ => {}
@@ -909,8 +904,8 @@ fn apply_item_kind(item_type: &mut ItemType, value: &str) {
     }
 }
 
-fn apply_floor_change(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsError> {
-    let floor_change = match lowercase_string(&parse_string(value)?).as_str() {
+fn apply_floor_change(item_type: &mut ItemType, value: &str) -> Result<(), ItemsError> {
+    let floor_change = match lowercase_string(value).as_str() {
         "down" => TILESTATE_FLOORCHANGE_DOWN,
         "north" => TILESTATE_FLOORCHANGE_NORTH,
         "south" => TILESTATE_FLOORCHANGE_SOUTH,
@@ -927,86 +922,31 @@ fn apply_floor_change(item_type: &mut ItemType, value: &Value) -> Result<(), Ite
     Ok(())
 }
 
-fn parse_bool(value: &Value) -> Result<bool, ItemsError> {
-    Ok(match value {
-        Value::Bool(value) => *value,
-        Value::Number(number) => number.as_i64().unwrap_or_default() != 0,
-        Value::String(value) => boolean_string(value),
-        other => {
-            return Err(ItemsError::InvalidAttributeValue {
-                value: other.clone(),
-            })
-        }
+fn parse_bool(value: &str) -> bool {
+    boolean_string(value)
+}
+
+fn parse_u16(value: &str) -> Result<u16, ItemsError> {
+    let v = parse_u64(value)?;
+    u16::try_from(v).map_err(|_| ItemsError::AttributeOutOfRange { value: v })
+}
+
+fn parse_u32(value: &str) -> Result<u32, ItemsError> {
+    let v = parse_u64(value)?;
+    u32::try_from(v).map_err(|_| ItemsError::AttributeOutOfRange { value: v })
+}
+
+fn parse_u64(value: &str) -> Result<u64, ItemsError> {
+    value.parse::<u64>().map_err(|_| ItemsError::InvalidAttributeValue {
+        value: value.to_string(),
     })
 }
 
-fn parse_string(value: &Value) -> Result<String, ItemsError> {
-    match value {
-        Value::String(value) => Ok(value.clone()),
-        Value::Number(number) => Ok(number.to_string()),
-        Value::Bool(value) => Ok(value.to_string()),
-        other => Err(ItemsError::InvalidAttributeValue {
-            value: other.clone(),
-        }),
-    }
-}
-
-fn parse_u16(value: &Value) -> Result<u16, ItemsError> {
-    let value = parse_u64(value)?;
-    u16::try_from(value).map_err(|_| ItemsError::AttributeOutOfRange { value })
-}
-
-fn parse_u32(value: &Value) -> Result<u32, ItemsError> {
-    let value = parse_u64(value)?;
-    u32::try_from(value).map_err(|_| ItemsError::AttributeOutOfRange { value })
-}
-
-fn parse_u64(value: &Value) -> Result<u64, ItemsError> {
-    match value {
-        Value::Number(number) => number
-            .as_u64()
-            .ok_or_else(|| ItemsError::InvalidAttributeValue {
-                value: value.clone(),
-            }),
-        Value::String(value) => {
-            value
-                .parse::<u64>()
-                .map_err(|_| ItemsError::InvalidAttributeValue {
-                    value: Value::String(value.clone()),
-                })
-        }
-        other => Err(ItemsError::InvalidAttributeValue {
-            value: other.clone(),
-        }),
-    }
-}
-
-fn parse_i32(value: &Value) -> Result<i32, ItemsError> {
-    match value {
-        Value::Number(number) => {
-            if let Some(value) = number.as_i64() {
-                i32::try_from(value).map_err(|_| ItemsError::SignedAttributeOutOfRange { value })
-            } else if let Some(value) = number.as_u64() {
-                i32::try_from(value).map_err(|_| ItemsError::AttributeOutOfRange { value })
-            } else {
-                Err(ItemsError::InvalidAttributeValue {
-                    value: value.clone(),
-                })
-            }
-        }
-        Value::String(value) => {
-            let parsed = value
-                .parse::<i64>()
-                .map_err(|_| ItemsError::InvalidAttributeValue {
-                    value: Value::String(value.clone()),
-                })?;
-            i32::try_from(parsed)
-                .map_err(|_| ItemsError::SignedAttributeOutOfRange { value: parsed })
-        }
-        other => Err(ItemsError::InvalidAttributeValue {
-            value: other.clone(),
-        }),
-    }
+fn parse_i32(value: &str) -> Result<i32, ItemsError> {
+    let parsed = value.parse::<i64>().map_err(|_| ItemsError::InvalidAttributeValue {
+        value: value.to_string(),
+    })?;
+    i32::try_from(parsed).map_err(|_| ItemsError::SignedAttributeOutOfRange { value: parsed })
 }
 
 fn clamp_i8(value: i32) -> i8 {
@@ -1033,47 +973,47 @@ fn lowercase_string(value: &str) -> String {
 }
 
 
-impl From<ItemAttributeJson5> for ItemAttribute {
-    fn from(value: ItemAttributeJson5) -> Self {
+impl From<ItemAttributeXml> for ItemAttribute {
+    fn from(value: ItemAttributeXml) -> Self {
         Self {
             key: value.key,
             value: value.value,
-            attributes: value
-                .attributes
-                .unwrap_or_default()
-                .into_iter()
-                .map(ItemAttribute::from)
-                .collect(),
+            attributes: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ItemsJson5 {
-    #[serde(default)]
-    items: Vec<ItemJson5>,
+#[serde(rename = "items")]
+struct ItemsXml {
+    #[serde(rename = "item", default)]
+    items: Vec<ItemXml>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ItemJson5 {
+struct ItemXml {
+    #[serde(rename = "@id")]
     id: Option<u16>,
+    #[serde(rename = "@fromid")]
     fromid: Option<u16>,
+    #[serde(rename = "@toid")]
     toid: Option<u16>,
+    #[serde(rename = "@name")]
     name: Option<String>,
+    #[serde(rename = "@article")]
     article: Option<String>,
+    #[serde(rename = "@plural")]
     plural: Option<String>,
-    #[serde(default)]
-    attributes: Option<Vec<ItemAttributeJson5>>,
-    #[serde(default)]
-    attribute: Option<ItemAttributeJson5>,
+    #[serde(rename = "attribute", default)]
+    attributes: Vec<ItemAttributeXml>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ItemAttributeJson5 {
+struct ItemAttributeXml {
+    #[serde(rename = "@key")]
     key: String,
-    value: Value,
-    #[serde(default)]
-    attributes: Option<Vec<ItemAttributeJson5>>,
+    #[serde(rename = "@value")]
+    value: String,
 }
 
 pub const COMBAT_NONE: u8 = 0;
@@ -1103,8 +1043,8 @@ pub const SLOTP_AMMO: u16 = 1 << 9;
 pub const SLOTP_TWO_HAND: u16 = 1 << 11;
 pub const SLOTP_HAND: u16 = SLOTP_LEFT | SLOTP_RIGHT;
 
-fn apply_weapon_type(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsError> {
-    let v = lowercase_string(&parse_string(value)?);
+fn apply_weapon_type(item_type: &mut ItemType, value: &str) -> Result<(), ItemsError> {
+    let v = lowercase_string(value);
     item_type.weapon_type = match v.as_str() {
         "sword" => 1,
         "club" => 2,
@@ -1121,8 +1061,8 @@ fn apply_weapon_type(item_type: &mut ItemType, value: &Value) -> Result<(), Item
     Ok(())
 }
 
-fn apply_slot_type(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsError> {
-    let v = lowercase_string(&parse_string(value)?);
+fn apply_slot_type(item_type: &mut ItemType, value: &str) -> Result<(), ItemsError> {
+    let v = lowercase_string(value);
     match v.as_str() {
         "head" => item_type.slot_position |= SLOTP_HEAD,
         "body" => item_type.slot_position |= SLOTP_ARMOR,
@@ -1141,8 +1081,8 @@ fn apply_slot_type(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsE
     Ok(())
 }
 
-fn apply_ammo_type(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsError> {
-    let v = lowercase_string(&parse_string(value)?);
+fn apply_ammo_type(item_type: &mut ItemType, value: &str) -> Result<(), ItemsError> {
+    let v = lowercase_string(value);
     item_type.ammo_type = match v.as_str() {
         "spear" => 3,
         "bolt" => 1,
@@ -1159,8 +1099,8 @@ fn apply_ammo_type(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsE
     Ok(())
 }
 
-fn apply_corpse_type(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsError> {
-    let v = lowercase_string(&parse_string(value)?);
+fn apply_corpse_type(item_type: &mut ItemType, value: &str) -> Result<(), ItemsError> {
+    let v = lowercase_string(value);
     item_type.corpse_type = match v.as_str() {
         "venom" => 1,
         "blood" => 2,
@@ -1175,8 +1115,8 @@ fn apply_corpse_type(item_type: &mut ItemType, value: &Value) -> Result<(), Item
     Ok(())
 }
 
-fn apply_fluid_source(item_type: &mut ItemType, value: &Value) -> Result<(), ItemsError> {
-    let v = lowercase_string(&parse_string(value)?);
+fn apply_fluid_source(item_type: &mut ItemType, value: &str) -> Result<(), ItemsError> {
+    let v = lowercase_string(value);
     item_type.fluid_source = match v.as_str() {
         "water" => 1,
         "blood" => 2,
@@ -1239,14 +1179,14 @@ mod tests {
         bytes.push(0x14);
         bytes.extend_from_slice(&(2u16).to_le_bytes());
         bytes.extend_from_slice(&250u16.to_le_bytes());
-        bytes.push(0x23);
+        bytes.push(0x2A);
         bytes.extend_from_slice(&(4u16).to_le_bytes());
         bytes.extend_from_slice(&7u16.to_le_bytes());
         bytes.extend_from_slice(&215u16.to_le_bytes());
-        bytes.push(0x24);
+        bytes.push(0x2B);
         bytes.extend_from_slice(&(1u16).to_le_bytes());
         bytes.push(3);
-        bytes.push(0x26);
+        bytes.push(0x2D);
         bytes.extend_from_slice(&(2u16).to_le_bytes());
         bytes.extend_from_slice(&999u16.to_le_bytes());
         bytes.push(Node::END);
@@ -1299,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn load_from_json5_should_overlay_item_metadata_and_attributes() {
+    fn load_from_xml_should_overlay_item_metadata_and_attributes() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"OTBI");
         bytes.push(Node::START);
@@ -1328,37 +1268,27 @@ mod tests {
             .load_from_otb_bytes(bytes)
             .expect("synthetic items.otb should load");
 
-        let path = std::env::temp_dir().join("tfs-rust-items.json5");
+        let path = std::env::temp_dir().join("tfs-rust-items.xml");
         fs::write(
             &path,
-            r#"
-{
-  items: [
-    {
-      id: 100,
-      name: "Torch",
-      article: "a",
-      plural: "torches",
-      attributes: [
-        { key: "description", value: "Bright." },
-        { key: "weight", value: 2300 },
-        { key: "moveable", value: false },
-        { key: "pickupable", value: true },
-        { key: "armor", value: 1 },
-        { key: "charges", value: 7 },
-        { key: "worth", value: 50 },
-        { key: "allowdistread", value: "yes" },
-      ],
-    },
-  ],
-}
-"#,
+            r#"<items>
+    <item id="100" name="Torch" article="a" plural="torches">
+        <attribute key="description" value="Bright." />
+        <attribute key="weight" value="2300" />
+        <attribute key="moveable" value="0" />
+        <attribute key="pickupable" value="1" />
+        <attribute key="armor" value="1" />
+        <attribute key="charges" value="7" />
+        <attribute key="worth" value="50" />
+        <attribute key="allowdistread" value="yes" />
+    </item>
+</items>"#,
         )
-        .expect("temp items json5 should be writable");
+        .expect("temp items xml should be writable");
 
         items
-            .load_from_json5(&path)
-            .expect("json5 overlay should load");
+            .load_from_xml(&path)
+            .expect("xml overlay should load");
 
         let item = items.get_item_type(100);
         assert_eq!(item.name, "Torch");
@@ -1375,6 +1305,6 @@ mod tests {
         assert_eq!(items.get_item_id_by_name("torch"), Some(100));
         assert_eq!(item.attributes.len(), 8);
 
-        fs::remove_file(path).expect("temp items json5 should be removable");
+        fs::remove_file(path).expect("temp items xml should be removable");
     }
 }

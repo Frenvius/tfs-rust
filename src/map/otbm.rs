@@ -537,14 +537,7 @@ fn map_tile_flags(flags: u32) -> u32 {
 fn resolve_sidecar_path(file_name: &Path, child: &str) -> String {
     let parent = file_name.parent().unwrap_or_else(|| Path::new(""));
     let child_path = Path::new(child);
-    let normalized_child = if child_path
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
-    {
-        child_path.with_extension("json5")
-    } else {
-        child_path.to_path_buf()
-    };
+    let normalized_child = child_path.to_path_buf();
 
     parent
         .join(OsString::from(normalized_child))
@@ -645,12 +638,12 @@ mod tests {
             .spawn_file
             .as_deref()
             .unwrap_or_default()
-            .ends_with("forgotten-spawn.json5"));
+            .ends_with("forgotten-spawn.xml"));
         assert!(map
             .house_file
             .as_deref()
             .unwrap_or_default()
-            .ends_with("forgotten-house.json5"));
+            .ends_with("forgotten-house.xml"));
 
         let tile = map
             .get_tile(Position {

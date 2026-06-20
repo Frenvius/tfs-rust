@@ -90,13 +90,13 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     // Initialise Lua environment (must happen before scripts are loaded).
     crate::lua::init_lua_env().map_err(|e| anyhow!("{e}"))?;
 
-    // Load items from OTB (then optional JSON5 overlay).
+    // Load items from OTB (then optional XML overlay).
     print!(">> Loading items... ");
     let mut items = Items::new();
     items.load_from_otb("data/items/items.otb").map_err(|e| anyhow!("{e}"))?;
-    let json5_path = "data/items/items.json5";
-    if std::path::Path::new(json5_path).exists() {
-        items.load_from_json5(json5_path).map_err(|e| anyhow!("{e}"))?;
+    let xml_path = "data/items/items.xml";
+    if std::path::Path::new(xml_path).exists() {
+        items.load_from_xml(xml_path).map_err(|e| anyhow!("{e}"))?;
     }
     println!("OTB v{}.{}.{}", items.major_version(), items.minor_version(), items.build_number());
 
@@ -108,8 +108,8 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     // Load monster types.
     print!(">> Loading monsters... ");
     let mut monsters = crate::creatures::monsters::Monsters::new();
-    if std::path::Path::new("data/monster/monsters.json5").exists() {
-        monsters.load_from_json5(std::path::Path::new("data"))
+    if std::path::Path::new("data/monster/monsters.xml").exists() {
+        monsters.load_from_xml(std::path::Path::new("data"))
             .map_err(|e| anyhow!("{e}"))?;
     }
     let n_monsters = monsters.monsters.len();
@@ -138,11 +138,11 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     println!(">> Loading lua scripts");
     crate::lua::ScriptingManager::load_script_systems().map_err(|e| anyhow!("{e}"))?;
 
-    // Load vocations. (Converted JSON5 data lives under data/XML/, mirroring
-    // the C++ data/XML/*.xml layout; fall back to data/ root for either layout.)
-    let voc_path = first_existing(&["data/XML/vocations.json5", "data/vocations.json5"]);
+    // Load vocations from data/XML/, mirroring the C++ data/XML/*.xml layout;
+    // fall back to data/ root for either layout.
+    let voc_path = first_existing(&["data/XML/vocations.xml", "data/vocations.xml"]);
     if let Some(voc_path) = voc_path {
-        let vocations = crate::world::vocation::Vocations::load_from_json5(voc_path)
+        let vocations = crate::world::vocation::Vocations::load_from_xml(voc_path)
             .map_err(|e| anyhow!("{e}"))?;
         crate::world::vocation::init_vocations(vocations);
     } else {
@@ -150,9 +150,9 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     }
 
     // Load quests.
-    let quests_path = first_existing(&["data/XML/quests.json5", "data/quests.json5"]);
+    let quests_path = first_existing(&["data/XML/quests.xml", "data/quests.xml"]);
     if let Some(quests_path) = quests_path {
-        let quests = crate::world::quests::Quests::load_from_json5(quests_path)
+        let quests = crate::world::quests::Quests::load_from_xml(quests_path)
             .map_err(|e| anyhow!("{e}"))?;
         crate::world::quests::init_quests(quests);
     } else {
@@ -160,9 +160,9 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     }
 
     // Load outfits.
-    let outfit_path = first_existing(&["data/XML/outfits.json5", "data/outfits.json5"]);
+    let outfit_path = first_existing(&["data/XML/outfits.xml", "data/outfits.xml"]);
     if let Some(outfit_path) = outfit_path {
-        let outfits = crate::world::outfit::Outfits::load_from_json5(outfit_path)
+        let outfits = crate::world::outfit::Outfits::load_from_xml(outfit_path)
             .map_err(|e| anyhow!("{e}"))?;
         crate::world::outfit::init_outfits(outfits);
     } else {
@@ -223,10 +223,10 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     // Load and start spawns.
     {
         let spawn_file_name = g_config().get_string(crate::config::StringConfig::MapName).to_owned();
-        let spawn_path = format!("data/world/{spawn_file_name}-spawn.json5");
+        let spawn_path = format!("data/world/{spawn_file_name}-spawn.xml");
         if std::path::Path::new(&spawn_path).exists() {
             let mut spawns = crate::world::spawn::Spawns::new();
-            spawns.load_from_json5(std::path::Path::new(&spawn_path))
+            spawns.load_from_xml(std::path::Path::new(&spawn_path))
                 .map_err(|e| anyhow!("{e}"))?;
             let n_spawns = spawns.spawn_list.len();
             spawns.startup();

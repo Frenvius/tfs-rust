@@ -22,14 +22,19 @@ pub fn g_chat() -> &'static Mutex<Chat> {
 
 #[derive(Debug, Deserialize)]
 struct ChatChannelEntry {
+    #[serde(rename = "@id")]
     id: u16,
+    #[serde(rename = "@name")]
     name: String,
+    #[serde(rename = "@public")]
     public: Option<u16>,
+    #[serde(rename = "@script")]
     script: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ChatChannelsFile {
+struct ChatChannelsXml {
+    #[serde(rename = "channel", default)]
     channels: Vec<ChatChannelEntry>,
 }
 
@@ -220,7 +225,7 @@ impl Chat {
     }
 
     pub fn load(&mut self) -> bool {
-        let path = "data/chatchannels/chatchannels.json5";
+        let path = "data/chatchannels/chatchannels.xml";
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -229,7 +234,7 @@ impl Chat {
             }
         };
 
-        let file: ChatChannelsFile = match json5::from_str(&source) {
+        let file: ChatChannelsXml = match quick_xml::de::from_str(&source) {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("Chat::load - parse error in {path}: {e}");

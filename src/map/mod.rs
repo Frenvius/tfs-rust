@@ -90,7 +90,7 @@ impl Map {
         let mut map = otbm::load_from_path(path, items)?;
         if load_houses {
             if let Some(house_file) = map.house_file.clone() {
-                map.houses.load_from_json5(house_file)?;
+                map.houses.load_from_xml(house_file)?;
             }
         }
         Ok(map)

@@ -49,23 +49,28 @@ impl GlobalEventType {
 }
 
 // ---------------------------------------------------------------------------
-// JSON5 schema
+// XML schema
 // ---------------------------------------------------------------------------
 
-/// A single entry in `data/globalevents/globalevents.json5`.
+/// A single entry in `data/globalevents/globalevents.xml`.
 #[derive(Debug, Deserialize)]
 pub struct GlobalEventEntry {
+    #[serde(rename = "@name")]
     pub name: String,
+    #[serde(rename = "@script")]
     pub script: Option<String>,
-    #[serde(alias = "type")]
+    #[serde(rename = "@type")]
     pub event: Option<String>,
+    #[serde(rename = "@time")]
     pub time: Option<String>,
+    #[serde(rename = "@interval")]
     pub interval: Option<i64>,
 }
 
-/// Top-level document for `data/globalevents/globalevents.json5`.
+/// Top-level document for `data/globalevents/globalevents.xml`.
 #[derive(Debug, Deserialize)]
-pub struct GlobalEventsFile {
+pub struct GlobalEventsXml {
+    #[serde(rename = "globalevent", default)]
     pub globalevents: Vec<GlobalEventEntry>,
 }
 
@@ -122,22 +127,22 @@ impl GlobalEvents {
         "globalevents"
     }
 
-    /// Load `data/globalevents/globalevents.json5`. Returns `true` on success.
-    pub fn load_from_json5(&mut self) -> bool {
-        let path = "data/globalevents/globalevents.json5";
+    /// Load `data/globalevents/globalevents.xml`. Returns `true` on success.
+    pub fn load_from_xml(&mut self) -> bool {
+        let path = "data/globalevents/globalevents.xml";
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("GlobalEvents::load_from_json5 - {path} not found: {e}");
+                tracing::warn!("GlobalEvents::load_from_xml - {path} not found: {e}");
                 return false;
             }
         };
 
-        let file: GlobalEventsFile = match json5::from_str(&source) {
+        let file: GlobalEventsXml = match quick_xml::de::from_str(&source) {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!(
-                    "GlobalEvents::load_from_json5 - parse error in {path}: {e}"
+                    "GlobalEvents::load_from_xml - parse error in {path}: {e}"
                 );
                 return false;
             }
@@ -152,7 +157,7 @@ impl GlobalEvents {
                         Some(next) => (GlobalEventType::Timer, next, 0u32),
                         None => {
                             tracing::error!(
-                                "GlobalEvents::load_from_json5 - invalid time '{}' for '{}'",
+                                "GlobalEvents::load_from_xml - invalid time '{}' for '{}'",
                                 time_str,
                                 entry.name
                             );
@@ -166,7 +171,7 @@ impl GlobalEvents {
                         }
                         _ => {
                             tracing::error!(
-                                "GlobalEvents::load_from_json5 - invalid event type '{}' for '{}'",
+                                "GlobalEvents::load_from_xml - invalid event type '{}' for '{}'",
                                 type_str,
                                 entry.name
                             );
@@ -179,7 +184,7 @@ impl GlobalEvents {
                     (GlobalEventType::None, next, clamped)
                 } else {
                     tracing::error!(
-                        "GlobalEvents::load_from_json5 - no time/type/interval for '{}'",
+                        "GlobalEvents::load_from_xml - no time/type/interval for '{}'",
                         entry.name
                     );
                     continue;
@@ -205,7 +210,7 @@ impl GlobalEvents {
                             .get_event(event.event_type.script_event_name());
                         if id == -1 {
                             tracing::warn!(
-                                "GlobalEvents::load_from_json5 - {} not found in {script_path}",
+                                "GlobalEvents::load_from_xml - {} not found in {script_path}",
                                 event.event_type.script_event_name()
                             );
                             continue;
@@ -215,7 +220,7 @@ impl GlobalEvents {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "GlobalEvents::load_from_json5 - cannot load {script_path}: {e}"
+                            "GlobalEvents::load_from_xml - cannot load {script_path}: {e}"
                         );
                         continue;
                     }
@@ -224,7 +229,7 @@ impl GlobalEvents {
 
             if !self.register_event_internal(event) {
                 tracing::warn!(
-                    "GlobalEvents::load_from_json5 - duplicate globalevent: '{}'",
+                    "GlobalEvents::load_from_xml - duplicate globalevent: '{}'",
                     entry.name
                 );
             }
@@ -394,7 +399,8 @@ impl GlobalEvents {
                 None => continue,
             };
             if !self.execute_event(&event, interval) {
-                tracing::warn!("GlobalEvents::timer - event failed: {name}");
+                self.timer_map.remove(&name);
+                continue;
             }
             let next_exec_time: i64 = 86400;
             if next_exec_time < next_scheduled {
@@ -415,7 +421,7 @@ impl GlobalEvents {
         if next_scheduled == i64::MAX { 0 } else { next_scheduled }
     }
 
-    /// Retrieve a Lua function for a JSON5-loaded global event script.
+    /// Retrieve a Lua function for an XML-loaded global event script.
     pub fn get_script_function(&self, script_id: i32) -> Option<mlua::Function> {
         self.script_interface.push_function(script_id).ok()
     }

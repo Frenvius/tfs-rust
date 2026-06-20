@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::Deserialize;
-use serde_json::Value;
 use thiserror::Error;
 
-use crate::util::json5::{self, Json5LoadError};
+use crate::util::xml::XmlLoadError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
@@ -23,24 +21,33 @@ pub struct Groups {
 }
 
 impl Groups {
-    pub fn load_from_json5(path: impl AsRef<Path>) -> Result<Self, GroupsError> {
-        let data: GroupsJson5 = json5::load_from_path(path)?;
-        let mut groups = Vec::with_capacity(data.groups.len());
-
-        for entry in data.groups {
-            let mut flags = entry.base_flags.unwrap_or(0);
-            apply_flag_nodes(&mut flags, entry.flags.as_deref())?;
-
-            groups.push(Group {
-                name: entry.name,
-                flags,
-                max_depot_items: entry.maxdepotitems,
-                max_vip_entries: entry.maxvipentries,
-                id: entry.id,
-                access: entry.access,
-            });
+    pub fn load_from_xml(path: impl AsRef<Path>) -> Result<Self, GroupsError> {
+        let content = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| GroupsError::Xml(XmlLoadError::Read { path: path.as_ref().display().to_string(), source: e }))?;
+        let doc = roxmltree::Document::parse(&content)
+            .map_err(|e| GroupsError::Xml(XmlLoadError::Dom { path: path.as_ref().display().to_string(), source: e }))?;
+        let parse_flags = parse_player_flag_map();
+        let mut groups = Vec::new();
+        for node in doc.root_element().children().filter(|n| n.has_tag_name("group")) {
+            let id: u16 = node.attribute("id").unwrap_or("0").parse().unwrap_or(0);
+            let name = node.attribute("name").unwrap_or("").to_string();
+            let access = node.attribute("access").unwrap_or("0") != "0";
+            let maxdepotitems: u32 = node.attribute("maxdepotitems").unwrap_or("0").parse().unwrap_or(0);
+            let maxvipentries: u32 = node.attribute("maxvipentries").unwrap_or("0").parse().unwrap_or(0);
+            let mut flags = 0u64;
+            for flags_node in node.children().filter(|n| n.has_tag_name("flags")) {
+                for flag_node in flags_node.children().filter(|n| n.has_tag_name("flag")) {
+                    for attr in flag_node.attributes() {
+                        if attr.value() == "1" || attr.value() == "true" {
+                            if let Some(&flag_bit) = parse_flags.get(attr.name()) {
+                                flags |= flag_bit;
+                            }
+                        }
+                    }
+                }
+            }
+            groups.push(Group { name, flags, max_depot_items: maxdepotitems, max_vip_entries: maxvipentries, id, access });
         }
-
         Ok(Self { groups })
     }
 
@@ -49,7 +56,7 @@ impl Groups {
     }
 }
 
-/// Returns the `access` flag for a group_id, matching groups.xml/groups.json5.
+/// Returns the `access` flag for a group_id, matching groups.xml.
 /// Only gamemaster (4) and community manager (5) are access groups; god (6) is
 /// NOT, matching upstream. Mirrors C++ `Player::isAccessPlayer` (group->access).
 pub fn access_for_group_id(group_id: u32) -> bool {
@@ -57,7 +64,7 @@ pub fn access_for_group_id(group_id: u32) -> bool {
 }
 
 /// Returns hardcoded group flags for a given group_id, matching data/XML/groups.xml.
-/// Used when groups.json5 has not been generated yet.
+/// Used as fallback when groups.xml has not been loaded yet.
 pub fn flags_for_group_id(group_id: u32) -> u64 {
     use crate::creatures::player::*;
     match group_id {
@@ -186,52 +193,9 @@ pub fn flags_for_group_id(group_id: u32) -> u64 {
 #[derive(Debug, Error)]
 pub enum GroupsError {
     #[error(transparent)]
-    Json5(#[from] Json5LoadError),
+    Xml(#[from] XmlLoadError),
     #[error("invalid group flags payload")]
     InvalidFlagsPayload,
-}
-
-#[derive(Debug, Deserialize)]
-struct GroupsJson5 {
-    #[serde(default)]
-    groups: Vec<GroupJson5>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GroupJson5 {
-    id: u16,
-    name: String,
-    access: bool,
-    maxdepotitems: u32,
-    maxvipentries: u32,
-    #[serde(default, alias = "flagsValue")]
-    base_flags: Option<u64>,
-    #[serde(default)]
-    flags: Option<Vec<Value>>,
-}
-
-fn apply_flag_nodes(flags: &mut u64, nodes: Option<&[Value]>) -> Result<(), GroupsError> {
-    let Some(nodes) = nodes else {
-        return Ok(());
-    };
-
-    let parse_flags = parse_player_flag_map();
-    for node in nodes {
-        let Value::Object(map) = node else {
-            return Err(GroupsError::InvalidFlagsPayload);
-        };
-
-        for (name, enabled) in map {
-            if !enabled.as_bool().unwrap_or(false) {
-                continue;
-            }
-            if let Some(flag) = parse_flags.get(&name.to_ascii_lowercase()) {
-                *flags |= *flag;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn parse_player_flag_map() -> HashMap<String, u64> {
@@ -286,34 +250,26 @@ mod tests {
     use super::Groups;
 
     #[test]
-    fn load_from_json5_should_merge_numeric_and_named_flags() {
-        let path = std::env::temp_dir().join("tfs-rust-groups.json5");
+    fn load_from_xml_should_parse_named_flags() {
+        let path = std::env::temp_dir().join("tfs-rust-groups.xml");
         fs::write(
             &path,
-            r#"
-{
-  groups: [
-    {
-      id: 1,
-      name: "Tutor",
-      access: true,
-      maxdepotitems: 2000,
-      maxvipentries: 100,
-      flagsValue: 4,
-      flags: [{ canbroadcast: true, cannotbemuted: true }],
-    },
-  ],
-}
-"#,
+            r#"<groups>
+    <group id="1" name="Tutor" access="1" maxdepotitems="2000" maxvipentries="100">
+        <flags>
+            <flag canbroadcast="1" />
+            <flag cannotbemuted="1" />
+        </flags>
+    </group>
+</groups>"#,
         )
-        .expect("temp groups json5 should be writable");
+        .expect("temp groups xml should be writable");
 
-        let groups = Groups::load_from_json5(&path).expect("groups should load");
+        let groups = Groups::load_from_xml(&path).expect("groups should load");
         let group = groups.get_group(1).expect("group should exist");
-        assert_ne!(group.flags & 4, 0);
         assert_ne!(group.flags & (1 << 16), 0);
         assert_ne!(group.flags & (1u64 << 36), 0);
 
-        fs::remove_file(path).expect("temp groups json5 should be removable");
+        fs::remove_file(path).expect("temp groups xml should be removable");
     }
 }

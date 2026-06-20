@@ -119,23 +119,27 @@ impl Default for EventsInfo {
     }
 }
 
-/// JSON5 schema for a single entry in `data/events/events.json5`.
+/// XML schema for a single entry in `data/events/events.xml`.
 #[derive(Debug, serde::Deserialize)]
 struct EventEntry {
+    #[serde(rename = "@class")]
     pub class: String,
+    #[serde(rename = "@method")]
     pub method: String,
-    pub enabled: Option<bool>,
+    #[serde(rename = "@enabled")]
+    pub enabled: Option<u8>,
 }
 
-/// JSON5 schema for the top-level `data/events/events.json5` document.
+/// XML schema for the top-level `data/events/events.xml` document.
 #[derive(Debug, serde::Deserialize)]
-struct EventsFile {
+struct EventsXml {
+    #[serde(rename = "event", default)]
     pub events: Vec<EventEntry>,
 }
 
 /// Mirrors the `Events` class from `events.h / events.cpp`.
 ///
-/// Loads `data/events/events.json5`, maps each enabled entry to a Lua
+/// Loads `data/events/events.xml`, maps each enabled entry to a Lua
 /// function via `get_meta_event`, and stores the resulting script IDs in
 /// `EventsInfo`.
 pub struct Events {
@@ -156,10 +160,10 @@ impl Events {
         }
     }
 
-    /// Load `data/events/events.json5`. Returns `true` on success.
+    /// Load `data/events/events.xml`. Returns `true` on success.
     /// Mirrors `Events::load()`.
     pub fn load(&mut self) -> bool {
-        let path = "data/events/events.json5";
+        let path = "data/events/events.xml";
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -168,7 +172,7 @@ impl Events {
             }
         };
 
-        let file: EventsFile = match json5::from_str(&source) {
+        let file: EventsXml = match quick_xml::de::from_str(&source) {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("Events::load - parse error in {path}: {e}");
@@ -182,7 +186,7 @@ impl Events {
             std::collections::HashSet::new();
 
         for entry in file.events {
-            if !entry.enabled.unwrap_or(true) {
+            if entry.enabled.unwrap_or(1) == 0 {
                 continue;
             }
 

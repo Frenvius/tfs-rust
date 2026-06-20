@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
 
 use crate::lua::script::LuaScriptInterface;
 use crate::map::Position;
@@ -25,7 +24,7 @@ pub enum MoveEventType {
 }
 
 impl MoveEventType {
-    /// Parse the event type string as used in JSON5 / XML.
+    /// Parse the event type string from XML.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
@@ -53,61 +52,62 @@ impl MoveEventType {
 }
 
 // ---------------------------------------------------------------------------
-// JSON5 schema
+// XML schema
 // ---------------------------------------------------------------------------
 
 /// Position sub-object in a movement entry.
 #[derive(Debug, Deserialize)]
 pub struct MoveEventPosEntry {
+    #[serde(rename = "@x")]
     pub x: u16,
+    #[serde(rename = "@y")]
     pub y: u16,
+    #[serde(rename = "@z")]
     pub z: u8,
 }
 
-/// A single entry in `data/movements/movements.json5`. Mirrors a
-/// `<movevent>` XML node.
+/// A single entry in `data/movements/movements.xml`. Mirrors a `<movevent>` node.
 #[derive(Debug, Deserialize)]
 pub struct MoveEventEntry {
+    #[serde(rename = "@script")]
     pub script: Option<String>,
+    #[serde(rename = "@event")]
     pub event: Option<String>,
-    #[serde(rename = "itemid")]
-    pub item_id: Option<JsonValue>,
-    #[serde(rename = "fromid")]
+    #[serde(rename = "@itemid")]
+    pub item_id: Option<String>,
+    #[serde(rename = "@fromid")]
     pub from_id: Option<u32>,
-    #[serde(rename = "toid")]
+    #[serde(rename = "@toid")]
     pub to_id: Option<u32>,
-    #[serde(rename = "uniqueid")]
-    pub unique_id: Option<JsonValue>,
-    #[serde(rename = "fromuid")]
+    #[serde(rename = "@uniqueid")]
+    pub unique_id: Option<String>,
+    #[serde(rename = "@fromuid")]
     pub from_uid: Option<u32>,
-    #[serde(rename = "touid")]
+    #[serde(rename = "@touid")]
     pub to_uid: Option<u32>,
-    #[serde(rename = "actionid")]
-    pub action_id: Option<JsonValue>,
-    #[serde(rename = "fromaid")]
+    #[serde(rename = "@actionid")]
+    pub action_id: Option<String>,
+    #[serde(rename = "@fromaid")]
     pub from_aid: Option<u32>,
-    #[serde(rename = "toaid")]
+    #[serde(rename = "@toaid")]
     pub to_aid: Option<u32>,
     pub pos: Option<MoveEventPosEntry>,
+    #[serde(rename = "@slot")]
     pub slot: Option<String>,
+    #[serde(rename = "@level")]
     pub level: Option<u32>,
-    #[serde(rename = "maglevel")]
+    #[serde(rename = "@maglevel")]
     pub mag_level: Option<u32>,
-    #[serde(default, deserialize_with = "crate::util::json5::deserialize_bool_or_int")]
-    pub premium: Option<bool>,
-    #[serde(default, deserialize_with = "crate::util::json5::deserialize_bool_or_int")]
-    pub tileitem: Option<bool>,
+    #[serde(rename = "@premium")]
+    pub premium: Option<u8>,
+    #[serde(rename = "@tileitem")]
+    pub tileitem: Option<u8>,
 }
 
-/// Wrapper for the nested JSON5 structure.
+/// Top-level document for `data/movements/movements.xml`.
 #[derive(Debug, Deserialize)]
-struct MoveEventsWrapper {
-    movements: MoveEventsFile,
-}
-
-/// Inner document for `data/movements/movements.json5`.
-#[derive(Debug, Deserialize)]
-pub struct MoveEventsFile {
+pub struct MoveEventsXml {
+    #[serde(rename = "movevent", default)]
     pub movevents: Vec<MoveEventEntry>,
 }
 
@@ -258,32 +258,31 @@ impl MoveEvents {
         "movements"
     }
 
-    /// Load `data/movements/movements.json5`. Returns `true` on success.
-    pub fn load_from_json5(&mut self) -> bool {
-        let path = "data/movements/movements.json5";
+    /// Load `data/movements/movements.xml`. Returns `true` on success.
+    pub fn load_from_xml(&mut self) -> bool {
+        let path = "data/movements/movements.xml";
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("MoveEvents::load_from_json5 - {path} not found: {e}");
+                tracing::warn!("MoveEvents::load_from_xml - {path} not found: {e}");
                 return false;
             }
         };
 
-        let wrapper: MoveEventsWrapper = match json5::from_str(&source) {
+        let file: MoveEventsXml = match quick_xml::de::from_str(&source) {
             Ok(f) => f,
             Err(e) => {
-                tracing::error!("MoveEvents::load_from_json5 - parse error in {path}: {e}");
+                tracing::error!("MoveEvents::load_from_xml - parse error in {path}: {e}");
                 return false;
             }
         };
-        let file = wrapper.movements;
 
         for entry in file.movevents {
             let event_type = match entry.event.as_deref().and_then(MoveEventType::from_str) {
                 Some(t) => t,
                 None => {
                     tracing::warn!(
-                        "MoveEvents::load_from_json5 - missing or unknown event type"
+                        "MoveEvents::load_from_xml - missing or unknown event type"
                     );
                     continue;
                 }
@@ -293,8 +292,8 @@ impl MoveEvents {
                 event_type,
                 req_level: entry.level.unwrap_or(0),
                 req_mag_level: entry.mag_level.unwrap_or(0),
-                premium: entry.premium.unwrap_or(false),
-                tile_item: entry.tileitem.unwrap_or(false),
+                premium: entry.premium.unwrap_or(0) != 0,
+                tile_item: entry.tileitem.unwrap_or(0) != 0,
                 ..Default::default()
             };
 
@@ -322,7 +321,7 @@ impl MoveEvents {
                             .get_event(event.event_type.script_event_name());
                         if id == -1 {
                             tracing::warn!(
-                                "MoveEvents::load_from_json5 - {} not found in {script_path}",
+                                "MoveEvents::load_from_xml - {} not found in {script_path}",
                                 event.event_type.script_event_name()
                             );
                             continue;
@@ -332,7 +331,7 @@ impl MoveEvents {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "MoveEvents::load_from_json5 - cannot load {script_path}: {e}"
+                            "MoveEvents::load_from_xml - cannot load {script_path}: {e}"
                         );
                         continue;
                     }
@@ -385,7 +384,7 @@ impl MoveEvents {
                 self.position_map.entry(key).or_default().add(event.clone());
             } else {
                 tracing::warn!(
-                    "MoveEvents::load_from_json5 - entry has no id/uid/aid/pos"
+                    "MoveEvents::load_from_xml - entry has no id/uid/aid/pos"
                 );
             }
         }
@@ -566,27 +565,15 @@ impl Default for MoveEvents {
 // ---------------------------------------------------------------------------
 
 fn collect_u32_ids(
-    value: &Option<JsonValue>,
+    value: &Option<String>,
     from: Option<u32>,
     to: Option<u32>,
 ) -> Vec<u32> {
     let mut ids: Vec<u32> = Vec::new();
 
-    if let Some(v) = value {
-        match v {
-            JsonValue::Number(n) => {
-                if let Some(id) = n.as_u64().and_then(|n| u32::try_from(n).ok()) {
-                    ids.push(id);
-                }
-            }
-            JsonValue::Array(arr) => {
-                for item in arr {
-                    if let Some(id) = item.as_u64().and_then(|n| u32::try_from(n).ok()) {
-                        ids.push(id);
-                    }
-                }
-            }
-            _ => {}
+    if let Some(s) = value {
+        if let Ok(id) = s.trim().parse::<u32>() {
+            ids.push(id);
         }
     }
 

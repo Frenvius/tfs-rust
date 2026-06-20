@@ -27,7 +27,7 @@ pub enum CreatureEventType {
 }
 
 impl CreatureEventType {
-    /// Parse the event type string from JSON5 / XML.
+    /// Parse the event type string from XML.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
@@ -66,27 +66,24 @@ impl CreatureEventType {
 }
 
 // ---------------------------------------------------------------------------
-// JSON5 schema
+// XML schema
 // ---------------------------------------------------------------------------
 
-/// A single entry in `data/creaturescripts/creaturescripts.json5`.
+/// A single entry in `data/creaturescripts/creaturescripts.xml`.
 #[derive(Debug, Deserialize)]
 pub struct CreatureScriptEntry {
+    #[serde(rename = "@name")]
     pub name: String,
-    #[serde(alias = "type")]
+    #[serde(rename = "@type")]
     pub event: Option<String>,
+    #[serde(rename = "@script")]
     pub script: Option<String>,
 }
 
-/// Top-level wrapper for `data/creaturescripts/creaturescripts.json5`.
+/// Top-level document for `data/creaturescripts/creaturescripts.xml`.
 #[derive(Debug, Deserialize)]
-pub struct CreatureScriptsWrapper {
-    pub creaturescripts: CreatureScriptsFile,
-}
-
-/// Inner file with the events array.
-#[derive(Debug, Deserialize)]
-pub struct CreatureScriptsFile {
+pub struct CreatureScriptsXml {
+    #[serde(rename = "event", default)]
     pub events: Vec<CreatureScriptEntry>,
 }
 
@@ -152,34 +149,33 @@ impl CreatureEvents {
         "creaturescripts"
     }
 
-    /// Load `data/creaturescripts/creaturescripts.json5`. Returns `true` on
-    /// success.
-    pub fn load_from_json5(&mut self) -> bool {
-        let path = "data/creaturescripts/creaturescripts.json5";
+    /// Load `data/creaturescripts/creaturescripts.xml`. Returns `true` on success.
+    pub fn load_from_xml(&mut self) -> bool {
+        let path = "data/creaturescripts/creaturescripts.xml";
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("CreatureEvents::load_from_json5 - {path} not found: {e}");
+                tracing::warn!("CreatureEvents::load_from_xml - {path} not found: {e}");
                 return false;
             }
         };
 
-        let wrapper: CreatureScriptsWrapper = match json5::from_str(&source) {
+        let file: CreatureScriptsXml = match quick_xml::de::from_str(&source) {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!(
-                    "CreatureEvents::load_from_json5 - parse error in {path}: {e}"
+                    "CreatureEvents::load_from_xml - parse error in {path}: {e}"
                 );
                 return false;
             }
         };
 
-        for entry in wrapper.creaturescripts.events {
+        for entry in file.events {
             let event_str = match &entry.event {
                 Some(s) => s.as_str(),
                 None => {
                     tracing::warn!(
-                        "CreatureEvents::load_from_json5 - missing event type for '{}'",
+                        "CreatureEvents::load_from_xml - missing event type for '{}'",
                         entry.name
                     );
                     continue;
@@ -189,7 +185,7 @@ impl CreatureEvents {
                 Some(t) => t,
                 None => {
                     tracing::warn!(
-                        "CreatureEvents::load_from_json5 - unknown event type '{}' for '{}'",
+                        "CreatureEvents::load_from_xml - unknown event type '{}' for '{}'",
                         event_str,
                         entry.name
                     );
@@ -199,7 +195,7 @@ impl CreatureEvents {
 
             if event_type == CreatureEventType::None {
                 tracing::warn!(
-                    "CreatureEvents::load_from_json5 - event type None for '{}'",
+                    "CreatureEvents::load_from_xml - event type None for '{}'",
                     entry.name
                 );
                 continue;
@@ -224,7 +220,7 @@ impl CreatureEvents {
                             .get_event(event.event_type.script_event_name());
                         if id == -1 {
                             tracing::warn!(
-                                "CreatureEvents::load_from_json5 - {} not found in {script_path}",
+                                "CreatureEvents::load_from_xml - {} not found in {script_path}",
                                 event.event_type.script_event_name()
                             );
                             continue;
@@ -234,7 +230,7 @@ impl CreatureEvents {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "CreatureEvents::load_from_json5 - cannot load {script_path}: {e}"
+                            "CreatureEvents::load_from_xml - cannot load {script_path}: {e}"
                         );
                         continue;
                     }
@@ -312,7 +308,7 @@ impl CreatureEvents {
     }
 
     /// Retrieve a Lua function for a script ID stored in this interface's event table.
-    /// Used by dispatch functions for JSON5-loaded creature events.
+    /// Used by dispatch functions for XML-loaded creature events.
     pub fn get_script_function(&self, script_id: i32) -> Option<mlua::Function> {
         self.script_interface.push_function(script_id).ok()
     }

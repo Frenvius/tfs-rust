@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::{thread_rng, Rng};
 
-pub mod json5;
+pub mod xml;
 pub mod wildcard;
 
 pub fn adler_checksum(data: &[u8]) -> u32 {

@@ -4,7 +4,7 @@ use std::path::Path;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::util::json5::{self, Json5LoadError};
+use crate::util::xml::{self, XmlLoadError};
 
 use super::Position;
 
@@ -438,10 +438,10 @@ impl Houses {
         &self.houses
     }
 
-    pub fn load_from_json5(&mut self, path: impl AsRef<Path>) -> Result<(), HouseLoadError> {
-        let data: HousesJson5 = json5::load_from_path(path)?;
+    pub fn load_from_xml(&mut self, path: impl AsRef<Path>) -> Result<(), HouseLoadError> {
+        let data: HousesXml = xml::load_from_path(path)?;
 
-        for house in data.houses {
+        for house in data.house {
             let existing = self
                 .get_house_mut(house.houseid)
                 .ok_or(HouseLoadError::UnknownHouseId(house.houseid))?;
@@ -474,24 +474,34 @@ impl Houses {
 #[derive(Debug, Error)]
 pub enum HouseLoadError {
     #[error(transparent)]
-    Json5(#[from] Json5LoadError),
+    Xml(#[from] XmlLoadError),
     #[error("unknown house id {0}")]
     UnknownHouseId(u32),
 }
 
 #[derive(Debug, Deserialize)]
-struct HousesJson5 {
-    #[serde(default)]
-    houses: Vec<HouseJson5>,
+struct HousesXml {
+    #[serde(rename = "house", default)]
+    house: Vec<HouseXml>,
 }
 
 #[derive(Debug, Deserialize)]
-struct HouseJson5 {
+#[allow(dead_code)]
+struct HouseXml {
+    #[serde(rename = "@houseid")]
     houseid: u32,
+    #[serde(rename = "@name")]
     name: String,
+    #[serde(rename = "@entryx")]
     entryx: u16,
+    #[serde(rename = "@entryy")]
     entryy: u16,
+    #[serde(rename = "@entryz")]
     entryz: u8,
+    #[serde(rename = "@rent")]
     rent: u32,
+    #[serde(rename = "@townid")]
     townid: u32,
+    #[serde(rename = "@size")]
+    size: Option<u16>,
 }
