@@ -122,6 +122,7 @@ pub fn broadcast_creature_teleport_pub(creature_id: CreatureId, old_pos: Positio
 /// Mirrors C++ `ProtocolGame::sendMoveCreature(..., teleport=true)` for the
 /// player == creature case.
 pub fn send_teleport_map_to_player(creature_id: CreatureId, old_pos: Position, old_stackpos: u8, new_pos: Position) {
+    let game = crate::game::g_game().lock().unwrap();
     let sessions = player_sessions().lock().unwrap();
     let Some(session) = sessions.get(&creature_id) else { return };
     let mut known = session.known_creatures.lock().unwrap();
@@ -129,19 +130,16 @@ pub fn send_teleport_map_to_player(creature_id: CreatureId, old_pos: Position, o
     let mut output = OutputMessage::new();
     write_remove_tile_creature(&mut output, old_pos, old_stackpos, creature_id);
 
-    {
-        let game = crate::game::g_game().lock().unwrap();
-        if let Some(player) = game.get_player(creature_id) {
-            write_map_description(
-                &mut output,
-                &game,
-                game.get_items(),
-                new_pos,
-                &mut known,
-                creature_id,
-                player,
-            );
-        }
+    if let Some(player) = game.get_player(creature_id) {
+        write_map_description(
+            &mut output,
+            &game,
+            game.get_items(),
+            new_pos,
+            &mut known,
+            creature_id,
+            player,
+        );
     }
 
     finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
@@ -1883,7 +1881,6 @@ impl ProtocolGame {
         let mut game = g_game().lock().unwrap();
         let from_spectators = game.map.get_spectators(from_pos, true, true, 0, 0, 0, 0);
         let to_spectators = game.map.get_spectators(to_pos, true, true, 0, 0, 0, 0);
-        drop(game);
 
         let sessions = player_sessions().lock().unwrap();
 
@@ -1898,7 +1895,6 @@ impl ProtocolGame {
             return;
         }
 
-        let game = g_game().lock().unwrap();
         for &spec_id in &to_spectators {
             let Some(session) = sessions.get(&spec_id) else { continue };
             let to_tile = game.map.get_tile(to_pos);
@@ -4254,9 +4250,9 @@ fn execute_auto_walk_step(creature_id: CreatureId) {
     }
 
     {
+        let game = g_game().lock().unwrap();
         let sessions = player_sessions().lock().unwrap();
         if let Some(session) = sessions.get(&creature_id) {
-            let game = g_game().lock().unwrap();
             let mut known = session.known_creatures.lock().unwrap();
 
             let mut output = OutputMessage::new();
@@ -4267,7 +4263,6 @@ fn execute_auto_walk_step(creature_id: CreatureId) {
                 write_creature_movement(&mut output, old_pos, new_pos, stackpos, creature_id);
             }
             append_walk_map_slices(&mut output, &game, game.get_items(), &mut known, old_pos, new_pos);
-            drop(game);
             finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
         }
     }
@@ -4287,9 +4282,9 @@ fn execute_auto_walk_step(creature_id: CreatureId) {
 }
 
 fn send_cancel_walk_to_session(creature_id: CreatureId) {
+    let game = g_game().lock().unwrap();
     let sessions = player_sessions().lock().unwrap();
     if let Some(session) = sessions.get(&creature_id) {
-        let game = g_game().lock().unwrap();
         let dir_byte = game.get_player(creature_id)
             .map(|p| p.base.direction as u8)
             .unwrap_or(2);
@@ -5364,10 +5359,10 @@ fn finalize_and_send(output: &mut OutputMessage, round_keys: &RoundKeys, checksu
 }
 
 pub(crate) fn broadcast_creature_move(mover_id: CreatureId, old_pos: Position, new_pos: Position, old_stackpos: u8) {
+    let mut game = g_game().lock().unwrap();
     let spectator_data: Vec<(CreatureId, Position)>;
     let new_stackpos: i32;
     {
-        let mut game = g_game().lock().unwrap();
         let old_specs = game.map.get_spectators(old_pos, true, true, 0, 0, 0, 0);
         let new_specs = game.map.get_spectators(new_pos, true, true, 0, 0, 0, 0);
         let mut seen = HashSet::new();
@@ -5403,7 +5398,6 @@ pub(crate) fn broadcast_creature_move(mover_id: CreatureId, old_pos: Position, n
             if teleport {
                 write_remove_tile_creature(&mut output, old_pos, old_stackpos, mover_id);
                 if (0..10).contains(&new_stackpos) {
-                    let game = g_game().lock().unwrap();
                     write_add_creature_packet(&mut output, mover_id, new_pos, new_stackpos as u8, &mut session.known_creatures.lock().unwrap(), &game);
                 }
             } else {
@@ -5417,9 +5411,7 @@ pub(crate) fn broadcast_creature_move(mover_id: CreatureId, old_pos: Position, n
             finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
         } else if can_see_new && (0..10).contains(&new_stackpos) {
             let mut output = OutputMessage::new();
-            let game = g_game().lock().unwrap();
             write_add_creature_packet(&mut output, mover_id, new_pos, new_stackpos as u8, &mut session.known_creatures.lock().unwrap(), &game);
-            drop(game);
             finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
         }
     }
@@ -5608,33 +5600,30 @@ pub(crate) fn broadcast_channel_message(channel_id: u16, name: &str, level: u16,
 }
 
 pub(crate) fn broadcast_creature_appear(creature_id: CreatureId, pos: Position) {
-    let spectator_ids: Vec<CreatureId>;
-    {
-        let mut game = g_game().lock().unwrap();
-        spectator_ids = game.map.get_spectators(pos, true, true, 0, 0, 0, 0)
-            .into_iter()
-            .filter(|&id| id != creature_id)
-            .collect();
-    }
+    let mut game = g_game().lock().unwrap();
+    let spectator_ids: Vec<CreatureId> = game.map.get_spectators(pos, true, true, 0, 0, 0, 0)
+        .into_iter()
+        .filter(|&id| id != creature_id)
+        .collect();
 
     if spectator_ids.is_empty() {
+        return;
+    }
+
+    let stackpos = game.map.get_tile(pos)
+        .map(|t| t.get_client_index_of_creature(creature_id))
+        .unwrap_or(-1);
+    if !(0..10).contains(&stackpos) {
         return;
     }
 
     let mut sessions = player_sessions().lock().unwrap();
     for spec_id in spectator_ids {
         let Some(session) = sessions.get_mut(&spec_id) else { continue };
-        let game = g_game().lock().unwrap();
-        let stackpos = game.map.get_tile(pos)
-            .map(|t| t.get_client_index_of_creature(creature_id))
-            .unwrap_or(-1);
-        if (0..10).contains(&stackpos) {
-            let mut output = OutputMessage::new();
-            write_add_creature_packet(&mut output, creature_id, pos, stackpos as u8, &mut session.known_creatures.lock().unwrap(), &game);
-            write_magic_effect(&mut output, pos, 0x0A); // CONST_ME_TELEPORT
-            drop(game);
-            finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
-        }
+        let mut output = OutputMessage::new();
+        write_add_creature_packet(&mut output, creature_id, pos, stackpos as u8, &mut session.known_creatures.lock().unwrap(), &game);
+        write_magic_effect(&mut output, pos, 0x0A); // CONST_ME_TELEPORT
+        finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
     }
 }
 
@@ -5663,10 +5652,10 @@ fn broadcast_creature_disappear(creature_id: CreatureId, pos: Position, stackpos
 }
 
 fn broadcast_creature_teleport(creature_id: CreatureId, old_pos: Position, old_stackpos: u8, new_pos: Position) {
+    let mut game = g_game().lock().unwrap();
     let spectator_data: Vec<(CreatureId, Position)>;
     let new_stackpos: i32;
     {
-        let mut game = g_game().lock().unwrap();
         let old_specs = game.map.get_spectators(old_pos, true, true, 0, 0, 0, 0);
         let new_specs = game.map.get_spectators(new_pos, true, true, 0, 0, 0, 0);
         let mut seen = HashSet::new();
@@ -5700,7 +5689,6 @@ fn broadcast_creature_teleport(creature_id: CreatureId, old_pos: Position, old_s
             let mut output = OutputMessage::new();
             write_remove_tile_creature(&mut output, old_pos, old_stackpos, creature_id);
             if (0..10).contains(&new_stackpos) {
-                let game = g_game().lock().unwrap();
                 write_add_creature_packet(&mut output, creature_id, new_pos, new_stackpos as u8, &mut session.known_creatures.lock().unwrap(), &game);
             }
             finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
@@ -5710,9 +5698,7 @@ fn broadcast_creature_teleport(creature_id: CreatureId, old_pos: Position, old_s
             finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
         } else if can_see_new && (0..10).contains(&new_stackpos) {
             let mut output = OutputMessage::new();
-            let game = g_game().lock().unwrap();
             write_add_creature_packet(&mut output, creature_id, new_pos, new_stackpos as u8, &mut session.known_creatures.lock().unwrap(), &game);
-            drop(game);
             write_magic_effect(&mut output, new_pos, 0x0A);
             finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
         }
