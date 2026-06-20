@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::util::json5::{self, Json5LoadError};
+use crate::util::xml::{self, XmlLoadError};
 
 static G_QUESTS: OnceLock<Quests> = OnceLock::new();
 
@@ -45,8 +45,8 @@ pub struct Quests {
 }
 
 impl Quests {
-    pub fn load_from_json5(path: impl AsRef<Path>) -> Result<Self, QuestError> {
-        let data: QuestsJson5 = json5::load_from_path(path)?;
+    pub fn load_from_xml(path: impl AsRef<Path>) -> Result<Self, QuestError> {
+        let data: QuestsXml = xml::load_from_path(path)?;
         let mut quests = Vec::with_capacity(data.quests.len());
 
         for (index, quest) in data.quests.into_iter().enumerate() {
@@ -57,18 +57,20 @@ impl Quests {
                 start_storage_value: quest.startstoragevalue,
                 missions: quest
                     .missions
-                    .unwrap_or_default()
                     .into_iter()
                     .map(|mission| Mission {
                         name: mission.name,
                         storage_id: mission.storageid as u32,
                         start_value: mission.startvalue,
                         end_value: mission.endvalue,
-                        ignore_end_value: mission.ignoreendvalue.unwrap_or(false),
+                        ignore_end_value: mission
+                            .ignoreendvalue
+                            .as_deref()
+                            .map(|s| matches!(s.trim(), "1" | "true" | "yes" | "TRUE" | "YES" | "True" | "Yes"))
+                            .unwrap_or(false),
                         main_description: mission.description.unwrap_or_default(),
                         descriptions: mission
                             .missionstates
-                            .unwrap_or_default()
                             .into_iter()
                             .map(|state| (state.id, state.description))
                             .collect(),
@@ -161,37 +163,50 @@ impl Mission {
 #[derive(Debug, Error)]
 pub enum QuestError {
     #[error(transparent)]
-    Json5(#[from] Json5LoadError),
+    Xml(#[from] XmlLoadError),
 }
 
 #[derive(Debug, Deserialize)]
-struct QuestsJson5 {
-    #[serde(default)]
-    quests: Vec<QuestJson5>,
+struct QuestsXml {
+    #[serde(rename = "quest", default)]
+    quests: Vec<QuestXml>,
 }
 
 #[derive(Debug, Deserialize)]
-struct QuestJson5 {
+struct QuestXml {
+    #[serde(rename = "@name")]
     name: String,
+    #[serde(rename = "@startstorageid")]
     startstorageid: i32,
+    #[serde(rename = "@startstoragevalue")]
     startstoragevalue: i32,
-    missions: Option<Vec<MissionJson5>>,
+    #[serde(rename = "mission", default)]
+    missions: Vec<MissionXml>,
 }
 
 #[derive(Debug, Deserialize)]
-struct MissionJson5 {
+struct MissionXml {
+    #[serde(rename = "@name")]
     name: String,
+    #[serde(rename = "@storageid")]
     storageid: i32,
+    #[serde(rename = "@startvalue")]
     startvalue: i32,
+    #[serde(rename = "@endvalue")]
     endvalue: i32,
-    ignoreendvalue: Option<bool>,
+    #[serde(rename = "@ignoreendvalue")]
+    ignoreendvalue: Option<String>,
+    #[serde(rename = "@description")]
     description: Option<String>,
-    missionstates: Option<Vec<MissionStateJson5>>,
+    #[serde(rename = "missionstate", default)]
+    missionstates: Vec<MissionStateXml>,
 }
 
 #[derive(Debug, Deserialize)]
-struct MissionStateJson5 {
+struct MissionStateXml {
+    #[serde(rename = "@id")]
     id: i32,
+    #[serde(rename = "@description")]
     description: String,
 }
 
@@ -202,34 +217,23 @@ mod tests {
     use super::Quests;
 
     #[test]
-    fn load_from_json5_should_build_quest_ids_and_storage_checks() {
-        let path = std::env::temp_dir().join("tfs-rust-quests.json5");
+    fn load_from_xml_should_build_quest_ids_and_storage_checks() {
+        let path = std::env::temp_dir().join("tfs-rust-quests.xml");
         fs::write(
             &path,
-            r#"
-{
-  quests: [
-    {
-      name: "The Rookie Guard",
-      startstorageid: 100,
-      startstoragevalue: 1,
-      missions: [
-        {
-          name: "Speak",
-          storageid: 101,
-          startvalue: 1,
-          endvalue: 3,
-          missionstates: [{ id: 1, description: "Hello" }],
-        },
-      ],
-    },
-  ],
-}
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<quests>
+  <quest name="The Rookie Guard" startstorageid="100" startstoragevalue="1">
+    <mission name="Speak" storageid="101" startvalue="1" endvalue="3">
+      <missionstate id="1" description="Hello" />
+    </mission>
+  </quest>
+</quests>
 "#,
         )
-        .expect("temp quests json5 should be writable");
+        .expect("temp quests xml should be writable");
 
-        let quests = Quests::load_from_json5(&path).expect("quests should load");
+        let quests = Quests::load_from_xml(&path).expect("quests should load");
         assert_eq!(
             quests.get_quest_by_id(1).map(|quest| quest.name.as_str()),
             Some("The Rookie Guard")
@@ -237,6 +241,6 @@ mod tests {
         assert!(quests.is_quest_storage(100, 1, 0));
         assert!(quests.is_quest_storage(101, 2, 0));
 
-        fs::remove_file(path).expect("temp quests json5 should be removable");
+        fs::remove_file(path).expect("temp quests xml should be removable");
     }
 }

@@ -396,7 +396,7 @@ impl Monsters {
 
     pub fn reload(&mut self) -> bool {
         self.loaded = false;
-        self.load_from_json5(std::path::Path::new("data")).is_ok()
+        self.load_from_xml(std::path::Path::new("data")).is_ok()
     }
 
     /// deserialize_spell — port of Monsters::deserializeSpell(MonsterSpell*, spellBlock_t&) from monsters.cpp.
@@ -410,72 +410,94 @@ impl Monsters {
         false
     }
 
-    pub fn load_from_json5(&mut self, data_dir: &Path) -> Result<(), anyhow::Error> {
+    pub fn load_from_xml(&mut self, data_dir: &Path) -> Result<(), anyhow::Error> {
         self.unloaded_monsters.clear();
-        let monsters_file = data_dir.join("monster").join("monsters.json5");
+        let monsters_file = data_dir.join("monster").join("monsters.xml");
 
         let content = std::fs::read_to_string(&monsters_file)
             .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", monsters_file, e))?;
 
-        let index: serde_json::Value = json5::from_str(&content)
+        let doc = roxmltree::Document::parse(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse {:?}: {}", monsters_file, e))?;
 
-        let entries = index["monsters"].as_array().cloned().unwrap_or_default();
+        let root = doc.root_element();
         let mut loaded = 0usize;
 
-        for entry in &entries {
-            let name = entry["name"].as_str().unwrap_or("").to_lowercase();
-            let file_str = entry["file"].as_str().unwrap_or("");
+        for node in root.children().filter(|n| n.is_element() && n.has_tag_name("monster")) {
+            let name = node.attribute("name").unwrap_or("").to_lowercase();
+            let file_str = node.attribute("file").unwrap_or("");
             if name.is_empty() || file_str.is_empty() {
                 continue;
             }
 
-            // Resolve file path: replace .xml extension with .json5.
-            let json5_path = {
+            let xml_path = {
                 let p = std::path::Path::new(file_str);
                 let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 let parent = p.parent().and_then(|pp| pp.to_str()).unwrap_or("");
                 if parent.is_empty() {
-                    data_dir.join("monster").join(format!("{stem}.json5"))
+                    data_dir.join("monster").join(format!("{stem}.xml"))
                 } else {
-                    data_dir.join("monster").join(parent).join(format!("{stem}.json5"))
+                    data_dir.join("monster").join(parent).join(format!("{stem}.xml"))
                 }
             };
 
-            if !json5_path.exists() {
+            if !xml_path.exists() {
                 self.unloaded_monsters.insert(name.clone(), file_str.to_owned());
                 continue;
             }
 
-            match load_monster_type_from_file(&json5_path) {
+            match load_monster_type_from_file(&xml_path) {
                 Ok(mt) => {
                     self.monsters.insert(name, mt);
                     loaded += 1;
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to load monster {:?}: {}", json5_path, e);
+                    tracing::warn!("Failed to load monster {:?}: {}", xml_path, e);
                 }
             }
         }
 
-        tracing::info!("Loaded {} monster types ({} unloaded)", loaded, self.unloaded_monsters.len());
+        tracing::debug!("Loaded {} monster types ({} unloaded)", loaded, self.unloaded_monsters.len());
         self.loaded = true;
         Ok(())
+    }
+}
+
+fn attr_str<'a>(node: &'a roxmltree::Node, name: &str) -> &'a str {
+    node.attribute(name).unwrap_or("")
+}
+
+fn attr_u64(node: &roxmltree::Node, name: &str, default: u64) -> u64 {
+    node.attribute(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn attr_i64(node: &roxmltree::Node, name: &str, default: i64) -> i64 {
+    node.attribute(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn attr_bool(node: &roxmltree::Node, name: &str, default: bool) -> bool {
+    match node.attribute(name) {
+        Some("1") | Some("true") => true,
+        Some("0") | Some("false") => false,
+        _ => default,
     }
 }
 
 fn load_monster_type_from_file(path: &Path) -> Result<MonsterType, anyhow::Error> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read: {}", e))?;
-    let val: serde_json::Value = json5::from_str(&content)
+    let doc = roxmltree::Document::parse(&content)
         .map_err(|e| anyhow::anyhow!("parse: {}", e))?;
-    let m = val.get("monster").ok_or_else(|| anyhow::anyhow!("missing 'monster' key"))?;
+    let m = doc.root_element();
+    if !m.has_tag_name("monster") {
+        return Err(anyhow::anyhow!("root element is not <monster>"));
+    }
 
     let mut mt = MonsterType::new();
-    mt.name = m["name"].as_str().unwrap_or("").to_owned();
-    mt.name_description = m["nameDescription"].as_str().unwrap_or("").to_owned();
+    mt.name = attr_str(&m, "name").to_owned();
+    mt.name_description = attr_str(&m, "nameDescription").to_owned();
 
-    mt.info.race = match m["race"].as_str().unwrap_or("blood") {
+    mt.info.race = match attr_str(&m, "race") {
         "venom" => RaceType::Venom,
         "undead" => RaceType::Undead,
         "fire" => RaceType::Fire,
@@ -483,294 +505,192 @@ fn load_monster_type_from_file(path: &Path) -> Result<MonsterType, anyhow::Error
         _ => RaceType::Blood,
     };
 
-    mt.info.experience = m["experience"].as_u64().unwrap_or(0);
-    mt.info.base_speed = m["speed"].as_u64().unwrap_or(200) as u32;
-    mt.info.mana_cost = m["manacost"].as_u64().unwrap_or(0) as u32;
+    mt.info.experience = attr_u64(&m, "experience", 0);
+    mt.info.base_speed = attr_u64(&m, "speed", 200) as u32;
+    mt.info.mana_cost = attr_u64(&m, "manacost", 0) as u32;
 
-    if let Some(h) = m.get("health") {
-        mt.info.health = h["now"].as_i64().unwrap_or(100) as i32;
-        mt.info.health_max = h["max"].as_i64().unwrap_or(100) as i32;
-    }
-
-    if let Some(look) = m.get("look") {
-        mt.info.outfit.look_type = look["type"].as_u64().unwrap_or(0) as u16;
-        mt.info.look_corpse = look["corpse"].as_u64().unwrap_or(0) as u16;
-    }
-
-    if let Some(tc) = m.get("targetchange") {
-        mt.info.change_target_speed = tc["interval"].as_u64().unwrap_or(0) as u32;
-        mt.info.change_target_chance = tc["chance"].as_i64().unwrap_or(0) as i32;
-    }
-
-    if let Some(flags) = m["flags"].as_array() {
-        for flag in flags {
-            if let Some(obj) = flag.as_object() {
-                for (key, val) in obj {
-                    match key.as_str() {
-                        "summonable" => mt.info.is_summonable = val.as_bool().unwrap_or(false),
-                        "attackable" => mt.info.is_attackable = val.as_bool().unwrap_or(true),
-                        "hostile" => mt.info.is_hostile = val.as_bool().unwrap_or(true),
-                        "illusionable" => mt.info.is_illusionable = val.as_bool().unwrap_or(false),
-                        "convinceable" => mt.info.is_convinceable = val.as_bool().unwrap_or(false),
-                        "pushable" => mt.info.pushable = val.as_bool().unwrap_or(true),
-                        "canpushitems" => mt.info.can_push_items = val.as_bool().unwrap_or(false),
-                        "canpushcreatures" => mt.info.can_push_creatures = val.as_bool().unwrap_or(false),
-                        "staticattack" => mt.info.static_attack_chance = val.as_u64().unwrap_or(95) as u32,
-                        "runonhealth" => mt.info.run_away_health = val.as_i64().unwrap_or(0) as i32,
-                        "targetdistance" => mt.info.target_distance = (val.as_i64().unwrap_or(1) as i32).max(1),
-                        "canwalkonenergy" => mt.info.can_walk_on_energy = val.as_bool().unwrap_or(true),
-                        "canwalkonfire" => mt.info.can_walk_on_fire = val.as_bool().unwrap_or(true),
-                        "canwalkonpoison" => mt.info.can_walk_on_poison = val.as_bool().unwrap_or(true),
-                        "boss" => mt.info.is_boss = val.as_bool().unwrap_or(false),
-                        "challengeable" => mt.info.is_challengeable = val.as_bool().unwrap_or(true),
-                        _ => {}
+    for child in m.children().filter(|n| n.is_element()) {
+        match child.tag_name().name() {
+            "health" => {
+                mt.info.health = attr_i64(&child, "now", 100) as i32;
+                mt.info.health_max = attr_i64(&child, "max", 100) as i32;
+            }
+            "look" => {
+                mt.info.outfit.look_type = attr_u64(&child, "type", 0) as u16;
+                mt.info.look_corpse = attr_u64(&child, "corpse", 0) as u16;
+            }
+            "targetchange" => {
+                mt.info.change_target_speed = attr_u64(&child, "interval", 0) as u32;
+                mt.info.change_target_chance = attr_i64(&child, "chance", 0) as i32;
+            }
+            "flags" => {
+                for flag in child.children().filter(|n| n.is_element() && n.has_tag_name("flag")) {
+                    for attr in flag.attributes() {
+                        let key = attr.name();
+                        let val = attr.value();
+                        match key {
+                            "summonable" => mt.info.is_summonable = val == "1" || val == "true",
+                            "attackable" => mt.info.is_attackable = val == "1" || val == "true",
+                            "hostile" => mt.info.is_hostile = val == "1" || val == "true",
+                            "illusionable" => mt.info.is_illusionable = val == "1" || val == "true",
+                            "convinceable" => mt.info.is_convinceable = val == "1" || val == "true",
+                            "pushable" => mt.info.pushable = val == "1" || val == "true",
+                            "canpushitems" => mt.info.can_push_items = val == "1" || val == "true",
+                            "canpushcreatures" => mt.info.can_push_creatures = val == "1" || val == "true",
+                            "staticattack" => {
+                                mt.info.static_attack_chance = val.parse().unwrap_or(95);
+                            }
+                            "runonhealth" => {
+                                mt.info.run_away_health = val.parse().unwrap_or(0);
+                            }
+                            "targetdistance" => {
+                                mt.info.target_distance = val.parse::<i32>().unwrap_or(1).max(1);
+                            }
+                            "canwalkonenergy" => mt.info.can_walk_on_energy = val == "1" || val == "true",
+                            "canwalkonfire" => mt.info.can_walk_on_fire = val == "1" || val == "true",
+                            "canwalkonpoison" => mt.info.can_walk_on_poison = val == "1" || val == "true",
+                            "boss" => mt.info.is_boss = val == "1" || val == "true",
+                            "challengeable" => mt.info.is_challengeable = val == "1" || val == "true",
+                            _ => {}
+                        }
                     }
                 }
             }
-        }
-    }
+            "defenses" => {
+                mt.info.armor = attr_i64(&child, "armor", 0) as i32;
+                mt.info.defense = attr_i64(&child, "defense", 0) as i32;
 
-    if let Some(def) = m.get("defenses") {
-        if let Some(a) = def.get("armor").and_then(|v| v.as_i64()) {
-            mt.info.armor = a as i32;
-        }
-        // `defense` may be the numeric defense value OR a single defense-spell
-        // object; `defenses` is the array of defense spells.
-        if let Some(d) = def.get("defense") {
-            if let Some(n) = d.as_i64() {
-                mt.info.defense = n as i32;
-            }
-        }
-
-        let mut defense_entries: Vec<&serde_json::Value> = Vec::new();
-        if let Some(arr) = def.get("defenses").and_then(|v| v.as_array()) {
-            defense_entries.extend(arr.iter());
-        }
-        match def.get("defense") {
-            Some(serde_json::Value::Array(arr)) => defense_entries.extend(arr.iter()),
-            Some(obj) if obj.is_object() => defense_entries.push(obj),
-            _ => {}
-        }
-
-        for d in defense_entries {
-            let name = d["name"].as_str().unwrap_or("").to_owned();
-            // Only genuine combat defenses (healing / direct damage) are cast as
-            // combat. Condition buffs (speed/invisible/outfit/strength/...) need
-            // monster-condition support that is not yet modeled, so they are
-            // skipped rather than misinterpreted as physical self-damage.
-            if !is_combat_spell_name(&name) {
-                continue;
-            }
-            let mut sb = SpellBlock::new();
-            sb.spell_name = name;
-            sb.speed = d["interval"].as_u64().unwrap_or(2000) as u32;
-            sb.chance = d["chance"].as_u64().unwrap_or(100) as u32;
-            sb.min_combat_value = d["min"].as_i64().unwrap_or(0) as i32;
-            sb.max_combat_value = d["max"].as_i64().unwrap_or(0) as i32;
-            sb.radius = d["radius"].as_i64().unwrap_or(0) as i32;
-            sb.combat_type = spell_name_to_combat_type(&sb.spell_name);
-            sb.combat_spell = true;
-            for attrs_key in &["attributes", "attribute"] {
-                let items: Vec<&serde_json::Value> = if let Some(arr) = d[attrs_key].as_array() {
-                    arr.iter().collect()
-                } else if let Some(obj) = d.get(attrs_key) {
-                    if obj.is_object() { vec![obj] } else { vec![] }
-                } else {
-                    vec![]
-                };
-                for item in items {
-                    let key = item["key"].as_str().unwrap_or("");
-                    let val = item["value"].as_str().unwrap_or("");
-                    if key == "areaEffect" {
-                        sb.area_effect = const_me_from_str(val);
-                    }
-                }
-            }
-            mt.info.defense_spells.push(sb);
-        }
-    }
-
-    if let Some(elems) = m["elements"].as_array() {
-        for elem in elems {
-            if let Some(obj) = elem.as_object() {
-                for (key, val) in obj {
-                    let ct = match key.as_str() {
-                        "earthPercent" => Some(CombatType::EarthDamage),
-                        "energyPercent" => Some(CombatType::EnergyDamage),
-                        "firePercent" => Some(CombatType::FireDamage),
-                        "icePercent" => Some(CombatType::IceDamage),
-                        "holyPercent" => Some(CombatType::HolyDamage),
-                        "deathPercent" => Some(CombatType::DeathDamage),
-                        "lifedrainPercent" => Some(CombatType::LifeDrain),
-                        "drownPercent" => Some(CombatType::DrownDamage),
-                        "physicalPercent" => Some(CombatType::PhysicalDamage),
-                        _ => None,
-                    };
-                    if let Some(c) = ct {
-                        mt.info.element_map.insert(c, val.as_i64().unwrap_or(0) as i32);
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(imms) = m["immunities"].as_array() {
-        for imm in imms {
-            if let Some(obj) = imm.as_object() {
-                for (key, val) in obj {
-                    if !val.as_bool().unwrap_or(false) {
+                for def_node in child.children().filter(|n| n.is_element() && n.has_tag_name("defense")) {
+                    let name = attr_str(&def_node, "name").to_owned();
+                    if !is_combat_spell_name(&name) {
                         continue;
                     }
-                    apply_immunity(&mut mt.info, key);
+                    let mut sb = SpellBlock::new();
+                    sb.spell_name = name;
+                    sb.speed = attr_u64(&def_node, "interval", 2000) as u32;
+                    sb.chance = attr_u64(&def_node, "chance", 100) as u32;
+                    sb.min_combat_value = attr_i64(&def_node, "min", 0) as i32;
+                    sb.max_combat_value = attr_i64(&def_node, "max", 0) as i32;
+                    sb.radius = attr_i64(&def_node, "radius", 0) as i32;
+                    sb.combat_type = spell_name_to_combat_type(&sb.spell_name);
+                    sb.combat_spell = true;
+                    for attr_node in def_node.children().filter(|n| n.is_element() && n.has_tag_name("attribute")) {
+                        let k = attr_str(&attr_node, "key");
+                        let v = attr_str(&attr_node, "value");
+                        if k == "areaEffect" {
+                            sb.area_effect = const_me_from_str(v);
+                        }
+                    }
+                    mt.info.defense_spells.push(sb);
                 }
             }
-        }
-    }
-
-    // Parse attacks.
-    if let Some(attacks) = m["attacks"].as_array() {
-        for atk in attacks {
-            let mut sb = SpellBlock::new();
-            sb.spell_name = atk["name"].as_str().unwrap_or("").to_owned();
-            sb.speed = atk["interval"].as_u64().unwrap_or(2000) as u32;
-            sb.chance = atk["chance"].as_u64().unwrap_or(100) as u32;
-            sb.range = atk["range"].as_u64().unwrap_or(0) as u32;
-            sb.min_combat_value = atk["min"].as_i64().unwrap_or(0) as i32;
-            sb.max_combat_value = atk["max"].as_i64().unwrap_or(0) as i32;
-            sb.radius = atk["radius"].as_i64().unwrap_or(0) as i32;
-            sb.length = atk["length"].as_i64().unwrap_or(0) as i32;
-            sb.spread = atk["spread"].as_i64().unwrap_or(0) as i32;
-            sb.need_target = atk["target"].as_bool().unwrap_or(false);
-            sb.skill = atk["skill"].as_i64().unwrap_or(0) as i32;
-            sb.attack = atk["attack"].as_i64().unwrap_or(0) as i32;
-            sb.is_melee = sb.spell_name == "melee";
-            sb.combat_spell = !sb.is_melee;
-            sb.combat_type = spell_name_to_combat_type(&sb.spell_name);
-            // Parse attributes for shoot/area effects.
-            for attrs_key in &["attributes", "attribute"] {
-                let items: Vec<&serde_json::Value> = if let Some(arr) = atk[attrs_key].as_array() {
-                    arr.iter().collect()
-                } else if let Some(obj) = atk.get(attrs_key) {
-                    if obj.is_object() { vec![obj] } else { vec![] }
-                } else {
-                    vec![]
-                };
-                for item in items {
-                    let key = item["key"].as_str().unwrap_or("");
-                    let val = item["value"].as_str().unwrap_or("");
-                    match key {
-                        "shootEffect" => sb.shoot_effect = const_ani_from_str(val),
-                        "areaEffect" => sb.area_effect = const_me_from_str(val),
-                        _ => {}
+            "elements" => {
+                for elem in child.children().filter(|n| n.is_element() && n.has_tag_name("element")) {
+                    for attr in elem.attributes() {
+                        let ct = match attr.name() {
+                            "earthPercent" => Some(CombatType::EarthDamage),
+                            "energyPercent" => Some(CombatType::EnergyDamage),
+                            "firePercent" => Some(CombatType::FireDamage),
+                            "icePercent" => Some(CombatType::IceDamage),
+                            "holyPercent" => Some(CombatType::HolyDamage),
+                            "deathPercent" => Some(CombatType::DeathDamage),
+                            "lifedrainPercent" => Some(CombatType::LifeDrain),
+                            "drownPercent" => Some(CombatType::DrownDamage),
+                            "physicalPercent" => Some(CombatType::PhysicalDamage),
+                            _ => None,
+                        };
+                        if let Some(c) = ct {
+                            let val: i32 = attr.value().parse().unwrap_or(0);
+                            mt.info.element_map.insert(c, val);
+                        }
                     }
                 }
             }
-            mt.info.attack_spells.push(sb);
-        }
-    }
-
-    // Parse voices.
-    if let Some(voices_obj) = m.get("voices") {
-        mt.info.yell_speed_ticks = voices_obj["interval"].as_u64().unwrap_or(5000) as u32;
-        mt.info.yell_chance = voices_obj["chance"].as_u64().unwrap_or(0) as u32;
-        let sentences: Vec<&serde_json::Value> = {
-            let mut v = Vec::new();
-            if let Some(arr) = voices_obj["voices"].as_array() {
-                v.extend(arr.iter());
-            }
-            if let Some(arr) = voices_obj["voice"].as_array() {
-                v.extend(arr.iter());
-            }
-            if let Some(obj) = voices_obj.get("voice") {
-                if obj.is_object() {
-                    v.push(obj);
+            "immunities" => {
+                for imm in child.children().filter(|n| n.is_element() && n.has_tag_name("immunity")) {
+                    for attr in imm.attributes() {
+                        if attr.value() == "1" || attr.value() == "true" {
+                            apply_immunity(&mut mt.info, attr.name());
+                        }
+                    }
                 }
             }
-            v
-        };
-        for s in sentences {
-            let text = s["sentence"].as_str().unwrap_or("").to_owned();
-            let yell_text = s["yell"].as_bool().unwrap_or(false);
-            if !text.is_empty() {
-                mt.info.voice_vector.push(VoiceBlock { text, yell_text });
-            }
-        }
-    }
-
-    // Parse loot. Port of Monsters::loadLootItem / loadLootContainer
-    // (monsters.cpp). The xml2json5 converter encodes a single loot child as a
-    // singular `loot.item` object and multiple as `loot.items: [...]`; container
-    // contents are a nested `items`/`item` under the entry. Container detection
-    // is structural here (presence of nested children) rather than via the item
-    // type's container flag — faithful to the converted dataset, see D021.
-    if let Some(loot_obj) = m.get("loot") {
-        for entry in collect_loot_entries(loot_obj) {
-            if let Some(lb) = parse_loot_block(entry) {
-                mt.info.loot_items.push(lb);
-            }
-        }
-    }
-
-    if let Some(summons_obj) = m.get("summons") {
-        mt.info.max_summons = summons_obj["maxSummons"].as_u64().unwrap_or(0) as u32;
-        let blocks: Vec<&serde_json::Value> = {
-            let mut v = Vec::new();
-            if let Some(arr) = summons_obj["summon"].as_array() {
-                v.extend(arr.iter());
-            } else if let Some(obj) = summons_obj.get("summon") {
-                if obj.is_object() {
-                    v.push(obj);
+            "attacks" => {
+                for atk in child.children().filter(|n| n.is_element() && n.has_tag_name("attack")) {
+                    let mut sb = SpellBlock::new();
+                    sb.spell_name = attr_str(&atk, "name").to_owned();
+                    sb.speed = attr_u64(&atk, "interval", 2000) as u32;
+                    sb.chance = attr_u64(&atk, "chance", 100) as u32;
+                    sb.range = attr_u64(&atk, "range", 0) as u32;
+                    sb.min_combat_value = attr_i64(&atk, "min", 0) as i32;
+                    sb.max_combat_value = attr_i64(&atk, "max", 0) as i32;
+                    sb.radius = attr_i64(&atk, "radius", 0) as i32;
+                    sb.length = attr_i64(&atk, "length", 0) as i32;
+                    sb.spread = attr_i64(&atk, "spread", 0) as i32;
+                    sb.need_target = attr_bool(&atk, "target", false);
+                    sb.skill = attr_i64(&atk, "skill", 0) as i32;
+                    sb.attack = attr_i64(&atk, "attack", 0) as i32;
+                    sb.is_melee = sb.spell_name == "melee";
+                    sb.combat_spell = !sb.is_melee;
+                    sb.combat_type = spell_name_to_combat_type(&sb.spell_name);
+                    for attr_node in atk.children().filter(|n| n.is_element() && n.has_tag_name("attribute")) {
+                        let k = attr_str(&attr_node, "key");
+                        let v = attr_str(&attr_node, "value");
+                        match k {
+                            "shootEffect" => sb.shoot_effect = const_ani_from_str(v),
+                            "areaEffect" => sb.area_effect = const_me_from_str(v),
+                            _ => {}
+                        }
+                    }
+                    mt.info.attack_spells.push(sb);
                 }
             }
-            v
-        };
-        for s in blocks {
-            let name = s["name"].as_str().unwrap_or("").to_owned();
-            if name.is_empty() {
-                continue;
+            "voices" => {
+                mt.info.yell_speed_ticks = attr_u64(&child, "interval", 5000) as u32;
+                mt.info.yell_chance = attr_u64(&child, "chance", 0) as u32;
+                for voice in child.children().filter(|n| n.is_element() && n.has_tag_name("voice")) {
+                    let text = attr_str(&voice, "sentence").to_owned();
+                    let yell_text = attr_bool(&voice, "yell", false);
+                    if !text.is_empty() {
+                        mt.info.voice_vector.push(VoiceBlock { text, yell_text });
+                    }
+                }
             }
-            // XML `speed`/`interval` are the same field; JSON5 uses `interval`.
-            let speed = s["interval"]
-                .as_u64()
-                .or_else(|| s["speed"].as_u64())
-                .unwrap_or(1000) as u32;
-            let chance = s["chance"].as_u64().unwrap_or(100) as u32;
-            let max = s["max"].as_u64().unwrap_or(mt.info.max_summons as u64) as u32;
-            let force = s["force"].as_bool().unwrap_or(false);
-            mt.info.summons.push(SummonBlock { name, chance, speed, max, force });
+            "loot" => {
+                for item_node in child.children().filter(|n| n.is_element() && n.has_tag_name("item")) {
+                    if let Some(lb) = parse_loot_node(item_node) {
+                        mt.info.loot_items.push(lb);
+                    }
+                }
+            }
+            "summons" => {
+                mt.info.max_summons = attr_u64(&child, "maxSummons", 0) as u32;
+                for summon in child.children().filter(|n| n.is_element() && n.has_tag_name("summon")) {
+                    let name = attr_str(&summon, "name").to_owned();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let speed = attr_u64(&summon, "interval", 1000) as u32;
+                    let chance = attr_u64(&summon, "chance", 100) as u32;
+                    let max = attr_u64(&summon, "max", mt.info.max_summons as u64) as u32;
+                    let force = attr_bool(&summon, "force", false);
+                    mt.info.summons.push(SummonBlock { name, chance, speed, max, force });
+                }
+            }
+            _ => {}
         }
     }
 
     Ok(mt)
 }
 
-/// Collect the loot child entries from a `loot` (or nested item) object,
-/// accepting both the plural `items: [...]` array and the singular `item: {...}`
-/// object emitted by the converter.
-fn collect_loot_entries(obj: &serde_json::Value) -> Vec<&serde_json::Value> {
-    let mut v = Vec::new();
-    if let Some(arr) = obj.get("items").and_then(|x| x.as_array()) {
-        v.extend(arr.iter());
-    }
-    match obj.get("item") {
-        Some(serde_json::Value::Array(arr)) => v.extend(arr.iter()),
-        Some(o) if o.is_object() => v.push(o),
-        _ => {}
-    }
-    v
-}
-
-/// Port of Monsters::loadLootItem (monsters.cpp:1364). Returns None when the
-/// entry has no usable id (matching the C++ early-return on a 0 id).
-fn parse_loot_block(entry: &serde_json::Value) -> Option<LootBlock> {
+/// Port of Monsters::loadLootItem (monsters.cpp:1364).
+fn parse_loot_node(node: roxmltree::Node) -> Option<LootBlock> {
     let mut lb = LootBlock::new();
 
-    // Resolve the item id from `id`, or fall back to `name` lookup like C++
-    // loadLootItem. The converted dataset uses both forms — e.g. orc spearman
-    // and most of dragon lord's loot are name-based, not id-based.
-    lb.id = entry["id"].as_u64().unwrap_or(0) as u16;
+    lb.id = node.attribute("id").and_then(|v| v.parse().ok()).unwrap_or(0);
     if lb.id == 0 {
-        if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
+        if let Some(name) = node.attribute("name") {
             lb.id = crate::items::g_items().get_item_id_by_name(name).unwrap_or(0);
         }
     }
@@ -778,8 +698,7 @@ fn parse_loot_block(entry: &serde_json::Value) -> Option<LootBlock> {
         return None;
     }
 
-    // countmax: default 1, reject > 100 (matches C++ loadLootItem).
-    if let Some(cm) = entry.get("countmax").and_then(|v| v.as_i64()) {
+    if let Some(cm) = node.attribute("countmax").and_then(|v| v.parse::<i64>().ok()) {
         if cm > 100 {
             return None;
         }
@@ -788,35 +707,30 @@ fn parse_loot_block(entry: &serde_json::Value) -> Option<LootBlock> {
         lb.count_max = 1;
     }
 
-    // chance / chance1: default MAX_LOOT_CHANCE, clamp to the max.
-    let chance = entry
-        .get("chance")
-        .and_then(|v| v.as_i64())
-        .or_else(|| entry.get("chance1").and_then(|v| v.as_i64()));
+    let chance = node.attribute("chance")
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| node.attribute("chance1").and_then(|v| v.parse::<i64>().ok()));
     lb.chance = match chance {
         Some(c) => (c.max(0) as u32).min(MAX_LOOT_CHANCE),
         None => MAX_LOOT_CHANCE,
     };
 
-    // Nested container contents.
-    for child in collect_loot_entries(entry) {
-        if let Some(child_lb) = parse_loot_block(child) {
+    for child_item in node.children().filter(|n| n.is_element() && n.has_tag_name("item")) {
+        if let Some(child_lb) = parse_loot_node(child_item) {
             lb.child_loot.push(child_lb);
         }
     }
 
-    // Optional fields.
-    if let Some(st) = entry.get("subtype").and_then(|v| v.as_i64()) {
+    if let Some(st) = node.attribute("subtype").and_then(|v| v.parse::<i64>().ok()) {
         lb.sub_type = st as i32;
     }
-    if let Some(aid) = entry
-        .get("actionId")
-        .or_else(|| entry.get("actionid"))
-        .and_then(|v| v.as_i64())
-    {
-        lb.action_id = aid as i32;
+    let aid = node.attribute("actionId")
+        .or_else(|| node.attribute("actionid"))
+        .and_then(|v| v.parse::<i64>().ok());
+    if let Some(a) = aid {
+        lb.action_id = a as i32;
     }
-    if let Some(text) = entry.get("text").and_then(|v| v.as_str()) {
+    if let Some(text) = node.attribute("text") {
         lb.text = text.to_owned();
     }
 
@@ -937,38 +851,44 @@ fn const_me_from_str(s: &str) -> u8 {
 
 #[cfg(test)]
 mod loot_tests {
-    use super::{collect_loot_entries, parse_loot_block, MAX_LOOT_CHANCE};
+    use super::{parse_loot_node, MAX_LOOT_CHANCE};
+
+    fn parse_item_xml(xml: &str) -> roxmltree::Document {
+        roxmltree::Document::parse(xml).unwrap()
+    }
 
     #[test]
     fn plural_items_array_parses_every_entry() {
-        let v: serde_json::Value = json5::from_str(
-            r#"{ items: [
-                { id: 2148, countmax: 8, chance: 90000 },
-                { id: 2389, countmax: 3, chance: 9000 },
-                { id: 2050, chance: 5000 },
-            ] }"#,
-        )
-        .unwrap();
-        let entries = collect_loot_entries(&v);
-        assert_eq!(entries.len(), 3);
-        let blocks: Vec<_> = entries.into_iter().filter_map(parse_loot_block).collect();
+        let doc = parse_item_xml(
+            r#"<loot>
+                <item id="2148" countmax="8" chance="90000" />
+                <item id="2389" countmax="3" chance="9000" />
+                <item id="2050" chance="5000" />
+            </loot>"#,
+        );
+        let loot = doc.root_element();
+        let blocks: Vec<_> = loot
+            .children()
+            .filter(|n| n.is_element() && n.has_tag_name("item"))
+            .filter_map(parse_loot_node)
+            .collect();
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].id, 2148);
         assert_eq!(blocks[0].count_max, 8);
         assert_eq!(blocks[0].chance, 90000);
-        // No chance specified -> defaults to MAX_LOOT_CHANCE.
         assert_eq!(blocks[2].id, 2050);
         assert_eq!(blocks[2].count_max, 1);
         assert_eq!(blocks[2].chance, 5000);
     }
 
     #[test]
-    fn singular_item_object_parses() {
-        let v: serde_json::Value =
-            json5::from_str(r#"{ item: { id: 1234, chance: 50000 } }"#).unwrap();
-        let blocks: Vec<_> = collect_loot_entries(&v)
-            .into_iter()
-            .filter_map(parse_loot_block)
+    fn singular_item_parses() {
+        let doc = parse_item_xml(r#"<loot><item id="1234" chance="50000" /></loot>"#);
+        let loot = doc.root_element();
+        let blocks: Vec<_> = loot
+            .children()
+            .filter(|n| n.is_element() && n.has_tag_name("item"))
+            .filter_map(parse_loot_node)
             .collect();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].id, 1234);
@@ -977,18 +897,19 @@ mod loot_tests {
 
     #[test]
     fn nested_container_items_become_child_loot() {
-        let v: serde_json::Value = json5::from_str(
-            r#"{ items: [
-                { id: 1987, items: [
-                    { id: 2472, chance: 1000 },
-                    { id: 2152, countmax: 3, chance: 2000 },
-                ] },
-            ] }"#,
-        )
-        .unwrap();
-        let blocks: Vec<_> = collect_loot_entries(&v)
-            .into_iter()
-            .filter_map(parse_loot_block)
+        let doc = parse_item_xml(
+            r#"<loot>
+                <item id="1987">
+                    <item id="2472" chance="1000" />
+                    <item id="2152" countmax="3" chance="2000" />
+                </item>
+            </loot>"#,
+        );
+        let loot = doc.root_element();
+        let blocks: Vec<_> = loot
+            .children()
+            .filter(|n| n.is_element() && n.has_tag_name("item"))
+            .filter_map(parse_loot_node)
             .collect();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].id, 1987);
@@ -999,18 +920,23 @@ mod loot_tests {
 
     #[test]
     fn missing_id_and_overlarge_countmax_are_rejected() {
-        let no_id: serde_json::Value = json5::from_str(r#"{ chance: 1000 }"#).unwrap();
-        assert!(parse_loot_block(&no_id).is_none());
-        let big: serde_json::Value =
-            json5::from_str(r#"{ id: 2148, countmax: 101 }"#).unwrap();
-        assert!(parse_loot_block(&big).is_none());
+        let doc_no_id = parse_item_xml(r#"<loot><item chance="1000" /></loot>"#);
+        let no_id = doc_no_id.root_element().children()
+            .find(|n| n.is_element() && n.has_tag_name("item")).unwrap();
+        assert!(parse_loot_node(no_id).is_none());
+
+        let doc_big = parse_item_xml(r#"<loot><item id="2148" countmax="101" /></loot>"#);
+        let big = doc_big.root_element().children()
+            .find(|n| n.is_element() && n.has_tag_name("item")).unwrap();
+        assert!(parse_loot_node(big).is_none());
     }
 
     #[test]
     fn chance_clamped_to_max() {
-        let v: serde_json::Value =
-            json5::from_str(r#"{ id: 2148, chance: 999999 }"#).unwrap();
-        let lb = parse_loot_block(&v).unwrap();
+        let doc = parse_item_xml(r#"<loot><item id="2148" chance="999999" /></loot>"#);
+        let item = doc.root_element().children()
+            .find(|n| n.is_element() && n.has_tag_name("item")).unwrap();
+        let lb = parse_loot_node(item).unwrap();
         assert_eq!(lb.chance, MAX_LOOT_CHANCE);
     }
 }

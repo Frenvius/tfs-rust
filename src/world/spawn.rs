@@ -166,47 +166,36 @@ impl Spawns {
             && (pos.y as i32 <= center.y as i32 + radius)
     }
 
-    pub fn load_from_json5(&mut self, path: &std::path::Path) -> Result<(), anyhow::Error> {
+    pub fn load_from_xml(&mut self, path: &std::path::Path) -> Result<(), anyhow::Error> {
         if self.loaded {
             return Ok(());
         }
 
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", path, e))?;
-        let val: serde_json::Value = json5::from_str(&content)
+        let doc = roxmltree::Document::parse(&content)
             .map_err(|e| anyhow::anyhow!("Failed to parse {:?}: {}", path, e))?;
 
-        let entries = val["spawns"].as_array().cloned().unwrap_or_default();
+        let root = doc.root_element();
 
-        for entry in &entries {
-            let centerx = entry["centerx"].as_u64().unwrap_or(0) as u16;
-            let centery = entry["centery"].as_u64().unwrap_or(0) as u16;
-            let centerz = entry["centerz"].as_u64().unwrap_or(7) as u8;
-            let radius = entry["radius"].as_i64().unwrap_or(0) as i32;
+        for entry in root.children().filter(|n| n.is_element() && n.has_tag_name("spawn")) {
+            let centerx = entry.attribute("centerx").and_then(|v| v.parse().ok()).unwrap_or(0u16);
+            let centery = entry.attribute("centery").and_then(|v| v.parse().ok()).unwrap_or(0u16);
+            let centerz = entry.attribute("centerz").and_then(|v| v.parse().ok()).unwrap_or(7u8);
+            let radius = entry.attribute("radius").and_then(|v| v.parse().ok()).unwrap_or(0i32);
 
             let center_pos = Position { x: centerx, y: centery, z: centerz };
             let mut spawn = Spawn::new(center_pos, radius);
 
-            // Collect monster entries from "monster" (single) or "monsters" (array).
-            let mut monster_entries: Vec<&serde_json::Value> = Vec::new();
-            if let Some(arr) = entry["monsters"].as_array() {
-                monster_entries.extend(arr.iter());
-            }
-            if let Some(obj) = entry.get("monster") {
-                if obj.is_object() {
-                    monster_entries.push(obj);
-                }
-            }
-
-            for m in &monster_entries {
-                let name = m["name"].as_str().unwrap_or("").to_owned();
+            for m in entry.children().filter(|n| n.is_element() && n.has_tag_name("monster")) {
+                let name = m.attribute("name").unwrap_or("").to_owned();
                 if name.is_empty() {
                     continue;
                 }
-                let rx = m["x"].as_i64().unwrap_or(0) as i16;
-                let ry = m["y"].as_i64().unwrap_or(0) as i16;
-                let abs_z = m["z"].as_u64().unwrap_or(centerz as u64) as u8;
-                let spawntime = m["spawntime"].as_u64().unwrap_or(60);
+                let rx = m.attribute("x").and_then(|v| v.parse().ok()).unwrap_or(0i16);
+                let ry = m.attribute("y").and_then(|v| v.parse().ok()).unwrap_or(0i16);
+                let abs_z = m.attribute("z").and_then(|v| v.parse().ok()).unwrap_or(centerz);
+                let spawntime = m.attribute("spawntime").and_then(|v| v.parse().ok()).unwrap_or(60u64);
 
                 let abs_x = (centerx as i32 + rx as i32).clamp(0, u16::MAX as i32) as u16;
                 let abs_y = (centery as i32 + ry as i32).clamp(0, u16::MAX as i32) as u16;
@@ -218,26 +207,15 @@ impl Spawns {
                 spawn.add_monster(&name, pos, Direction::South, interval);
             }
 
-            // Collect NPC entries from "npc" (single) or "npcs" (array).
-            let mut npc_entries: Vec<&serde_json::Value> = Vec::new();
-            if let Some(arr) = entry["npcs"].as_array() {
-                npc_entries.extend(arr.iter());
-            }
-            if let Some(obj) = entry.get("npc") {
-                if obj.is_object() {
-                    npc_entries.push(obj);
-                }
-            }
-
-            for n in &npc_entries {
-                let name = n["name"].as_str().unwrap_or("").to_owned();
+            for n in entry.children().filter(|n| n.is_element() && n.has_tag_name("npc")) {
+                let name = n.attribute("name").unwrap_or("").to_owned();
                 if name.is_empty() {
                     continue;
                 }
-                let rx = n["x"].as_i64().unwrap_or(0) as i16;
-                let ry = n["y"].as_i64().unwrap_or(0) as i16;
-                let abs_z = n["z"].as_u64().unwrap_or(centerz as u64) as u8;
-                let dir_val = n["direction"].as_u64().unwrap_or(2) as u8;
+                let rx = n.attribute("x").and_then(|v| v.parse().ok()).unwrap_or(0i16);
+                let ry = n.attribute("y").and_then(|v| v.parse().ok()).unwrap_or(0i16);
+                let abs_z = n.attribute("z").and_then(|v| v.parse().ok()).unwrap_or(centerz);
+                let dir_val = n.attribute("direction").and_then(|v| v.parse().ok()).unwrap_or(2u8);
                 let direction = Direction::from_u8(dir_val).unwrap_or(Direction::South);
 
                 let abs_x = (centerx as i32 + rx as i32).clamp(0, u16::MAX as i32) as u16;

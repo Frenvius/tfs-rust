@@ -1,30 +1,32 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
 
 use crate::lua::script::LuaScriptInterface;
 
 // ---------------------------------------------------------------------------
-// JSON5 schema
+// XML schema
 // ---------------------------------------------------------------------------
 
-/// A single entry in `data/talkactions/talkactions.json5`. Mirrors a
-/// `<talkaction>` XML node.
+/// A single entry in `data/talkactions/talkactions.xml`. Mirrors a `<talkaction>` node.
 #[derive(Debug, Deserialize)]
 pub struct TalkActionEntry {
+    #[serde(rename = "@script")]
     pub script: Option<String>,
-    /// `words` can be a single string or an array; semicolons are split too.
-    pub words: Option<JsonValue>,
+    #[serde(rename = "@words")]
+    pub words: Option<String>,
+    #[serde(rename = "@separator")]
     pub separator: Option<String>,
+    #[serde(rename = "@access")]
     pub access: Option<bool>,
-    #[serde(rename = "accounttype")]
+    #[serde(rename = "@accounttype")]
     pub account_type: Option<u8>,
 }
 
-/// Top-level document for `data/talkactions/talkactions.json5`.
+/// Top-level document for `data/talkactions/talkactions.xml`.
 #[derive(Debug, Deserialize)]
-pub struct TalkActionsFile {
+pub struct TalkActionsXml {
+    #[serde(rename = "talkaction", default)]
     pub talkactions: Vec<TalkActionEntry>,
 }
 
@@ -102,21 +104,21 @@ impl TalkActions {
         "talkactions"
     }
 
-    /// Load `data/talkactions/talkactions.json5`. Returns `true` on success.
-    pub fn load_from_json5(&mut self) -> bool {
-        let path = "data/talkactions/talkactions.json5";
+    /// Load `data/talkactions/talkactions.xml`. Returns `true` on success.
+    pub fn load_from_xml(&mut self) -> bool {
+        let path = "data/talkactions/talkactions.xml";
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("TalkActions::load_from_json5 - {path} not found: {e}");
+                tracing::warn!("TalkActions::load_from_xml - {path} not found: {e}");
                 return false;
             }
         };
 
-        let file: TalkActionsFile = match json5::from_str(&source) {
+        let file: TalkActionsXml = match quick_xml::de::from_str(&source) {
             Ok(f) => f,
             Err(e) => {
-                tracing::error!("TalkActions::load_from_json5 - parse error in {path}: {e}");
+                tracing::error!("TalkActions::load_from_xml - parse error in {path}: {e}");
                 return false;
             }
         };
@@ -132,7 +134,7 @@ impl TalkActions {
             let words = collect_words(&entry.words);
             if words.is_empty() {
                 tracing::warn!(
-                    "TalkActions::load_from_json5 - entry missing words, skipping"
+                    "TalkActions::load_from_xml - entry missing words, skipping"
                 );
                 continue;
             }
@@ -149,7 +151,7 @@ impl TalkActions {
                             .get_event("onSay");
                         if id == -1 {
                             tracing::warn!(
-                                "TalkActions::load_from_json5 - onSay not found in {script_path}"
+                                "TalkActions::load_from_xml - onSay not found in {script_path}"
                             );
                             continue;
                         }
@@ -158,7 +160,7 @@ impl TalkActions {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "TalkActions::load_from_json5 - cannot load {script_path}: {e}"
+                            "TalkActions::load_from_xml - cannot load {script_path}: {e}"
                         );
                         continue;
                     }
@@ -235,30 +237,15 @@ impl Default for TalkActions {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn collect_words(value: &Option<JsonValue>) -> Vec<String> {
+fn collect_words(value: &Option<String>) -> Vec<String> {
     let mut out = Vec::new();
-    match value {
-        Some(JsonValue::String(s)) => {
-            for w in s.split(';') {
-                let trimmed = w.trim();
-                if !trimmed.is_empty() {
-                    out.push(trimmed.to_owned());
-                }
+    if let Some(s) = value {
+        for w in s.split(';') {
+            let trimmed = w.trim();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_owned());
             }
         }
-        Some(JsonValue::Array(arr)) => {
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    for w in s.split(';') {
-                        let trimmed = w.trim();
-                        if !trimmed.is_empty() {
-                            out.push(trimmed.to_owned());
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
     }
     out
 }

@@ -874,7 +874,7 @@ impl Scripts {
                         .and_then(|p| p.file_name())
                         .and_then(|n| n.to_str())
                     {
-                        tracing::info!(">> [{}]", dir_name);
+                        tracing::debug!(">> [{}]", dir_name);
                     }
                     last_parent = parent;
                 }
@@ -888,9 +888,9 @@ impl Scripts {
             match self.script_interface.load_file(path_str) {
                 Ok(()) => {
                     if reload {
-                        tracing::info!("> {} [reloaded]", file_name);
+                        tracing::debug!("> {} [reloaded]", file_name);
                     } else {
-                        tracing::info!("> {} [loaded]", file_name);
+                        tracing::debug!("> {} [loaded]", file_name);
                     }
                 }
                 Err(_) => {
@@ -940,7 +940,7 @@ fn collect_lua_files(
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             if file_name.starts_with('#') {
-                tracing::info!("> {} [disabled]", file_name);
+                tracing::debug!("> {} [disabled]", file_name);
                 continue;
             }
             out.push(path);
@@ -960,7 +960,7 @@ impl ScriptingManager {
     /// Load all script systems.
     ///
     /// Subsystem failures log a warning and continue rather than aborting,
-    /// because JSON5 data files may not have been converted from XML yet.
+    /// because XML data files may not exist for all subsystems yet.
     pub fn load_script_systems() -> anyhow::Result<()> {
         use crate::events::registry::init_script_registry;
         init_script_registry();
@@ -976,23 +976,23 @@ impl ScriptingManager {
         // 2. Lua lib scripts
         let mut scripts = Scripts::new()
             .map_err(|e| anyhow::anyhow!("Failed to create Scripts interface: {}", e))?;
-        tracing::info!(">> Loading lua libs");
+        tracing::debug!(">> Loading lua libs");
         if !scripts.load_scripts("scripts/lib", true, false) {
             return Err(anyhow::anyhow!("Unable to load lua libs"));
         }
 
-        // 3. Load JSON5-backed event subsystems (matches C++ scriptmanager.cpp order)
+        // 3. Load XML-backed event subsystems (matches C++ scriptmanager.cpp order)
         {
             let mut registry = crate::events::registry::g_script_registry().lock().unwrap();
-            registry.actions.load_from_json5();
-            registry.talk_actions.load_from_json5();
-            registry.move_events.load_from_json5();
-            registry.creature_events.load_from_json5();
-            registry.global_events.load_from_json5();
+            registry.actions.load_from_xml();
+            registry.talk_actions.load_from_xml();
+            registry.move_events.load_from_xml();
+            registry.creature_events.load_from_xml();
+            registry.global_events.load_from_xml();
         }
 
         // 4. Chat channels
-        tracing::info!(">> Loading chat channels");
+        tracing::debug!(">> Loading chat channels");
         {
             let mut chat = crate::chat::g_chat().lock().unwrap();
             chat.load();
@@ -1000,16 +1000,16 @@ impl ScriptingManager {
 
         // 5. Load all self-registering scripts from data/scripts/
         // This matches C++ otserv.cpp:249: g_scripts->loadScripts("scripts", false, false)
-        tracing::info!(">> Loading scripts");
+        tracing::debug!(">> Loading scripts");
         if !scripts.load_scripts("scripts", false, false) {
             tracing::warn!("[ScriptingManager] Warning: some scripts failed to load");
         }
 
-        // 5c. Load spells from data/spells/spells.json5
+        // 5c. Load spells from data/spells/spells.xml
         print!(">> Loading spells... ");
         crate::events::spells::load_spells();
 
-        // 5b. Load Events (data/events/events.json5 + data/events/scripts/*.lua)
+        // 5b. Load Events (data/events/events.xml + data/events/scripts/*.lua)
         // Must come after scripts/lib (which defines hasEventCallback, EventCallback)
         {
             let mut events = crate::events::g_events().lock().unwrap();
@@ -1017,13 +1017,13 @@ impl ScriptingManager {
         }
 
         // 6. Load monster Lua scripts from data/monster/
-        tracing::info!(">> Loading lua monsters");
+        tracing::debug!(">> Loading lua monsters");
         if !scripts.load_scripts("monster", false, false) {
             tracing::warn!("[ScriptingManager] Warning: some monster scripts failed to load");
         }
 
         // 7. Initialize NPC script interface and load per-NPC scripts.
-        tracing::info!(">> Loading npc scripts");
+        tracing::debug!(">> Loading npc scripts");
         init_npc_script_interface();
         {
             let type_names: Vec<(String, String)> = {

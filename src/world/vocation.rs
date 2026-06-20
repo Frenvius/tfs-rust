@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::util::json5::{self, Json5LoadError};
+use crate::util::xml::{self, XmlLoadError};
 
 const VOCATION_NONE: u32 = 0;
 const SKILL_LAST: usize = 6;
@@ -111,8 +111,8 @@ pub struct Vocations {
 }
 
 impl Vocations {
-    pub fn load_from_json5(path: impl AsRef<Path>) -> Result<Self, VocationError> {
-        let data: VocationsJson5 = json5::load_from_path(path)?;
+    pub fn load_from_xml(path: impl AsRef<Path>) -> Result<Self, VocationError> {
+        let data: VocationsXml = xml::load_from_path(path)?;
         let mut vocations = BTreeMap::new();
 
         for entry in data.vocations {
@@ -134,12 +134,12 @@ impl Vocations {
                 attack_speed: entry.attackspeed.unwrap_or(1500),
                 base_speed: entry.basespeed.unwrap_or(220),
                 no_pong_kick_time: entry.nopongkicktime.unwrap_or(60) * 1000,
-                allow_pvp: entry.allowpvp.unwrap_or(true),
+                allow_pvp: entry.allowpvp.map(|v| v != 0).unwrap_or(true),
                 mana_multiplier: entry.manamultiplier.unwrap_or(4.0),
                 ..Vocation::default()
             };
 
-            for skill in entry.skills.unwrap_or_default() {
+            for skill in entry.skill.unwrap_or_default() {
                 let skill_id = usize::from(skill.id);
                 if skill_id <= SKILL_LAST {
                     vocation.skill_multipliers[skill_id] = skill.multiplier;
@@ -192,53 +192,78 @@ impl Vocations {
 #[derive(Debug, Error)]
 pub enum VocationError {
     #[error(transparent)]
-    Json5(#[from] Json5LoadError),
+    Xml(#[from] XmlLoadError),
 }
 
 #[derive(Debug, Deserialize)]
-struct VocationsJson5 {
-    #[serde(default)]
-    vocations: Vec<VocationJson5>,
+struct VocationsXml {
+    #[serde(rename = "vocation", default)]
+    vocations: Vec<VocationXml>,
 }
 
 #[derive(Debug, Deserialize)]
-struct VocationJson5 {
+struct VocationXml {
+    #[serde(rename = "@id")]
     id: u16,
+    #[serde(rename = "@name")]
     name: Option<String>,
-    allowpvp: Option<bool>,
+    #[serde(rename = "@allowPvp")]
+    allowpvp: Option<u8>,
+    #[serde(rename = "@clientid")]
     clientid: Option<u16>,
+    #[serde(rename = "@description")]
     description: Option<String>,
+    #[serde(rename = "@gaincap")]
     gaincap: Option<u32>,
+    #[serde(rename = "@gainhp")]
     gainhp: Option<u32>,
+    #[serde(rename = "@gainmana")]
     gainmana: Option<u32>,
+    #[serde(rename = "@gainhpticks")]
     gainhpticks: Option<u32>,
+    #[serde(rename = "@gainhpamount")]
     gainhpamount: Option<u32>,
+    #[serde(rename = "@gainmanaticks")]
     gainmanaticks: Option<u32>,
+    #[serde(rename = "@gainmanaamount")]
     gainmanaamount: Option<u32>,
+    #[serde(rename = "@manamultiplier")]
     manamultiplier: Option<f32>,
+    #[serde(rename = "@attackspeed")]
     attackspeed: Option<u32>,
+    #[serde(rename = "@basespeed")]
     basespeed: Option<u32>,
+    #[serde(rename = "@soulmax")]
     soulmax: Option<u8>,
+    #[serde(rename = "@gainsoulticks")]
     gainsoulticks: Option<u16>,
+    #[serde(rename = "@fromvoc")]
     fromvoc: Option<u32>,
+    #[serde(rename = "@noPongKickTime")]
     nopongkicktime: Option<u32>,
-    skills: Option<Vec<VocationSkillJson5>>,
-    formula: Option<VocationFormulaJson5>,
+    #[serde(rename = "skill", default)]
+    skill: Option<Vec<VocationSkillXml>>,
+    #[serde(default)]
+    formula: Option<VocationFormulaXml>,
 }
 
 #[derive(Debug, Deserialize)]
-struct VocationSkillJson5 {
+struct VocationSkillXml {
+    #[serde(rename = "@id")]
     id: u8,
+    #[serde(rename = "@multiplier")]
     multiplier: f64,
 }
 
 #[derive(Debug, Deserialize)]
-struct VocationFormulaJson5 {
-    #[serde(rename = "meleeDamage")]
+struct VocationFormulaXml {
+    #[serde(rename = "@meleeDamage")]
     melee_damage: Option<f32>,
-    #[serde(rename = "distDamage")]
+    #[serde(rename = "@distDamage")]
     dist_damage: Option<f32>,
+    #[serde(rename = "@defense")]
     defense: Option<f32>,
+    #[serde(rename = "@armor")]
     armor: Option<f32>,
 }
 
@@ -249,33 +274,23 @@ mod tests {
     use super::Vocations;
 
     #[test]
-    fn load_from_json5_should_load_vocations_and_lookups() {
-        let path = std::env::temp_dir().join("tfs-rust-vocations.json5");
+    fn load_from_xml_should_load_vocations_and_lookups() {
+        let path = std::env::temp_dir().join("tfs-rust-vocations.xml");
         fs::write(
             &path,
-            r#"
-{
-  vocations: [
-    {
-      id: 1,
-      name: "Sorcerer",
-      gaincap: 10,
-      fromvoc: 0,
-      skills: [{ id: 0, multiplier: 1.7 }],
-      formula: { meleeDamage: 1.1, distDamage: 1.2, defense: 1.3, armor: 1.4 },
-    },
-    {
-      id: 5,
-      name: "Master Sorcerer",
-      fromvoc: 1,
-    },
-  ],
-}
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<vocations>
+    <vocation id="1" name="Sorcerer" gaincap="10" fromvoc="0" manamultiplier="4.0">
+        <formula meleeDamage="1.1" distDamage="1.2" defense="1.3" armor="1.4" />
+        <skill id="0" multiplier="1.7" />
+    </vocation>
+    <vocation id="5" name="Master Sorcerer" fromvoc="1" manamultiplier="4.0" />
+</vocations>
 "#,
         )
-        .expect("temp vocations json5 should be writable");
+        .expect("temp vocations xml should be writable");
 
-        let vocations = Vocations::load_from_json5(&path).expect("vocations should load");
+        let vocations = Vocations::load_from_xml(&path).expect("vocations should load");
         let vocation = vocations.get_vocation(1).expect("vocation should exist");
 
         assert_eq!(vocation.gain_cap, 1000);
@@ -283,6 +298,6 @@ mod tests {
         assert_eq!(vocations.get_promoted_vocation(1), 5);
         assert_eq!(vocation.get_req_mana(2), 6400);
 
-        fs::remove_file(path).expect("temp vocations json5 should be removable");
+        fs::remove_file(path).expect("temp vocations xml should be removable");
     }
 }

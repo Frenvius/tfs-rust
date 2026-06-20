@@ -119,7 +119,7 @@ impl Npcs {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json5") {
+            if path.extension().and_then(|e| e.to_str()) != Some("xml") {
                 continue;
             }
             if let Err(e) = self.load_npc_file(&path) {
@@ -132,40 +132,54 @@ impl Npcs {
     fn load_npc_file(&mut self, path: &std::path::Path) -> Result<(), anyhow::Error> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("read error: {}", e))?;
-        let val: serde_json::Value = json5::from_str(&content)
+        let doc = roxmltree::Document::parse(&content)
             .map_err(|e| anyhow::anyhow!("parse error: {}", e))?;
 
-        let npc = &val["npc"];
-        let name = npc["name"].as_str().unwrap_or("").to_owned();
+        let npc = doc.root_element();
+        if !npc.has_tag_name("npc") {
+            return Ok(());
+        }
+
+        let name = npc.attribute("name").unwrap_or("").to_owned();
         if name.is_empty() {
             return Ok(());
         }
 
-        let health_now = npc["health"]["now"].as_i64().unwrap_or(100) as i32;
-        let health_max = npc["health"]["max"].as_i64().unwrap_or(100) as i32;
-        let walk_interval = npc["walkinterval"].as_u64().unwrap_or(2000) as u32;
+        let walk_interval = npc.attribute("walkinterval")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000u32);
 
-        let look = &npc["look"];
-        let outfit = Outfit {
-            look_type: look["type"].as_u64().unwrap_or(0) as u16,
-            look_head: look["head"].as_u64().unwrap_or(0) as u8,
-            look_body: look["body"].as_u64().unwrap_or(0) as u8,
-            look_legs: look["legs"].as_u64().unwrap_or(0) as u8,
-            look_feet: look["feet"].as_u64().unwrap_or(0) as u8,
-            look_addons: look["addons"].as_u64().unwrap_or(0) as u8,
-            look_type_ex: 0,
-        };
+        let script_file = npc.attribute("script").unwrap_or("").to_owned();
 
-        let script_file = npc["script"].as_str().unwrap_or("").to_owned();
-
+        let mut health_now = 100i32;
+        let mut health_max = 100i32;
+        let mut outfit = Outfit::default();
         let mut parameters = HashMap::new();
-        if let Some(params) = npc["parameters"]["parameter"].as_array() {
-            for param in params {
-                let key = param["key"].as_str().unwrap_or("").to_owned();
-                let value = param["value"].as_str().unwrap_or("").to_owned();
-                if !key.is_empty() {
-                    parameters.insert(key, value);
+
+        for child in npc.children().filter(|n| n.is_element()) {
+            match child.tag_name().name() {
+                "health" => {
+                    health_now = child.attribute("now").and_then(|v| v.parse().ok()).unwrap_or(100);
+                    health_max = child.attribute("max").and_then(|v| v.parse().ok()).unwrap_or(100);
                 }
+                "look" => {
+                    outfit.look_type = child.attribute("type").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    outfit.look_head = child.attribute("head").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    outfit.look_body = child.attribute("body").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    outfit.look_legs = child.attribute("legs").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    outfit.look_feet = child.attribute("feet").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    outfit.look_addons = child.attribute("addons").and_then(|v| v.parse().ok()).unwrap_or(0);
+                }
+                "parameters" => {
+                    for param in child.children().filter(|n| n.is_element() && n.has_tag_name("parameter")) {
+                        let key = param.attribute("key").unwrap_or("").to_owned();
+                        let value = param.attribute("value").unwrap_or("").to_owned();
+                        if !key.is_empty() {
+                            parameters.insert(key, value);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

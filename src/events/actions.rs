@@ -1,49 +1,48 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
-use serde_json::Value as JsonValue;
 
 use crate::lua::script::LuaScriptInterface;
 
 // ---------------------------------------------------------------------------
-// JSON5 schema
+// XML schema
 // ---------------------------------------------------------------------------
 
-/// A single entry in `data/actions/actions.json5`. Mirrors an `<action>` node
-/// from the C++ `actions.xml`.
+/// A single entry in `data/actions/actions.xml`. Mirrors an `<action>` node.
 #[derive(Debug, Deserialize)]
 pub struct ActionEntry {
+    #[serde(rename = "@script")]
     pub script: Option<String>,
-    #[serde(rename = "itemid")]
-    pub item_id: Option<JsonValue>,
-    #[serde(rename = "fromid")]
+    #[serde(rename = "@itemid")]
+    pub item_id: Option<String>,
+    #[serde(rename = "@fromid")]
     pub from_id: Option<u16>,
-    #[serde(rename = "toid")]
+    #[serde(rename = "@toid")]
     pub to_id: Option<u16>,
-    #[serde(rename = "uniqueid")]
-    pub unique_id: Option<JsonValue>,
-    #[serde(rename = "fromuid")]
+    #[serde(rename = "@uniqueid")]
+    pub unique_id: Option<String>,
+    #[serde(rename = "@fromuid")]
     pub from_uid: Option<u16>,
-    #[serde(rename = "touid")]
+    #[serde(rename = "@touid")]
     pub to_uid: Option<u16>,
-    #[serde(rename = "actionid")]
-    pub action_id: Option<JsonValue>,
-    #[serde(rename = "fromaid")]
+    #[serde(rename = "@actionid")]
+    pub action_id: Option<String>,
+    #[serde(rename = "@fromaid")]
     pub from_aid: Option<u16>,
-    #[serde(rename = "toaid")]
+    #[serde(rename = "@toaid")]
     pub to_aid: Option<u16>,
-    #[serde(rename = "allowfaruse")]
+    #[serde(rename = "@allowfaruse")]
     pub allow_far_use: Option<bool>,
-    /// `blockwalls` maps to `checkLineOfSight` (C++ `configureEvent` parity).
-    #[serde(rename = "blockwalls")]
+    #[serde(rename = "@blockwalls")]
     pub block_walls: Option<bool>,
-    #[serde(rename = "checkfloor")]
+    #[serde(rename = "@checkfloor")]
     pub check_floor: Option<bool>,
 }
 
-/// Top-level document for `data/actions/actions.json5`.
+/// Top-level document for `data/actions/actions.xml`.
 #[derive(Debug, Deserialize)]
-pub struct ActionsFile {
+pub struct ActionsXml {
+    #[serde(rename = "action", default)]
     pub actions: Vec<ActionEntry>,
 }
 
@@ -116,22 +115,22 @@ impl Actions {
         "actions"
     }
 
-    /// Load `data/actions/actions.json5`. Returns `true` on success.
+    /// Load `data/actions/actions.xml`. Returns `true` on success.
     /// Mirrors `BaseEvents::loadFromXml()` specialised for Actions.
-    pub fn load_from_json5(&mut self) -> bool {
-        let path = "data/actions/actions.json5";
+    pub fn load_from_xml(&mut self) -> bool {
+        let path = "data/actions/actions.xml";
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Actions::load_from_json5 - {path} not found: {e}");
+                tracing::warn!("Actions::load_from_xml - {path} not found: {e}");
                 return false;
             }
         };
 
-        let file: ActionsFile = match json5::from_str(&source) {
+        let file: ActionsXml = match quick_xml::de::from_str(&source) {
             Ok(f) => f,
             Err(e) => {
-                tracing::error!("Actions::load_from_json5 - parse error in {path}: {e}");
+                tracing::error!("Actions::load_from_xml - parse error in {path}: {e}");
                 return false;
             }
         };
@@ -154,7 +153,7 @@ impl Actions {
                             .get_event("onUse");
                         if id == -1 {
                             tracing::warn!(
-                                "Actions::load_from_json5 - onUse not found in {script_path}"
+                                "Actions::load_from_xml - onUse not found in {script_path}"
                             );
                             continue;
                         }
@@ -163,7 +162,7 @@ impl Actions {
                     }
                     Err(e) => {
                         tracing::warn!(
-                            "Actions::load_from_json5 - cannot load {script_path}: {e}"
+                            "Actions::load_from_xml - cannot load {script_path}: {e}"
                         );
                         continue;
                     }
@@ -185,7 +184,7 @@ impl Actions {
                         e.insert(action.clone());
                     } else {
                         tracing::warn!(
-                            "Actions::load_from_json5 - duplicate item id: {id}"
+                            "Actions::load_from_xml - duplicate item id: {id}"
                         );
                     }
                 }
@@ -200,7 +199,7 @@ impl Actions {
                         e.insert(action.clone());
                     } else {
                         tracing::warn!(
-                            "Actions::load_from_json5 - duplicate unique id: {id}"
+                            "Actions::load_from_xml - duplicate unique id: {id}"
                         );
                     }
                 }
@@ -215,7 +214,7 @@ impl Actions {
                         e.insert(action.clone());
                     } else {
                         tracing::warn!(
-                            "Actions::load_from_json5 - duplicate action id: {id}"
+                            "Actions::load_from_xml - duplicate action id: {id}"
                         );
                     }
                 }
@@ -331,33 +330,18 @@ impl Default for Actions {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a JSON5 field that can be a single integer or an array of integers
-/// into a `Vec<u16>`. Also handles an optional `from`/`to` range pair.
+/// Parse an XML attribute string that can be a single integer into a `Vec<u16>`.
+/// Also handles an optional `from`/`to` range pair.
 fn collect_ids(
-    value: &Option<JsonValue>,
+    value: &Option<String>,
     from: Option<u16>,
     to: Option<u16>,
 ) -> Vec<u16> {
     let mut ids: Vec<u16> = Vec::new();
 
-    if let Some(v) = value {
-        match v {
-            JsonValue::Number(n) => {
-                if let Some(id) = n.as_u64().and_then(|n| u16::try_from(n).ok()) {
-                    ids.push(id);
-                }
-            }
-            JsonValue::Array(arr) => {
-                for item in arr {
-                    if let Some(id) = item
-                        .as_u64()
-                        .and_then(|n| u16::try_from(n).ok())
-                    {
-                        ids.push(id);
-                    }
-                }
-            }
-            _ => {}
+    if let Some(s) = value {
+        if let Ok(id) = s.trim().parse::<u16>() {
+            ids.push(id);
         }
     }
 

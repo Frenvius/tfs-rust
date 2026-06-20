@@ -4,9 +4,8 @@ use serde::{Deserialize, Deserializer};
 use crate::events::registry::{g_script_registry, SpellEntry};
 use crate::lua::script::g_lua;
 
-/// Deserialize a 0/1 flag that the XML→JSON5 migration may emit as either a
-/// boolean (`true`/`false`), an integer (`1`/`0`), or a string (`"1"`/`"true"`).
-/// Mirrors the C++ `pugicast` helpers, which accept all of these forms.
+/// Deserialize a 0/1 flag that the XML may emit as a string (`"1"`/`"true"`/`"0"`/`"false"`).
+/// Mirrors the C++ `pugicast` helpers.
 fn flag_u8<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u8, D::Error> {
     struct FlagVisitor;
     impl serde::de::Visitor<'_> for FlagVisitor {
@@ -44,70 +43,72 @@ fn opt_flag_u8<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
-struct SpellsFile {
-    spells: SpellsRoot,
+enum SpellNode {
+    #[serde(rename = "instant")]
+    Instant(SpellDef),
+    #[serde(rename = "rune")]
+    Rune(SpellDef),
 }
 
 #[derive(Debug, Deserialize)]
-struct SpellsRoot {
-    #[serde(default)]
-    instants: Vec<SpellDef>,
-    #[serde(default)]
-    runes: Vec<SpellDef>,
+struct SpellsXml {
+    #[serde(rename = "$value", default)]
+    entries: Vec<SpellNode>,
 }
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct SpellDef {
-    #[serde(default)]
+    #[serde(rename = "@name", default)]
     name: String,
-    #[serde(default)]
+    #[serde(rename = "@words", default)]
     words: String,
-    #[serde(default)]
+    #[serde(rename = "@group", default)]
     group: String,
-    #[serde(default)]
+    #[serde(rename = "@level", default)]
     level: u32,
-    #[serde(rename = "magiclevel", default)]
+    #[serde(rename = "@magiclevel", default)]
     magic_level: u32,
-    #[serde(default)]
+    #[serde(rename = "@mana", default)]
     mana: u32,
-    #[serde(rename = "manaPercent", default)]
+    #[serde(rename = "@manaPercent", default)]
     mana_percent: u32,
-    #[serde(default)]
+    #[serde(rename = "@soul", default)]
     soul: u32,
-    #[serde(default)]
+    #[serde(rename = "@range", default)]
     #[allow(dead_code)]
     range: i32,
-    #[serde(default)]
+    #[serde(rename = "@cooldown", default)]
     cooldown: u32,
-    #[serde(rename = "groupcooldown", default)]
+    #[serde(rename = "@groupcooldown", default)]
     group_cooldown: u32,
-    #[serde(default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@premium", default, deserialize_with = "flag_u8")]
     #[allow(dead_code)]
     premium: u8,
-    #[serde(default, deserialize_with = "opt_flag_u8")]
+    #[serde(rename = "@enabled", default, deserialize_with = "opt_flag_u8")]
     enabled: Option<u8>,
-    #[serde(default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@needlearn", default, deserialize_with = "flag_u8")]
     needlearn: u8,
-    #[serde(default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@needweapon", default, deserialize_with = "flag_u8")]
     needweapon: u8,
-    #[serde(default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@needtarget", default, deserialize_with = "flag_u8")]
     needtarget: u8,
-    #[serde(default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@selftarget", default, deserialize_with = "flag_u8")]
     selftarget: u8,
-    #[serde(default)]
+    #[serde(rename = "@aggressive", default)]
     aggressive: Option<i32>,
-    #[serde(default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@hasparams", default, deserialize_with = "flag_u8")]
     hasparams: u8,
-    #[serde(rename = "hasplayernameparam", default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@hasplayernameparam", default, deserialize_with = "flag_u8")]
     has_player_name_param: u8,
-    #[serde(rename = "pzlock", default, deserialize_with = "flag_u8")]
+    #[serde(rename = "@pzlock", default, deserialize_with = "flag_u8")]
     pz_lock: u8,
+    #[serde(rename = "@script")]
     script: Option<String>,
 }
 
 pub fn load_spells() {
-    let path = "data/spells/spells.json5";
+    let path = "data/spells/spells.xml";
     if !std::path::Path::new(path).exists() {
         return;
     }
@@ -117,16 +118,17 @@ pub fn load_spells() {
         Err(e) => { tracing::error!("Failed to read {path}: {e}"); return; }
     };
 
-    let file: SpellsFile = match json5::from_str(&text) {
+    let file: SpellsXml = match quick_xml::de::from_str(&text) {
         Ok(f) => f,
         Err(e) => { tracing::error!("Failed to parse {path}: {e}"); return; }
     };
 
     let mut count = 0usize;
 
-    let all_spells = file.spells.instants.iter()
-        .map(|s| (1i32, s))
-        .chain(file.spells.runes.iter().map(|s| (2i32, s)));
+    let all_spells = file.entries.iter().map(|node| match node {
+        SpellNode::Instant(s) => (1i32, s),
+        SpellNode::Rune(s) => (2i32, s),
+    });
 
     for (spell_type, def) in all_spells {
         if def.words.is_empty() && spell_type == 1 { continue; }

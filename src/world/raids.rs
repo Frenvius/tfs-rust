@@ -201,7 +201,7 @@ impl Raid {
         }
     }
 
-    pub fn load_from_json5(&mut self, _path: &std::path::Path) -> Result<(), anyhow::Error> {
+    pub fn load_from_xml(&mut self, _path: &std::path::Path) -> Result<(), anyhow::Error> {
         if self.is_loaded() {
             return Ok(());
         }
@@ -272,7 +272,7 @@ impl Raids {
     pub fn check_raids(&mut self) {
     }
 
-    pub fn load_from_json5(&mut self, _path: &std::path::Path) -> Result<(), anyhow::Error> {
+    pub fn load_from_xml(&mut self, _path: &std::path::Path) -> Result<(), anyhow::Error> {
         if self.is_loaded() {
             return Ok(());
         }
