@@ -2646,27 +2646,33 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
         None => return,
     };
 
-    let item_idx = if from_stackpos == 0 && from_tile.ground.is_some() {
-        None
+    // Resolve the clicked thing in client stack order: ground, top, creature, down.
+    let g = if from_tile.ground.is_some() { 1usize } else { 0 };
+    let down_count = from_tile.get_down_item_count();
+    let top_count = from_tile.items.len().saturating_sub(down_count);
+    let ncre = from_tile.creature_ids.len();
+    let s = from_stackpos as usize;
+
+    if s >= g + top_count && s < g + top_count + ncre {
+        let cre_off = s - (g + top_count);
+        let pushed_creature_id = from_tile.creature_ids[ncre - 1 - cre_off];
+        drop(game);
+        handle_push_creature_free(creature_id, pushed_creature_id, to_pos);
+        return;
+    }
+
+    let item_idx = if s >= g && s < g + top_count {
+        Some(down_count + (s - g)) // top item
+    } else if s >= g + top_count + ncre {
+        let di = s - (g + top_count + ncre);
+        if di < down_count { Some(di) } else { None } // down item
     } else {
-        let ground_offset = if from_tile.ground.is_some() { 1 } else { 0 };
-        let idx = (from_stackpos as usize).saturating_sub(ground_offset);
-        if idx < from_tile.creature_ids.len() {
-            let pushed_creature_id = from_tile.creature_ids[from_tile.creature_ids.len() - 1 - idx];
-            drop(game);
-            handle_push_creature_free(creature_id, pushed_creature_id, to_pos);
-            return;
-        }
-        let item_idx = idx - from_tile.creature_ids.len();
-        if item_idx >= from_tile.items.len() {
-            return;
-        }
-        Some(item_idx)
+        None // ground or out of range
     };
 
     let item = match item_idx {
-        Some(idx) => from_tile.items[idx].clone(),
-        None => return,
+        Some(idx) if idx < from_tile.items.len() => from_tile.items[idx].clone(),
+        _ => return,
     };
 
     let it = game.items.get_item_type(item.server_id as usize);
@@ -3770,9 +3776,9 @@ fn extract_move_item(
         }
         MoveEndpoint::Ground { pos, stackpos } => {
             let tile = game.map.get_tile_mut(pos)?;
-            let ground_off = if tile.ground.is_some() { 1 } else { 0 };
-            let idx = (stackpos as usize).checked_sub(ground_off + tile.creature_ids.len())?;
-            tile.remove_item_at(idx).map(|(it, _)| it)
+            let vi = tile.use_item_vec_index(stackpos);
+            if vi < 0 { return None; }
+            tile.remove_item_at(vi as usize).map(|(it, _)| it)
         }
     }
 }
@@ -3938,8 +3944,9 @@ fn peek_trade_item(
     match *ep {
         MoveEndpoint::Ground { pos, stackpos } => {
             let tile = game.map.get_tile(pos)?;
-            let ground_off = if tile.ground.is_some() { 1 } else { 0 };
-            let idx = (stackpos as usize).checked_sub(ground_off + tile.creature_ids.len())?;
+            let vi = tile.use_item_vec_index(stackpos);
+            if vi < 0 { return None; }
+            let idx = vi as usize;
             let item = tile.items.get(idx)?.clone();
             Some((item, TradeItemLoc::Tile(pos, idx)))
         }
@@ -5246,8 +5253,9 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
         if dx > 1 || dy > 1 || ppos.z != from_pos.z { return; }
 
         let Some(tile) = game.map.get_tile(from_pos) else { return };
-        let ground_off: usize = if tile.ground.is_some() { 1 } else { 0 };
-        let idx_in_tile = (from_stackpos as usize).saturating_sub(ground_off + tile.creature_ids.len());
+        let vi = tile.use_item_vec_index(from_stackpos);
+        if vi < 0 { return; }
+        let idx_in_tile = vi as usize;
         let Some(item) = tile.items.get(idx_in_tile) else { return };
         let it = game.items.get_item_type(item.server_id as usize);
         if it.client_id != sprite_id { return; }
