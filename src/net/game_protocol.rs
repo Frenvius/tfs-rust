@@ -2719,16 +2719,21 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
         (removed_sp, add_sp, delivered)
     };
 
-    let mut game = g_game().lock().unwrap();
-    let from_spectators = game.map.get_spectators(from_pos, true, true, 0, 0, 0, 0);
-    let to_spectators = game.map.get_spectators(to_pos, true, true, 0, 0, 0, 0);
-    let sessions = player_sessions().lock().unwrap();
+    // Collect spectators, then drop g_game BEFORE sending: send_packet_to_player
+    // locks player_sessions, and holding g_game across that lock inverts the
+    // g_game→player_sessions order used everywhere else, wedging the server.
+    let (from_spectators, to_spectators) = {
+        let mut game = g_game().lock().unwrap();
+        (
+            game.map.get_spectators(from_pos, true, true, 0, 0, 0, 0),
+            game.map.get_spectators(to_pos, true, true, 0, 0, 0, 0),
+        )
+    };
 
-    for &spec_id in &from_spectators {
-        let Some(session) = sessions.get(&spec_id) else { continue };
-        let mut output = OutputMessage::new();
-        write_remove_tile_thing(&mut output, from_pos, removed_stackpos);
-        finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
+    for spec_id in from_spectators {
+        send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
+            write_remove_tile_thing(output, from_pos, removed_stackpos);
+        });
     }
 
     if delivered_to_mailbox {
@@ -2736,11 +2741,12 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
     }
 
     let Some(add_stackpos) = add_stackpos else { return };
-    for &spec_id in &to_spectators {
-        let Some(session) = sessions.get(&spec_id) else { continue };
-        let mut output = OutputMessage::new();
-        write_add_tile_item(&mut output, to_pos, add_stackpos, &item, &game.items);
-        finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
+    for spec_id in to_spectators {
+        let item = item.clone();
+        let items_ref = items_arc.clone();
+        send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
+            write_add_tile_item(output, to_pos, add_stackpos, &item, &items_ref);
+        });
     }
 }
 
@@ -3251,20 +3257,22 @@ fn handle_push_creature_free(player_id: CreatureId, pushed_creature_id: Creature
 
     broadcast_creature_move(pushed_creature_id, old_pos, to_pos, old_stackpos);
 
-    {
+    let pushed_is_player = {
         let game = g_game().lock().unwrap();
-        if game.get_creature(pushed_creature_id).map(|c| c.is_player()).unwrap_or(false)
-            && pushed_creature_id != player_id
-        {
-            let sessions = player_sessions().lock().unwrap();
-            if let Some(session) = sessions.get(&pushed_creature_id) {
-                let known = &mut session.known_creatures.lock().unwrap();
-                let mut output = OutputMessage::new();
-                output.add_byte(0x6D);
-                write_creature_movement(&mut output, old_pos, to_pos, old_stackpos, pushed_creature_id);
-                append_walk_map_slices(&mut output, &game, game.get_items(), known, old_pos, to_pos);
-                finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
-            }
+        game.get_creature(pushed_creature_id).map(|c| c.is_player()).unwrap_or(false)
+    };
+    if pushed_is_player && pushed_creature_id != player_id {
+        // Lock player_sessions BEFORE g_game (the order used everywhere else);
+        // inverting it wedges the server.
+        let sessions = player_sessions().lock().unwrap();
+        if let Some(session) = sessions.get(&pushed_creature_id) {
+            let known = &mut session.known_creatures.lock().unwrap();
+            let game = g_game().lock().unwrap();
+            let mut output = OutputMessage::new();
+            output.add_byte(0x6D);
+            write_creature_movement(&mut output, old_pos, to_pos, old_stackpos, pushed_creature_id);
+            append_walk_map_slices(&mut output, &game, game.get_items(), known, old_pos, to_pos);
+            finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
         }
     }
 }
