@@ -29,6 +29,7 @@ pub const TEXTCOLOR_TEAL: u8 = 143;
 pub const TEXTCOLOR_PURPLE: u8 = 154;
 pub const TEXTCOLOR_RED: u8 = 180;
 pub const TEXTCOLOR_ORANGE: u8 = 192;
+pub const TEXTCOLOR_PASTELRED: u8 = 194;
 pub const TEXTCOLOR_YELLOW: u8 = 210;
 pub const TEXTCOLOR_WHITE: u8 = 215;
 pub const TEXTCOLOR_NONE: u8 = 255;
@@ -1795,6 +1796,43 @@ impl Game {
         });
     }
 
+    /// Send a combat text message carrying the floating damage/heal numbers.
+    ///
+    /// On 10.98 the floating number is embedded in the 0xB4 text message
+    /// (position + value(s) + color(s), keyed off the DAMAGE_*/HEALED* class).
+    /// On 8.60 those classes don't exist on the wire — the float is the
+    /// separate 0x84 AnimatedText, so fall back to a plain status message.
+    #[allow(clippy::too_many_arguments)]
+    fn send_combat_text_message(
+        &mut self,
+        player_id: CreatureId,
+        wire_type: u8,
+        pos: Position,
+        primary_value: u32,
+        primary_color: u8,
+        secondary_value: u32,
+        secondary_color: u8,
+        text: String,
+    ) {
+        if !crate::net::protocol_version::client_version().is_1098() {
+            self.send_text_message(player_id, MESSAGE_STATUS_DEFAULT, text);
+            return;
+        }
+        let has_secondary = matches!(wire_type, 23 | 24 | 27);
+        send_packet_to_player(player_id, move |output: &mut OutputMessage| {
+            output.add_byte(0xB4);
+            output.add_byte(wire_type);
+            output.add_position(pos.x, pos.y, pos.z);
+            output.add_u32(primary_value);
+            output.add_byte(primary_color);
+            if has_secondary {
+                output.add_u32(secondary_value);
+                output.add_byte(secondary_color);
+            }
+            output.add_string(text.as_bytes());
+        });
+    }
+
     // ── Block check ──────────────────────────────────────────────────────────
 
     /// Returns the block effect to play for a given block type and combat type.
@@ -2005,7 +2043,8 @@ impl Game {
                             }
                         }
                     };
-                    self.send_text_message(spec_id, MESSAGE_STATUS_DEFAULT, msg);
+                    let wire_type = if is_attacker || is_target { 25 } else { 28 };
+                    self.send_combat_text_message(spec_id, wire_type, target_pos, real_change as u32, TEXTCOLOR_PASTELRED, 0, TEXTCOLOR_NONE, msg);
                 }
             }
 
@@ -2104,7 +2143,8 @@ impl Game {
                         }
                     }
                 };
-                self.send_text_message(spec_id, MESSAGE_STATUS_DEFAULT, msg);
+                let wire_type = if is_attacker && !is_target { 23 } else if is_target { 24 } else { 27 };
+                self.send_combat_text_message(spec_id, wire_type, target_pos, mana_damage as u32, TEXTCOLOR_BLUE, 0, TEXTCOLOR_NONE, msg);
             }
 
             // reduce from damage
@@ -2222,7 +2262,10 @@ impl Game {
                         }
                     }
                 };
-                self.send_text_message(spec_id, MESSAGE_STATUS_DEFAULT, msg);
+                let wire_type = if is_attacker && !is_target { 23 } else if is_target { 24 } else { 27 };
+                let p_color = if clamped_primary > 0 { primary_color } else { TEXTCOLOR_NONE };
+                let s_color = if clamped_secondary > 0 { secondary_color } else { TEXTCOLOR_NONE };
+                self.send_combat_text_message(spec_id, wire_type, target_pos, clamped_primary as u32, p_color, clamped_secondary as u32, s_color, msg);
             }
         }
 
@@ -2714,7 +2757,7 @@ impl Game {
         } else {
             format!("You gained {} experience point{}.", gained, if gained != 1 { "s" } else { "" })
         };
-        self.send_text_message(attacker_id, MESSAGE_STATUS_DEFAULT, msg);
+        self.send_combat_text_message(attacker_id, 26, target_pos, gained as u32, TEXTCOLOR_WHITE, 0, TEXTCOLOR_NONE, msg);
 
         if leveled_up {
             // Send level-up magic effect + 0x82 magic effect at player position.
