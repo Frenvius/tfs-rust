@@ -69,10 +69,8 @@ pub fn rsa_decrypt(msg: &mut NetworkMessage) -> bool {
     let pos = msg.get_buffer_position() as usize;
     let body_len = msg.get_length() as usize;
 
-    // available bytes from current position to end of body
-    // body starts at buffer[2], body_len bytes; pos is absolute
     let available = body_len + 2 - pos;
-    if available != 128 {
+    if available < 128 {
         return false;
     }
 
@@ -80,9 +78,11 @@ pub fn rsa_decrypt(msg: &mut NetworkMessage) -> bool {
         .decrypt_block(&mut msg.buffer_mut()[pos..pos + 128])
         .is_err()
     {
+        tracing::info!("rsa_decrypt: decrypt_block failed");
         return false;
     }
 
-    // first decrypted byte must be 0x00
-    msg.get_byte() == 0
+    let first_byte = msg.get_byte();
+    tracing::info!(first_byte, "rsa_decrypt: first decrypted byte");
+    first_byte == 0
 }

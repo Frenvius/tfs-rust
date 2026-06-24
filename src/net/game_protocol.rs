@@ -21,6 +21,7 @@ use crate::net::connection::ConnectionHandle;
 use crate::net::message::NetworkMessage;
 use crate::net::output_message::OutputMessage;
 use crate::net::protocol::{rsa_decrypt, ProtocolCrypto};
+use crate::net::protocol_version::{client_version, translate_message_class_to_client, translate_speak_class_to_client};
 use crate::util::adler_checksum;
 
 struct PlayerSession {
@@ -148,9 +149,10 @@ pub fn send_teleport_map_to_player(creature_id: CreatureId, old_pos: Position, o
 /// Send a 0xB4 MESSAGE_STATUS_SMALL text line to a player's session.
 fn send_status_message_to_player(creature_id: CreatureId, text: &str) {
     let bytes = text.as_bytes().to_vec();
+    let msg_type = crate::net::protocol_version::message_status_small();
     send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
         output.add_byte(0xB4);
-        output.add_byte(0x04); // MESSAGE_STATUS_SMALL
+        output.add_byte(msg_type);
         output.add_string(&bytes);
     });
 }
@@ -457,9 +459,6 @@ pub fn broadcast_effect_to_spectators(pos: Position, build_fn: impl Fn(&mut Outp
     }
 }
 
-const CLIENT_VERSION_MIN: u16 = 860;
-const CLIENT_VERSION_MAX: u16 = 860;
-
 const MAP_MAX_LAYERS: i32 = 16;
 const USE_TELEPORT_UP_IDS: &[u16] = &[1386, 3678, 5543];
 const USE_TELEPORT_DOWN_IDS: &[u16] = &[430, 1369];
@@ -518,8 +517,17 @@ impl ProtocolGame {
         msg: &mut NetworkMessage,
         conn: &ConnectionHandle,
     ) {
+        let is_1098 = client_version().is_1098();
+        let version_min = client_version().min_version();
+        let version_max = client_version().max_version();
+
         let _os = msg.get_u16();
         let version = msg.get_u16();
+
+        if is_1098 {
+            // 10.98: clientVersion(u32) + clientType(u8) + datRevision(u16) = 7 bytes
+            msg.skip_bytes(7);
+        }
 
         if !rsa_decrypt(msg) {
             conn.disconnect();
@@ -531,12 +539,26 @@ impl ProtocolGame {
 
         msg.skip_bytes(1); // gamemaster flag
 
-        let account_name_bytes = msg.get_string(None);
-        let account_name = String::from_utf8_lossy(&account_name_bytes).into_owned();
-        let char_name_bytes = msg.get_string(None);
-        let char_name = String::from_utf8_lossy(&char_name_bytes).into_owned();
-        let password_bytes = msg.get_string(None);
-        let password = String::from_utf8_lossy(&password_bytes).into_owned();
+        let (account_name, char_name, password) = if is_1098 {
+            // 10.98: session key string "accountName\npassword\ntoken\ntokenTime"
+            let session_bytes = msg.get_string(None);
+            let session = String::from_utf8_lossy(&session_bytes).into_owned();
+            let parts: Vec<&str> = session.splitn(4, '\n').collect();
+            let acc = parts.first().copied().unwrap_or("").to_string();
+            let pwd = parts.get(1).copied().unwrap_or("").to_string();
+            let char_bytes = msg.get_string(None);
+            let chr = String::from_utf8_lossy(&char_bytes).into_owned();
+            (acc, chr, pwd)
+        } else {
+            // 8.60: separate account/char/password fields
+            let account_name_bytes = msg.get_string(None);
+            let account_name = String::from_utf8_lossy(&account_name_bytes).into_owned();
+            let char_name_bytes = msg.get_string(None);
+            let char_name = String::from_utf8_lossy(&char_name_bytes).into_owned();
+            let password_bytes = msg.get_string(None);
+            let password = String::from_utf8_lossy(&password_bytes).into_owned();
+            (account_name, char_name, password)
+        };
 
         if account_name.is_empty() {
             self.disconnect_client(conn, "You must enter your account name.");
@@ -550,11 +572,11 @@ impl ProtocolGame {
             return;
         }
 
-        if version < CLIENT_VERSION_MIN || version > CLIENT_VERSION_MAX {
+        if version < version_min || version > version_max {
             self.disconnect_client(conn, &format!(
                 "Only clients with protocol {}.{} allowed!",
-                CLIENT_VERSION_MIN / 100,
-                CLIENT_VERSION_MIN % 100
+                version_min / 100,
+                version_min % 100
             ));
             return;
         }
@@ -583,6 +605,18 @@ impl ProtocolGame {
                 return;
             }
         };
+        // C++ ProtocolGame::login checks getPlayerByName first and kicks
+        // the old session before placing the new one.  Without this, a
+        // lingering old connection (e.g. unclean disconnect) leaves the
+        // player in the world and the new login either double-inserts or
+        // gets rejected.
+        {
+            let existing_id = g_game().lock().unwrap().get_player_id_by_name(&char_name);
+            if let Some(old_id) = existing_id {
+                tracing::info!(char_name = %char_name, old_id, "game login: kicking stale session");
+                kick_player_by_id(old_id);
+            }
+        }
 
         // Assign creature ID and track player in the game.
         let (creature_id, player_guid) = {
@@ -652,45 +686,92 @@ impl ProtocolGame {
             let (light_level, light_color) = game.get_world_light_info();
             let c_light = player.base.internal_light;
 
-            // 0x0A: player self-init
-            output.add_byte(0x0A);
-            output.add_u32(creature_id);
-            output.add_u16(0x32);
-            output.add_byte(u8::from(can_report_bugs));
+            if is_1098 {
+                // 10.98 login sequence (Player::onCreatureAppear, creature==this):
+                // C++ uses writeToOutputBuffer which auto-splits. We send each
+                // major section as a separate XTEA frame since the 10.98 map +
+                // mark bytes exceed a single OutputMessage.
 
-            // 0x64: map description (also inserts creature into known set)
-            write_map_description(&mut output, &game, game.get_items(), pos,
-                &mut known, creature_id, player);
+                // Frame 1: pending + enter world
+                output.add_byte(0x0A); // sendPendingStateEntered
+                output.add_byte(0x0F); // sendEnterWorld
 
+                // Frame 2: map description (largest payload — own frame)
+                let rk = Arc::new(**self.crypto.round_keys.as_ref().expect("xtea keys set"));
+                finalize_and_send(&mut output, &rk, self.checksummed, conn);
 
-            // 0x78/0x79: inventory slots
-            for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
-                if let Some(server_id) = player.inventory[slot] {
-                    output.add_byte(0x78);
-                    output.add_byte(slot as u8);
-                    write_item(&mut output, game.get_items(), server_id, 1);
-                } else {
-                    output.add_byte(0x79);
-                    output.add_byte(slot as u8);
+                output = OutputMessage::new();
+                write_map_description(&mut output, &game, game.get_items(), pos,
+                    &mut known, creature_id, player);
+                finalize_and_send(&mut output, &rk, self.checksummed, conn);
+
+                // Frame 3: inventory + stats + skills + lights + basic data
+                output = OutputMessage::new();
+                for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+                    if let Some(server_id) = player.inventory[slot] {
+                        output.add_byte(0x78);
+                        output.add_byte(slot as u8);
+                        write_item(&mut output, game.get_items(), server_id, 1);
+                    } else {
+                        output.add_byte(0x79);
+                        output.add_byte(slot as u8);
+                    }
                 }
+
+                write_player_stats(&mut output, player);
+                write_player_skills(&mut output, player);
+
+                output.add_byte(0x82); // world light
+                output.add_byte(if is_access { 0xFF } else { light_level });
+                output.add_byte(light_color);
+
+                output.add_byte(0x8D); // creature light
+                output.add_u32(creature_id);
+                output.add_byte(if is_access { 0xFF } else { c_light.level });
+                output.add_byte(c_light.color);
+
+                write_basic_data(&mut output, player);
+                // Icons handled below (shared with 8.60)
+            } else {
+                // 0x0A: 8.60 player self-init
+                output.add_byte(0x0A);
+                output.add_u32(creature_id);
+                output.add_u16(0x32);
+                output.add_byte(u8::from(can_report_bugs));
+
+                // 0x64: map description
+                write_map_description(&mut output, &game, game.get_items(), pos,
+                    &mut known, creature_id, player);
+
+                // 0x78/0x79: inventory slots
+                for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+                    if let Some(server_id) = player.inventory[slot] {
+                        output.add_byte(0x78);
+                        output.add_byte(slot as u8);
+                        write_item(&mut output, game.get_items(), server_id, 1);
+                    } else {
+                        output.add_byte(0x79);
+                        output.add_byte(slot as u8);
+                    }
+                }
+
+                // 0xA0: player stats
+                write_player_stats(&mut output, player);
+
+                // 0xA1: player skills
+                write_player_skills(&mut output, player);
+
+                // 0x82: world light
+                output.add_byte(0x82);
+                output.add_byte(if is_access { 0xFF } else { light_level });
+                output.add_byte(light_color);
+
+                // 0x8D: creature light
+                output.add_byte(0x8D);
+                output.add_u32(creature_id);
+                output.add_byte(if is_access { 0xFF } else { c_light.level });
+                output.add_byte(c_light.color);
             }
-
-            // 0xA0: player stats
-            write_player_stats(&mut output, player);
-
-            // 0xA1: player skills
-            write_player_skills(&mut output, player);
-
-            // 0x82: world light
-            output.add_byte(0x82);
-            output.add_byte(if is_access { 0xFF } else { light_level });
-            output.add_byte(light_color);
-
-            // 0x8D: creature light
-            output.add_byte(0x8D);
-            output.add_u32(creature_id);
-            output.add_byte(if is_access { 0xFF } else { c_light.level });
-            output.add_byte(c_light.color);
 
             // 0xA2: player icons (condition icons + PZ/pzblock state)
             {
@@ -824,6 +905,7 @@ impl ProtocolGame {
         let opcode = msg.get_byte();
         match opcode {
             0x14 => self.handle_logout(conn),
+            0x1D => self.handle_ping_back(), // 10.98 ping back
             0x1E => self.handle_ping_back(),
             0x32 => self.parse_extended_opcode(msg),
             0x64 => self.parse_auto_walk(msg, conn),
@@ -836,6 +918,12 @@ impl ProtocolGame {
             0x6B => self.handle_walk(conn, Direction::SouthEast),
             0x6C => self.handle_walk(conn, Direction::SouthWest),
             0x6D => self.handle_walk(conn, Direction::NorthWest),
+            0x73 => { // GM teleport (10.98)
+                let _pos = msg.get_position();
+            }
+            0x77 => { // equip object (10.98)
+                let _sprite_id = msg.get_u16();
+            }
             0x6F => self.handle_turn(conn, Direction::North),
             0x70 => self.handle_turn(conn, Direction::East),
             0x71 => self.handle_turn(conn, Direction::South),
@@ -881,10 +969,19 @@ impl ProtocolGame {
             0xBE => self.handle_cancel_attack_and_follow(),
             0xC9 => {} // update tile (no-op)
             0xCA => self.parse_update_container(msg, conn),
+            0xCB => { msg.skip_bytes(5); } // browse field (stub)
+            0xCC => { msg.skip_bytes(3); } // seek in container (stub)
             0xD2 => self.handle_request_outfit(conn),
             0xD3 => self.parse_set_outfit(msg, conn),
+            0xD4 => { msg.skip_bytes(1); } // toggle mount (stub)
             0xDC => self.parse_add_vip(msg, conn),
             0xDD => self.parse_remove_vip(msg),
+            0xDE => { // edit VIP (10.98 stub)
+                let _guid = msg.get_u32();
+                let _ = msg.get_string(None); // description
+                let _icon = msg.get_u32();
+                let _notify = msg.get_byte();
+            }
             0xE6 => self.parse_bug_report(msg),
             0xE7 => {} // thank you (no-op)
             0xE8 => self.parse_debug_assert(msg),
@@ -892,6 +989,12 @@ impl ProtocolGame {
             0xF1 => self.parse_quest_line(msg, conn),
             0xF2 => self.parse_rule_violation_report(msg),
             0xF3 => {} // get object info (no-op)
+            0xF4..=0xF8 => {} // market opcodes (stub)
+            0xF9 => { // modal window answer (stub)
+                let _ = msg.get_u32(); // window id
+                let _ = msg.get_byte(); // button
+                let _ = msg.get_byte(); // choice
+            }
             _ => debug!(opcode, "unhandled opcode"),
         }
     }
@@ -1002,12 +1105,16 @@ impl ProtocolGame {
         let stackpos = msg.get_byte();
         let _index = msg.get_byte();
 
+        tracing::info!(creature_id = self.creature_id, ?pos, sprite_id, stackpos, "handle_use_item: received");
+
         let Some((server_id, old_pos, is_pz_locked)) =
             resolve_player_item_for_use(self.creature_id, pos, stackpos, sprite_id, false)
         else {
+            tracing::info!(sprite_id, "handle_use_item: resolve failed");
             send_status_message(&mut self.crypto, conn, b"Sorry, not possible.");
             return;
         };
+        tracing::info!(server_id, "handle_use_item: resolved");
 
         let (action_id, unique_id, item_index) = {
             let game = g_game().lock().unwrap();
@@ -1022,6 +1129,7 @@ impl ProtocolGame {
             }
         };
 
+        tracing::info!(server_id, action_id, unique_id, item_index, "handle_use_item: dispatching action");
         if crate::events::dispatch::execute_action_use(
             self.creature_id,
             pos,
@@ -1468,7 +1576,8 @@ impl ProtocolGame {
             return;
         }
 
-        let speak_type = msg.get_byte();
+        let speak_type_wire = msg.get_byte();
+        let speak_type = crate::net::protocol_version::translate_speak_class_from_client(speak_type_wire);
 
         let mut receiver = Vec::new();
         let mut channel_id: u16 = 0;
@@ -1483,7 +1592,6 @@ impl ProtocolGame {
 
         match speak_type {
             TALKTYPE_PRIVATE | TALKTYPE_PRIVATE_RED => { receiver = msg.get_string(None); }
-            // CHANNEL_O does NOT read channelId in C++ (falls through to default, channelId=0)
             TALKTYPE_CHANNEL_Y | TALKTYPE_CHANNEL_R1 | TALKTYPE_CHANNEL_R2 => { channel_id = msg.get_u16(); }
             _ => {}
         }
@@ -3485,7 +3593,7 @@ impl ProtocolGame {
             send_packet_to_player(creature_id, |output: &mut OutputMessage| {
                 let msg = b"Trade cancelled.";
                 output.add_byte(0xB4);
-                output.add_byte(0x04); // MESSAGE_STATUS_SMALL
+                output.add_byte(translate_message_class_to_client(0x04));
                 output.add_u16(msg.len() as u16);
                 output.add_bytes(msg);
             });
@@ -3512,7 +3620,7 @@ impl ProtocolGame {
                 send_packet_to_player(partner_id, |output: &mut OutputMessage| {
                     let msg = b"Trade cancelled.";
                     output.add_byte(0xB4);
-                    output.add_byte(0x04);
+                    output.add_byte(translate_message_class_to_client(0x04));
                     output.add_u16(msg.len() as u16);
                     output.add_bytes(msg);
                 });
@@ -3745,6 +3853,10 @@ impl ProtocolGame {
             output.add_byte(*addons);
         }
 
+        if client_version().is_1098() {
+            output.add_byte(0); // mount count (mounts not loaded yet)
+        }
+
         self.crypto.finalize_output(&mut output);
         conn.send_bytes(output.get_output_buffer().to_vec());
     }
@@ -3766,6 +3878,7 @@ impl ProtocolGame {
             look_legs,
             look_feet,
             look_addons,
+            look_mount: if crate::net::protocol_version::client_version().is_1098() { msg.get_u16() } else { 0 },
         };
 
         let pos = {
@@ -3830,10 +3943,7 @@ impl ProtocolGame {
             }
 
             let mut output = OutputMessage::new();
-            output.add_byte(0xD2);
-            output.add_u32(guid);
-            output.add_string(target_name.as_bytes());
-            output.add_byte(1); // online
+            write_vip(&mut output, guid, &target_name, true);
             self.crypto.finalize_output(&mut output);
             conn.send_bytes(output.get_output_buffer().to_vec());
         } else {
@@ -3867,10 +3977,7 @@ impl ProtocolGame {
                         let sessions = player_sessions().lock().unwrap();
                         if let Some(session) = sessions.get(&cid) {
                             let mut output = OutputMessage::new();
-                            output.add_byte(0xD2);
-                            output.add_u32(guid);
-                            output.add_string(db_name.as_bytes());
-                            output.add_byte(0); // offline
+                            write_vip(&mut output, guid, &db_name, false);
                             finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
                         }
                     }
@@ -3983,7 +4090,7 @@ impl ProtocolGame {
         };
         let mut output = OutputMessage::new();
         output.add_byte(0xB4);
-        output.add_byte(26);
+        output.add_byte(translate_message_class_to_client(26));
         output.add_string(message);
         output.add_byte(0xB5);
         output.add_byte(player_dir as u8);
@@ -4075,8 +4182,6 @@ pub fn kick_player_by_id(creature_id: CreatureId) {
 
 impl Drop for ProtocolGame {
     fn drop(&mut self) {
-        // accept_packets is true while a player is actively logged in.
-        // If it's still true at drop time, the connection was lost without a clean logout.
         if self.accept_packets && self.creature_id != 0 {
             perform_player_logout(self.creature_id);
         }
@@ -4123,7 +4228,7 @@ fn resolve_player_item_for_use(
 fn send_status_message(crypto: &mut ProtocolCrypto, conn: &ConnectionHandle, message: &[u8]) {
     let mut output = OutputMessage::new();
     output.add_byte(0xB4);
-    output.add_byte(26);
+    output.add_byte(translate_message_class_to_client(26)); // MESSAGE_STATUS_SMALL
     output.add_string(message);
     crypto.finalize_output(&mut output);
     conn.send_bytes(output.get_output_buffer().to_vec());
@@ -4896,32 +5001,31 @@ fn write_tile_description(
 ) {
     let mut count: i32 = 0;
 
+    if client_version().is_1098() {
+        output.add_u16(0x0000); // environmental effects
+    }
+
     if let Some(ground) = &tile.ground {
-        write_item(output, items, ground.server_id, ground.count as u8);
-        count += 1;
+        if write_item(output, items, ground.server_id, ground.count as u8) {
+            count += 1;
+        }
     }
 
     let top_start = tile.get_down_item_count();
     for item in &tile.items[top_start..] {
         if count >= 10 { break; }
-        write_item(output, items, item.server_id, item.count as u8);
-        count += 1;
+        if write_item(output, items, item.server_id, item.count as u8) {
+            count += 1;
+        }
     }
 
     if count < 10 {
-        if let Some((creature_id, player)) = player_at {
-            let (is_new, remove_id) = check_creature_as_known(known, creature_id);
-            if is_new {
-                output.add_u16(0x61);
-                output.add_u32(remove_id);
-                output.add_u32(creature_id);
-                output.add_string(player.name.as_bytes());
-            } else {
-                output.add_u16(0x62);
-                output.add_u32(creature_id);
+        if let Some((creature_id, _player)) = player_at {
+            if let Some(creature) = game.get_creature(creature_id) {
+                let (is_new, remove_id) = check_creature_as_known(known, creature_id);
+                write_creature_data(output, creature, creature_id, is_new, remove_id);
+                count += 1;
             }
-            write_creature_appearance(output, player, is_new);
-            count += 1;
         }
 
         for &cid in tile.get_creatures().iter().rev() {
@@ -4930,20 +5034,9 @@ fn write_tile_description(
                 continue;
             }
             if let Some(creature) = game.get_creature(cid) {
-                if let Some(other_player) = creature.as_player() {
-                    let (is_new, remove_id) = check_creature_as_known(known, cid);
-                    if is_new {
-                        output.add_u16(0x61);
-                        output.add_u32(remove_id);
-                        output.add_u32(cid);
-                        output.add_string(other_player.name.as_bytes());
-                    } else {
-                        output.add_u16(0x62);
-                        output.add_u32(cid);
-                    }
-                    write_creature_appearance(output, other_player, is_new);
-                    count += 1;
-                }
+                let (is_new, remove_id) = check_creature_as_known(known, cid);
+                write_creature_data(output, creature, cid, is_new, remove_id);
+                count += 1;
             }
         }
     }
@@ -4952,13 +5045,77 @@ fn write_tile_description(
         let down_count = tile.get_down_item_count();
         for item in &tile.items[..down_count] {
             if count >= 10 { break; }
-            write_item(output, items, item.server_id, item.count as u8);
-            count += 1;
+            if write_item(output, items, item.server_id, item.count as u8) {
+                count += 1;
+            }
         }
     }
 }
 
+fn write_creature_data(
+    output: &mut OutputMessage,
+    creature: &crate::creatures::Creature,
+    creature_id: u32,
+    is_new: bool,
+    remove_id: u32,
+) {
+    let is_1098 = client_version().is_1098();
+    let base = creature.base();
+    let creature_type = creature.get_type() as u8;
+
+    if is_new {
+        output.add_u16(0x61);
+        output.add_u32(remove_id);
+        output.add_u32(creature_id);
+        if is_1098 {
+            output.add_byte(creature_type);
+        }
+        output.add_string(creature.get_name().as_bytes());
+    } else {
+        output.add_u16(0x62);
+        output.add_u32(creature_id);
+    }
+
+    let hp_pct = if base.health_max > 0 {
+        ((base.health.clamp(0, base.health_max) as f64 / base.health_max as f64) * 100.0).ceil() as u8
+    } else {
+        0
+    };
+    output.add_byte(hp_pct);
+    output.add_byte(base.direction as u8);
+    write_outfit(output, &base.current_outfit);
+
+    output.add_byte(base.internal_light.level);
+    output.add_byte(base.internal_light.color);
+
+    let speed = base.get_speed() as u16;
+    if is_1098 {
+        output.add_u16(speed / 2);
+    } else {
+        output.add_u16(speed);
+    }
+
+    output.add_byte(base.skull as u8);
+    output.add_byte(0x00); // party shield
+
+    if is_new {
+        output.add_byte(0x00); // guild emblem
+    }
+
+    if is_1098 {
+        output.add_byte(creature_type); // creatureType (second, for summon reclassification)
+        output.add_byte(0x00); // speechBubble
+        output.add_byte(0xFF); // MARK_UNMARKED
+        output.add_u16(0x00);  // helpers
+        output.add_byte(0x00); // walkthrough (0=can walk through)
+    } else {
+        output.add_byte(0x01); // walkthrough (0x01 = cannot walk through)
+    }
+}
+
 fn write_creature_appearance(output: &mut OutputMessage, player: &Player, is_new: bool) {
+    let is_1098 = client_version().is_1098();
+
     let hp = player.base.health.clamp(0, player.base.health_max);
     let hp_pct = if player.base.health_max > 0 {
         ((hp as f64 / player.base.health_max as f64) * 100.0).ceil() as u8
@@ -4969,20 +5126,33 @@ fn write_creature_appearance(output: &mut OutputMessage, player: &Player, is_new
     output.add_byte(player.base.direction as u8);
     write_outfit(output, &player.base.current_outfit);
 
-    // C++ AddCreature uses isAccessPlayer() (group->access) for the light override.
     let light = player.base.internal_light;
     output.add_byte(if player.is_access_player() { 0xFF } else { light.level });
     output.add_byte(light.color);
 
-    output.add_u16(player.get_step_speed() as u16);
+    let speed = player.get_step_speed() as u16;
+    if is_1098 {
+        output.add_u16(speed / 2);
+    } else {
+        output.add_u16(speed);
+    }
+
     output.add_byte(skull_client(player.base.skull, player.base.skull) as u8);
     output.add_byte(0x00); // party shield
 
     if is_new {
-        output.add_byte(0x00); // guild emblem — only written for 0x61 (new) creatures
+        output.add_byte(0x00); // guild emblem
     }
 
-    output.add_byte(0x01); // walkthrough (0x01 = cannot walk through)
+    if is_1098 {
+        output.add_byte(0x00); // creatureType (second)
+        output.add_byte(0x00); // speechBubble
+        output.add_byte(0xFF); // MARK_UNMARKED
+        output.add_u16(0x00);  // helpers count
+    }
+
+    let walkthrough: u8 = if is_1098 { 0x00 } else { 0x01 };
+    output.add_byte(walkthrough);
 }
 
 fn check_creature_as_known(known: &mut HashSet<u32>, id: u32) -> (bool, u32) {
@@ -5017,17 +5187,33 @@ fn write_outfit(output: &mut OutputMessage, outfit: &Outfit) {
     } else {
         output.add_u16(outfit.look_type_ex);
     }
+    if client_version().is_1098() {
+        output.add_u16(outfit.look_mount);
+    }
 }
 
-fn write_item(output: &mut OutputMessage, items: &Items, server_id: u16, count: u8) {
+fn write_item(output: &mut OutputMessage, items: &Items, server_id: u16, count: u8) -> bool {
     let item_type = items.get_item_type(server_id as usize);
+    if item_type.client_id == 0 {
+        return false;
+    }
     output.add_u16(item_type.client_id);
+
+    if client_version().is_1098() {
+        output.add_byte(0xFF); // MARK_UNMARKED
+    }
+
     if item_type.stackable {
         output.add_byte(count.max(1));
     } else if item_type.group == ItemGroup::Splash || item_type.group == ItemGroup::Fluid {
         static FLUID_MAP: [u8; 8] = [0, 6, 7, 2, 1, 5, 4, 9];
         output.add_byte(FLUID_MAP[(count & 7) as usize]);
     }
+
+    if client_version().is_1098() && item_type.is_animation {
+        output.add_byte(0xFE); // random animation phase
+    }
+    true
 }
 
 fn write_remove_tile_creature(
@@ -5298,25 +5484,75 @@ pub(crate) fn write_player_stats(output: &mut OutputMessage, player: &Player) {
     output.add_byte(0xA0);
     output.add_u16(player.base.health.min(0xFFFF) as u16);
     output.add_u16(player.base.health_max.min(0xFFFF) as u16);
+
     let free_cap = player.get_free_capacity();
     let free_cap_capped = if free_cap == u32::MAX { u32::MAX } else { free_cap };
     output.add_u32(free_cap_capped);
-    output.add_u32(player.experience.min(0x7FFF_FFFF) as u32);
-    output.add_u16(player.level as u16);
-    output.add_byte(player.level_percent);
-    output.add_u16(player.mana.min(0xFFFF) as u16);
-    output.add_u16(player.get_max_mana().min(0xFFFF) as u16);
-    output.add_byte(player.get_magic_level().min(0xFF) as u8);
-    output.add_byte(player.mag_level_percent);
-    output.add_byte(player.soul);
-    output.add_u16(player.stamina_minutes);
+
+    if client_version().is_1098() {
+        output.add_u32(free_cap_capped); // totalCapacity (same as free for now)
+        output.add_u64(player.experience.min(i64::MAX as u64));
+        output.add_u16(player.level as u16);
+        output.add_byte(player.level_percent);
+
+        // XP rate fields
+        output.add_u16(100); // baseXpGain (100 = 1.0x)
+        output.add_u16(0);   // voucherAddend
+        output.add_u16(0);   // grindingAddend
+        output.add_u16(0);   // storeBoostAddend
+        output.add_u16(100); // huntingBoostFactor (100 = stamina 1.0x)
+
+        output.add_u16(player.mana.min(0xFFFF) as u16);
+        output.add_u16(player.get_max_mana().min(0xFFFF) as u16);
+        output.add_byte(player.get_magic_level().min(0xFF) as u8);
+        output.add_byte(player.get_base_magic_level().min(0xFF) as u8); // baseMagicLevel
+        output.add_byte(player.mag_level_percent);
+        output.add_byte(player.soul);
+        output.add_u16(player.stamina_minutes);
+        output.add_u16((player.base.base_speed / 2) as u16); // baseSpeed / 2
+
+        // Condition regeneration seconds
+        let regen_secs: u16 = player.base.conditions.iter()
+            .filter(|c| c.get_type() == crate::combat::condition::ConditionType::Regeneration)
+            .map(|c| (c.get_ticks() / 1000) as u16)
+            .next()
+            .unwrap_or(0);
+        output.add_u16(regen_secs);
+
+        output.add_u16(0); // offlineTrainingTime
+        output.add_u16(0); // xpBoostRemainingTime
+        output.add_byte(0); // xpBoostStoreBuy
+    } else {
+        output.add_u32(player.experience.min(0x7FFF_FFFF) as u32);
+        output.add_u16(player.level as u16);
+        output.add_byte(player.level_percent);
+        output.add_u16(player.mana.min(0xFFFF) as u16);
+        output.add_u16(player.get_max_mana().min(0xFFFF) as u16);
+        output.add_byte(player.get_magic_level().min(0xFF) as u8);
+        output.add_byte(player.mag_level_percent);
+        output.add_byte(player.soul);
+        output.add_u16(player.stamina_minutes);
+    }
 }
 
 fn write_player_skills(output: &mut OutputMessage, player: &Player) {
     output.add_byte(0xA1);
-    for i in 0..SKILL_COUNT {
-        output.add_byte(player.get_skill_level(i).min(0xFF) as u8);
-        output.add_byte(player.get_skill_percent(i));
+    if client_version().is_1098() {
+        for i in 0..SKILL_COUNT {
+            output.add_u16(player.get_skill_level(i));
+            output.add_u16(player.get_skill_level(i)); // base skill
+            output.add_byte(player.get_skill_percent(i));
+        }
+        // Special skills (critical, life leech, mana leech — 6 pairs of u16 value + u16 base)
+        for _ in 0..6 {
+            output.add_u16(0); // value
+            output.add_u16(0); // base
+        }
+    } else {
+        for i in 0..SKILL_COUNT {
+            output.add_byte(player.get_skill_level(i).min(0xFF) as u8);
+            output.add_byte(player.get_skill_percent(i));
+        }
     }
 }
 
@@ -5431,18 +5667,7 @@ fn write_add_creature_packet(
 
     let (is_new, remove_id) = check_creature_as_known(known, creature_id);
     if let Some(creature) = game.get_creature(creature_id) {
-        if let Some(player) = creature.as_player() {
-            if is_new {
-                output.add_u16(0x61);
-                output.add_u32(remove_id);
-                output.add_u32(creature_id);
-                output.add_string(player.name.as_bytes());
-            } else {
-                output.add_u16(0x62);
-                output.add_u32(creature_id);
-            }
-            write_creature_appearance(output, player, is_new);
-        }
+        write_creature_data(output, creature, creature_id, is_new, remove_id);
     }
 }
 
@@ -5785,6 +6010,37 @@ fn broadcast_vip_status(changed_guid: u32, online: bool) {
     }
 }
 
+/// 0x9F: sendBasicData — premium status, vocation, known spells (10.98 only)
+fn write_basic_data(output: &mut OutputMessage, player: &Player) {
+    output.add_byte(0x9F);
+    output.add_byte(if player.is_premium() { 1 } else { 0 });
+    output.add_u32(0); // premium time (unix timestamp, 0=none)
+    output.add_byte(player.vocation_id as u8);
+
+    // Spell list — send all known spell IDs (C++ iterates player->learnedInstantSpellList)
+    // For now, send 0 spells — Lua self-registers them on the client side.
+    output.add_u16(0); // spell count
+}
+
+pub fn broadcast_tile_item_transform(pos: Position, stackpos: u8, new_server_id: u16, count: u8, items: &Items) {
+    let spectator_ids: Vec<CreatureId> = {
+        let mut game = g_game().lock().unwrap();
+        game.map.get_spectators(pos, true, true, 0, 0, 0, 0)
+    };
+    if items.get_item_type(new_server_id as usize).client_id == 0 {
+        return;
+    }
+    for spec_id in spectator_ids {
+        let items_ref = items;
+        send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
+            output.add_byte(0x6B); // UpdateTileItem
+            output.add_position(pos.x, pos.y, pos.z);
+            output.add_byte(stackpos);
+            write_item(output, items_ref, new_server_id, count);
+        });
+    }
+}
+
 // ── Send helper functions (S2C packets) ──────────────────────────────────────
 
 fn write_add_tile_item(output: &mut OutputMessage, pos: Position, stackpos: u8, item: &crate::map::tile::MapItem, items: &Items) {
@@ -6033,14 +6289,17 @@ fn write_creature_turn(output: &mut OutputMessage, pos: Position, stackpos: u8, 
     output.add_u16(0x63);
     output.add_u32(creature_id);
     output.add_byte(direction as u8);
+    if client_version().is_1098() {
+        output.add_byte(0x00); // walkthrough
+    }
 }
 
 fn write_creature_say(output: &mut OutputMessage, name: &str, level: u16, speak_type: u8, pos: Position, text: &[u8]) {
     output.add_byte(0xAA);
-    output.add_u32(0x00);
+    output.add_u32(0x00); // statement id
     output.add_string(name.as_bytes());
     output.add_u16(level);
-    output.add_byte(speak_type);
+    output.add_byte(translate_speak_class_to_client(speak_type));
     output.add_position(pos.x, pos.y, pos.z);
     output.add_string(text);
 }
@@ -6081,10 +6340,15 @@ fn write_creature_light(output: &mut OutputMessage, creature_id: u32, level: u8,
 }
 
 #[allow(dead_code)]
-fn write_change_speed(output: &mut OutputMessage, creature_id: u32, speed: u16) {
+fn write_change_speed(output: &mut OutputMessage, creature_id: u32, base_speed: u16, speed: u16) {
     output.add_byte(0x8F);
     output.add_u32(creature_id);
-    output.add_u16(speed);
+    if client_version().is_1098() {
+        output.add_u16(base_speed / 2);
+        output.add_u16(speed / 2);
+    } else {
+        output.add_u16(speed);
+    }
 }
 
 fn write_icons(output: &mut OutputMessage, icons: u16) {
@@ -6102,7 +6366,7 @@ fn write_world_light(output: &mut OutputMessage, level: u8, color: u8) {
 #[allow(dead_code)]
 fn write_text_message(output: &mut OutputMessage, msg_type: u8, text: &[u8]) {
     output.add_byte(0xB4);
-    output.add_byte(msg_type);
+    output.add_byte(translate_message_class_to_client(msg_type));
     output.add_string(text);
 }
 
@@ -6222,16 +6486,7 @@ fn write_relogin_window(output: &mut OutputMessage) {
 }
 
 fn add_outfit(output: &mut OutputMessage, outfit: &Outfit) {
-    output.add_u16(outfit.look_type);
-    if outfit.look_type != 0 {
-        output.add_byte(outfit.look_head);
-        output.add_byte(outfit.look_body);
-        output.add_byte(outfit.look_legs);
-        output.add_byte(outfit.look_feet);
-        output.add_byte(outfit.look_addons);
-    } else {
-        output.add_u16(outfit.look_type_ex);
-    }
+    write_outfit(output, outfit);
 }
 
 // ── Trade packets ────────────────────────────────────────────────────────────
@@ -6372,6 +6627,11 @@ fn write_vip(output: &mut OutputMessage, guid: u32, name: &str, online: bool) {
     output.add_byte(0xD2);
     output.add_u32(guid);
     output.add_string(name.as_bytes());
+    if client_version().is_1098() {
+        output.add_string(b""); // description
+        output.add_u32(0);      // icon
+        output.add_byte(0x00);  // notify
+    }
     output.add_byte(if online { 0x01 } else { 0x00 });
 }
 

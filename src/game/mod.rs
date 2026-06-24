@@ -346,8 +346,12 @@ impl Game {
             let is_player = creature.is_player();
 
             if let Some(player) = creature.as_player() {
-                self.player_name_to_id.remove(&player.name);
-                self.player_guid_to_id.remove(&player.guid);
+                if self.player_name_to_id.get(&player.name) == Some(&creature_id) {
+                    self.player_name_to_id.remove(&player.name);
+                }
+                if self.player_guid_to_id.get(&player.guid) == Some(&creature_id) {
+                    self.player_guid_to_id.remove(&player.guid);
+                }
             }
 
             self.map.remove_creature_from_tile(pos, creature_id, is_player);
@@ -389,8 +393,12 @@ impl Game {
         if let Some(creature) = self.creatures.remove(&creature_id) {
             let pos = creature.position();
             if let Some(player) = creature.as_player() {
-                self.player_name_to_id.remove(&player.name);
-                self.player_guid_to_id.remove(&player.guid);
+                if self.player_name_to_id.get(&player.name) == Some(&creature_id) {
+                    self.player_name_to_id.remove(&player.name);
+                }
+                if self.player_guid_to_id.get(&player.guid) == Some(&creature_id) {
+                    self.player_guid_to_id.remove(&player.guid);
+                }
             }
             self.map.remove_creature_from_tile(pos, creature_id, true);
         }
@@ -1750,9 +1758,10 @@ impl Game {
 
     /// Send text message (0xB4) to a single player.
     pub fn send_text_message(&mut self, player_id: CreatureId, msg_type: u8, text: String) {
+        let wire_type = crate::net::protocol_version::translate_message_class_to_client(msg_type);
         send_packet_to_player(player_id, move |output: &mut OutputMessage| {
             output.add_byte(0xB4);
-            output.add_byte(msg_type);
+            output.add_byte(wire_type);
             output.add_string(text.as_bytes());
         });
     }

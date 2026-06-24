@@ -34,7 +34,7 @@ impl ConnectionHandle {
     }
 
     pub fn disconnect(&self) {
-        self.close.notify_waiters();
+        self.close.notify_one();
         let _ = self.write_tx.send(vec![]);
     }
 
@@ -96,6 +96,8 @@ async fn connection_loop(
     let mut first_message = true;
     let mut packet_count = 0u32;
     let mut window_start = Instant::now();
+
+    tracing::info!("new connection from {}", conn.peer_addr);
 
     // For server_sends_first: create and initialise the game protocol before reading.
     for svc in services.iter() {
@@ -172,10 +174,14 @@ async fn connection_loop(
             // If protocol pre-assigned (server_sends_first), skip the placeholder protocol ID byte.
             if protocol.is_none() {
                 let protocol_id = msg.get_byte();
+                tracing::info!(protocol_id, checksummed, packet_len, "first message routing");
                 let matched = services.iter().find(|s| {
                     s.protocol_id == protocol_id && (!s.checksummed || checksummed)
                 });
-                let Some(svc) = matched else { break };
+                let Some(svc) = matched else {
+                    tracing::info!(protocol_id, "no matching service, dropping connection");
+                    break;
+                };
                 protocol = Some(match svc.kind {
                     ProtocolKind::Status => AnyProtocol::Status(ProtocolStatus::new()),
                     ProtocolKind::Login => {
