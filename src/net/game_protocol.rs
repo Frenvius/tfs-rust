@@ -1975,388 +1975,6 @@ impl ProtocolGame {
         schedule_auto_walk_step(creature_id);
     }
 
-    fn parse_throw(&mut self, msg: &mut NetworkMessage, conn: &ConnectionHandle) {
-        let from_pos = to_map_position(msg.get_position());
-        let sprite_id = msg.get_u16();
-        let from_stackpos = msg.get_byte();
-        let to_pos = to_map_position(msg.get_position());
-        let _count = msg.get_byte();
-
-        let creature_id = self.creature_id;
-        if creature_id == 0 || from_pos == to_pos {
-            return;
-        }
-
-        // Decode the C++ position scheme: x==0xFFFF means a non-map location.
-        // (y & 0x40) => open container (cid = y & 0x0F, slot = z); otherwise an
-        // equipment/inventory slot (slot = y). x!=0xFFFF => a map tile.
-        let from_is_container = from_pos.x == 0xFFFF && (from_pos.y & 0x40) != 0;
-        let to_is_container = to_pos.x == 0xFFFF && (to_pos.y & 0x40) != 0;
-
-        // Any move that touches an open container goes through the container path.
-        if from_is_container || to_is_container {
-            self.handle_container_move(conn, from_pos, from_stackpos, sprite_id, to_pos);
-            return;
-        }
-
-        let from_is_inv = from_pos.x == 0xFFFF;
-        let to_is_inv = to_pos.x == 0xFFFF;
-
-        if from_is_inv && to_is_inv {
-            handle_inventory_to_inventory(creature_id, from_pos, to_pos, self, conn);
-            return;
-        }
-
-        if from_is_inv && !to_is_inv {
-            handle_inventory_to_ground(creature_id, from_pos, to_pos, from_stackpos, self, conn);
-            return;
-        }
-
-        if !from_is_inv && to_is_inv {
-            handle_ground_to_inventory(creature_id, from_pos, to_pos, from_stackpos, sprite_id, self, conn);
-            return;
-        }
-
-        let game = g_game().lock().unwrap();
-        let player_pos = match game.get_player(creature_id) {
-            Some(p) => p.base.position,
-            None => return,
-        };
-
-        if player_pos.z != from_pos.z {
-            let msg_text = if from_pos.z > player_pos.z {
-                "First go downstairs."
-            } else {
-                "First go upstairs."
-            };
-            drop(game);
-            let mut output = OutputMessage::new();
-            output.add_byte(0xB4);
-            output.add_byte(20);
-            output.add_string(msg_text.as_bytes());
-            self.crypto.finalize_output(&mut output);
-            conn.send_bytes(output.get_output_buffer().to_vec());
-            return;
-        }
-
-        let dx = (player_pos.x as i32 - from_pos.x as i32).unsigned_abs();
-        let dy = (player_pos.y as i32 - from_pos.y as i32).unsigned_abs();
-        if dx > 1 || dy > 1 {
-            drop(game);
-            return;
-        }
-
-        let throw_dx = (from_pos.x as i32 - to_pos.x as i32).unsigned_abs();
-        let throw_dy = (from_pos.y as i32 - to_pos.y as i32).unsigned_abs();
-        if throw_dx > 7 || throw_dy > 5 || from_pos.z != to_pos.z {
-            drop(game);
-            let mut output = OutputMessage::new();
-            output.add_byte(0xB4);
-            output.add_byte(20);
-            output.add_string(b"Destination is out of reach.");
-            self.crypto.finalize_output(&mut output);
-            conn.send_bytes(output.get_output_buffer().to_vec());
-            return;
-        }
-
-        let from_tile = match game.map.get_tile(from_pos) {
-            Some(t) => t,
-            None => return,
-        };
-
-        let item_idx = if from_stackpos == 0 && from_tile.ground.is_some() {
-            None
-        } else {
-            let ground_offset = if from_tile.ground.is_some() { 1 } else { 0 };
-            let idx = (from_stackpos as usize).saturating_sub(ground_offset);
-            if idx < from_tile.creature_ids.len() {
-                let pushed_creature_id = from_tile.creature_ids[from_tile.creature_ids.len() - 1 - idx];
-                drop(game);
-                self.handle_push_creature(conn, creature_id, pushed_creature_id, to_pos);
-                return;
-            }
-            let item_idx = idx - from_tile.creature_ids.len();
-            if item_idx >= from_tile.items.len() {
-                drop(game);
-                return;
-            }
-            Some(item_idx)
-        };
-
-        let item = match item_idx {
-            Some(idx) => from_tile.items[idx].clone(),
-            None => {
-                drop(game);
-                return;
-            }
-        };
-
-        let it = game.items.get_item_type(item.server_id as usize);
-        if it.client_id != sprite_id {
-            drop(game);
-            return;
-        }
-        if !it.moveable {
-            drop(game);
-            let mut output = OutputMessage::new();
-            output.add_byte(0xB4);
-            output.add_byte(20);
-            output.add_string(b"You cannot move this object.");
-            self.crypto.finalize_output(&mut output);
-            conn.send_bytes(output.get_output_buffer().to_vec());
-            return;
-        }
-
-        let to_tile = match game.map.get_tile(to_pos) {
-            Some(t) => t,
-            None => {
-                drop(game);
-                return;
-            }
-        };
-        if to_tile.ground.is_none() {
-            drop(game);
-            let mut output = OutputMessage::new();
-            output.add_byte(0xB4);
-            output.add_byte(20);
-            output.add_string(b"There is no way.");
-            self.crypto.finalize_output(&mut output);
-            conn.send_bytes(output.get_output_buffer().to_vec());
-            return;
-        }
-        drop(game);
-
-        let delivered_to_mailbox = {
-            let mut game = g_game().lock().unwrap();
-            let has_mailbox = game
-                .map
-                .get_tile(to_pos)
-                .map(|t| t.has_flag(crate::map::tile::TILESTATE_MAILBOX))
-                .unwrap_or(false);
-            let delivered = has_mailbox
-                && crate::items::special::mailbox::Mailbox::can_send(item.server_id)
-                && mailbox_deliver(&mut game, &item);
-            if let Some(from_t) = game.map.get_tile_mut(from_pos) {
-                if let Some(idx) = item_idx {
-                    from_t.items.remove(idx);
-                }
-            }
-            if !delivered {
-                if let Some(to_t) = game.map.get_tile_mut(to_pos) {
-                    to_t.items.push(item.clone());
-                }
-            }
-            delivered
-        };
-
-        let mut game = g_game().lock().unwrap();
-        let from_spectators = game.map.get_spectators(from_pos, true, true, 0, 0, 0, 0);
-        let to_spectators = game.map.get_spectators(to_pos, true, true, 0, 0, 0, 0);
-
-        let sessions = player_sessions().lock().unwrap();
-
-        for &spec_id in &from_spectators {
-            let Some(session) = sessions.get(&spec_id) else { continue };
-            let mut output = OutputMessage::new();
-            write_remove_tile_thing(&mut output, from_pos, from_stackpos);
-            finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
-        }
-
-        if delivered_to_mailbox {
-            return;
-        }
-
-        for &spec_id in &to_spectators {
-            let Some(session) = sessions.get(&spec_id) else { continue };
-            let to_tile = game.map.get_tile(to_pos);
-            let stackpos = to_tile.map(|t| {
-                let gnd: u8 = if t.ground.is_some() { 1 } else { 0 };
-                gnd + t.creature_ids.len() as u8 + t.items.len().saturating_sub(1) as u8
-            }).unwrap_or(0);
-            let mut output = OutputMessage::new();
-            write_add_tile_item(&mut output, to_pos, stackpos, &item, &game.items);
-            finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
-        }
-    }
-
-    fn handle_push_creature(
-        &mut self,
-        conn: &ConnectionHandle,
-        player_id: CreatureId,
-        pushed_creature_id: CreatureId,
-        to_pos: Position,
-    ) {
-        use crate::creatures::player::{PLAYER_FLAG_CAN_PUSH_ALL_CREATURES};
-        use crate::map::tile::{TILESTATE_BLOCKPATH, TILESTATE_PROTECTIONZONE, TILESTATE_NOPVPZONE};
-
-        let old_pos: Position;
-        let old_stackpos: u8;
-        {
-            let game = g_game().lock().unwrap();
-
-            let player = match game.get_player(player_id) {
-                Some(p) => p,
-                None => return,
-            };
-            let player_pos = player.base.position;
-            let can_push_all = player.has_flag(PLAYER_FLAG_CAN_PUSH_ALL_CREATURES);
-
-            let creature: &crate::creatures::Creature = match game.get_creature(pushed_creature_id) {
-                Some(c) => c,
-                None => return,
-            };
-
-            if creature.base().movement_blocked {
-                send_status_message(&mut self.crypto, conn, b"You cannot move this object.");
-                return;
-            }
-
-            let creature_pos = creature.position();
-
-            let is_pushable = match creature {
-                crate::creatures::Creature::Player(p) => p.is_pushable(),
-                crate::creatures::Creature::Monster(m) => m.is_pushable(),
-                crate::creatures::Creature::Npc(_) => true,
-            };
-
-            if !is_pushable && !can_push_all {
-                send_status_message(&mut self.crypto, conn, b"You cannot move this object.");
-                return;
-            }
-
-            if creature.is_in_ghost_mode() {
-                send_status_message(&mut self.crypto, conn, b"You cannot move this object.");
-                return;
-            }
-
-            let dx = (creature_pos.x as i32 - player_pos.x as i32).unsigned_abs();
-            let dy = (creature_pos.y as i32 - player_pos.y as i32).unsigned_abs();
-            let dz = if creature_pos.z > player_pos.z {
-                (creature_pos.z - player_pos.z) as u32
-            } else {
-                (player_pos.z - creature_pos.z) as u32
-            };
-            if dx > 1 || dy > 1 || dz > 0 {
-                send_status_message(&mut self.crypto, conn, b"There is no way.");
-                return;
-            }
-
-            let throw_dx = (creature_pos.x as i32 - to_pos.x as i32).unsigned_abs();
-            let throw_dy = (creature_pos.y as i32 - to_pos.y as i32).unsigned_abs();
-            let throw_dz = if creature_pos.z > to_pos.z {
-                (creature_pos.z - to_pos.z) as u32
-            } else {
-                (to_pos.z - creature_pos.z) as u32
-            };
-            if throw_dx > 1 || throw_dy > 1 || throw_dz * 4 > 1 {
-                send_status_message(&mut self.crypto, conn, b"Destination is out of range.");
-                return;
-            }
-
-            let to_tile = match game.map.get_tile(to_pos) {
-                Some(t) => t,
-                None => {
-                    send_status_message(&mut self.crypto, conn, b"Sorry, not possible.");
-                    return;
-                }
-            };
-
-            if player_id != pushed_creature_id {
-                if to_tile.has_flag(TILESTATE_BLOCKPATH) {
-                    send_status_message(&mut self.crypto, conn, b"There is not enough room.");
-                    return;
-                }
-
-                let creature_tile = game.map.get_tile(creature_pos);
-                let creature_on_pz = creature_tile
-                    .map(|t| t.has_flag(TILESTATE_PROTECTIONZONE))
-                    .unwrap_or(false);
-                let creature_on_nopvp = creature_tile
-                    .map(|t| t.has_flag(TILESTATE_NOPVPZONE))
-                    .unwrap_or(false);
-                let dest_is_pz = to_tile.has_flag(TILESTATE_PROTECTIONZONE);
-                let dest_is_nopvp = to_tile.has_flag(TILESTATE_NOPVPZONE);
-
-                if (creature_on_pz && !dest_is_pz) || (creature_on_nopvp && !dest_is_nopvp) {
-                    send_status_message(&mut self.crypto, conn, b"Sorry, not possible.");
-                    return;
-                }
-
-                for &cid in to_tile.get_creatures() {
-                    let Some(tc) = game.get_creature(cid) else { continue };
-                    if !tc.is_in_ghost_mode() {
-                        send_status_message(&mut self.crypto, conn, b"There is not enough room.");
-                        return;
-                    }
-                }
-            }
-
-            if to_tile.ground.is_none() || to_tile.has_flag(TILESTATE_BLOCKSOLID) {
-                send_status_message(&mut self.crypto, conn, b"There is not enough room.");
-                return;
-            }
-
-            old_pos = creature_pos;
-            let idx = game.map.get_tile(old_pos)
-                .map(|t| t.get_client_index_of_creature(pushed_creature_id))
-                .unwrap_or(-1);
-            old_stackpos = if idx >= 0 { idx as u8 } else { 0 };
-        }
-
-        let creature_class = {
-            let game = g_game().lock().unwrap();
-            match game.get_creature(pushed_creature_id) {
-                Some(crate::creatures::Creature::Player(_)) => "Player",
-                Some(crate::creatures::Creature::Monster(_)) => "Monster",
-                Some(crate::creatures::Creature::Npc(_)) => "Npc",
-                None => return,
-            }
-        };
-
-        {
-            let events = crate::events::g_events().lock().unwrap();
-            if !events.event_player_on_move_creature(
-                player_id,
-                pushed_creature_id,
-                creature_class,
-                old_pos,
-                to_pos,
-            ) {
-                return;
-            }
-        }
-
-        {
-            let mut game = g_game().lock().unwrap();
-            game.move_creature_position(pushed_creature_id, old_pos, to_pos);
-        }
-
-        crate::events::dispatch::execute_step_event(pushed_creature_id, old_pos, to_pos, 1);
-        crate::events::dispatch::execute_step_event(pushed_creature_id, to_pos, old_pos, 0);
-
-        broadcast_creature_move(pushed_creature_id, old_pos, to_pos, old_stackpos);
-
-        {
-            let game = g_game().lock().unwrap();
-            if game.get_creature(pushed_creature_id).map(|c| c.is_player()).unwrap_or(false)
-                && pushed_creature_id != player_id
-            {
-                let sessions = player_sessions().lock().unwrap();
-                if let Some(session) = sessions.get(&pushed_creature_id) {
-                    let known = &mut session.known_creatures.lock().unwrap();
-                    let mut output = OutputMessage::new();
-
-                    output.add_byte(0x6D);
-                    write_creature_movement(&mut output, old_pos, to_pos, old_stackpos, pushed_creature_id);
-
-                    append_walk_map_slices(&mut output, &game, game.get_items(), known, old_pos, to_pos);
-
-                    finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
-                }
-            }
-        }
-    }
-
     fn parse_look_in_shop(&mut self, msg: &mut NetworkMessage) {
         let sprite_id = msg.get_u16();
         let count = msg.get_byte();
@@ -2815,159 +2433,6 @@ impl ProtocolGame {
 
         let mut output = OutputMessage::new();
         write_container(&mut output, cid, &container_item_clone, &items_ref, &name, capacity, false, &children_clone);
-        self.crypto.finalize_output(&mut output);
-        conn.send_bytes(output.get_output_buffer().to_vec());
-    }
-
-    /// Move an item where the source and/or destination is an open container
-    /// window. Mirrors the container branches of C++ `Game::playerMoveItem` +
-    /// `internalGetCylinder`. Endpoints are decoded from the Tibia position
-    /// scheme (see `parse_throw`). Item attributes/children are preserved.
-    fn handle_container_move(
-        &mut self,
-        conn: &ConnectionHandle,
-        from_pos: Position,
-        from_stackpos: u8,
-        sprite_id: u16,
-        to_pos: Position,
-    ) {
-        let creature_id = self.creature_id;
-        let from = MoveEndpoint::decode(from_pos, from_stackpos);
-        let to = MoveEndpoint::decode(to_pos, 0);
-
-        let mut game = g_game().lock().unwrap();
-
-        // Phase 1: extract the source item (owned, with its full child tree).
-        let item = match extract_move_item(&mut game, creature_id, &from) {
-            Some(i) => i,
-            None => {
-                drop(game);
-                send_status_message(&mut self.crypto, conn, b"Sorry, not possible.");
-                return;
-            }
-        };
-
-        // Optional client-sprite sanity check (skip when 0 / unknown).
-        if sprite_id != 0 {
-            let client_id = game.items.get_item_type(usize::from(item.server_id)).client_id;
-            if client_id != sprite_id {
-                // Sprite mismatch — put it back and bail.
-                insert_move_item(&mut game, creature_id, &from, item);
-                drop(game);
-                send_status_message(&mut self.crypto, conn, b"Sorry, not possible.");
-                return;
-            }
-        }
-
-        // Phase 2: insert into the destination; on failure, restore to source.
-        if !insert_move_item(&mut game, creature_id, &to, item.clone()) {
-            insert_move_item(&mut game, creature_id, &from, item);
-            drop(game);
-            send_status_message(&mut self.crypto, conn, b"Sorry, not possible.");
-            return;
-        }
-
-        drop(game);
-
-        // Refresh every surface the move touched for the acting player.
-        self.refresh_move_endpoint(conn, &from);
-        if to != from {
-            self.refresh_move_endpoint(conn, &to);
-        }
-    }
-
-    /// Re-sync the client view of a move endpoint after a container move.
-    /// Containers are refreshed with a fresh 0x6E; inventory slots with
-    /// 0x78/0x79; ground tiles with a full-tile 0x69 update to spectators.
-    fn refresh_move_endpoint(&mut self, conn: &ConnectionHandle, ep: &MoveEndpoint) {
-        match *ep {
-            MoveEndpoint::Container { cid, .. } => {
-                self.resend_open_container(conn, cid);
-            }
-            MoveEndpoint::Inventory { slot } => {
-                let (sid, count) = {
-                    let game = g_game().lock().unwrap();
-                    match game.get_player(self.creature_id) {
-                        Some(p) => (p.inventory[slot], p.inventory_count[slot]),
-                        None => (None, 0),
-                    }
-                };
-                let client_id = sid.map(|s| {
-                    g_game().lock().unwrap().items.get_item_type(usize::from(s)).client_id
-                });
-                let s = slot as u8;
-                let c = count.max(1) as u8;
-                send_packet_to_player(self.creature_id, move |output: &mut OutputMessage| {
-                    match client_id {
-                        Some(cid) => { output.add_byte(0x78); output.add_byte(s); output.add_u16(cid); output.add_byte(c); }
-                        None => { output.add_byte(0x79); output.add_byte(s); }
-                    }
-                });
-            }
-            MoveEndpoint::Ground { pos, .. } => {
-                // Refresh the acting player's view of the tile (0x69 UpdateTile).
-                let mut output = OutputMessage::new();
-                {
-                    let game = g_game().lock().unwrap();
-                    output.add_byte(0x69);
-                    output.add_position(pos.x, pos.y, pos.z);
-                    if let Some(tile) = game.map.get_tile(pos) {
-                        let mut known = std::mem::take(&mut self.known_creatures);
-                        write_tile_description(&mut output, &game, tile, game.get_items(), &mut known, None);
-                        self.known_creatures = known;
-                        output.add_byte(0x00);
-                        output.add_byte(0xFF);
-                    } else {
-                        output.add_byte(0x01);
-                        output.add_byte(0xFF);
-                    }
-                }
-                self.crypto.finalize_output(&mut output);
-                conn.send_bytes(output.get_output_buffer().to_vec());
-            }
-        }
-    }
-
-    /// Re-send an open container window (0x6E) to refresh its contents.
-    fn resend_open_container(&mut self, conn: &ConnectionHandle, cid: u8) {
-        use crate::creatures::player::ContainerParent;
-        let game = g_game().lock().unwrap();
-        let Some(player) = game.get_player(self.creature_id) else { return };
-        let Some(oc) = player.get_container_by_id(cid) else { return };
-        let parent = oc.parent.clone();
-
-        // Depot chests have no wrapping item — rebuild the synthetic chest.
-        if let ContainerParent::Depot(depot_id) = parent {
-            let children: Vec<crate::map::tile::MapItem> =
-                player.depot_items.get(&depot_id).cloned().unwrap_or_default();
-            let items_ref = game.items.clone();
-            // Use a depot item id for the header if any child exists, else a generic.
-            let chest = crate::map::tile::MapItem { server_id: 2594, ..crate::map::tile::MapItem::default() };
-            let capacity = 255u8;
-            drop(game);
-            let mut output = OutputMessage::new();
-            write_container(&mut output, cid, &chest, &items_ref, "Depot chest", capacity, false, &children);
-            self.crypto.finalize_output(&mut output);
-            conn.send_bytes(output.get_output_buffer().to_vec());
-            return;
-        }
-
-        // Resolve the container item (with children) from its storage root.
-        let Some((root, path, _scroll)) = resolve_container_storage(player, cid) else { return };
-        let container_item = match container_item_ref(&game, self.creature_id, &root, &path) {
-            Some(it) => it.clone(),
-            None => return,
-        };
-        let item_type = game.items.get_item_type(usize::from(container_item.server_id));
-        let name = if container_item.name.is_empty() { item_type.name.clone() } else { container_item.name.clone() };
-        let capacity = item_type.max_items.min(255) as u8;
-        let has_parent = matches!(parent, ContainerParent::Container(_, _));
-        let children = container_item.children.clone();
-        let items_ref = game.items.clone();
-        drop(game);
-
-        let mut output = OutputMessage::new();
-        write_container(&mut output, cid, &container_item, &items_ref, &name, capacity, has_parent, &children);
         self.crypto.finalize_output(&mut output);
         conn.send_bytes(output.get_output_buffer().to_vec());
     }
@@ -5588,35 +5053,425 @@ fn game_handle_use_with_creature(creature_id: CreatureId, from_pos: Position, fr
 }
 
 #[allow(clippy::too_many_arguments)]
-fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16, from_stackpos: u8, to_pos: Position, count: u8) {
-    if creature_id == 0 { return; }
-    // The full parse_throw is the most complex handler (~500 lines: ground↔inventory↔container moves).
-    // It delegates to handle_container_move, handle_push_creature, and various extract/insert paths.
-    // All those sub-methods already use send_packet_to_player or the session map.
-    // For now, delegate to the old method's game-state logic directly.
-    // TODO: fully port the parse_throw body when container model is finalized.
+fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16, from_stackpos: u8, to_pos: Position, _count: u8) {
+    if creature_id == 0 || from_pos == to_pos {
+        return;
+    }
 
-    // Decode endpoints.
+    // x==0xFFFF marks a non-map location. (y & 0x40) => open container
+    // (cid = y & 0x0F, slot = z); otherwise an equipment slot (slot = y).
     let from_is_container = from_pos.x == 0xFFFF && (from_pos.y & 0x40) != 0;
     let to_is_container = to_pos.x == 0xFFFF && (to_pos.y & 0x40) != 0;
-    let from_is_inventory = from_pos.x == 0xFFFF && !from_is_container;
-    let to_is_inventory = to_pos.x == 0xFFFF && !to_is_container;
 
-    if from_is_inventory && to_is_inventory {
-        // Inventory slot swap
-        let from_slot = from_pos.y as usize;
-        let to_slot = to_pos.y as usize;
-        let mut game = g_game().lock().unwrap();
-        if let Some(player) = game.get_player_mut(creature_id) {
-            player.inventory.swap(from_slot, to_slot);
-            player.inventory_count.swap(from_slot, to_slot);
-            player.inventory_items.swap(from_slot, to_slot);
-        }
-        drop(game);
-        send_full_inventory(creature_id);
+    if from_is_container || to_is_container {
+        handle_container_move_free(creature_id, from_pos, from_stackpos, sprite_id, to_pos);
+        return;
     }
-    // Other move types (ground→inv, inv→ground, container moves) need full port.
-    // The old parse_throw on ProtocolGame is still available for reference.
+
+    let from_is_inv = from_pos.x == 0xFFFF;
+    let to_is_inv = to_pos.x == 0xFFFF;
+
+    if from_is_inv && to_is_inv {
+        handle_inventory_to_inventory(creature_id, from_pos, to_pos);
+        return;
+    }
+    if from_is_inv && !to_is_inv {
+        handle_inventory_to_ground(creature_id, from_pos, to_pos, from_stackpos);
+        return;
+    }
+    if !from_is_inv && to_is_inv {
+        handle_ground_to_inventory(creature_id, from_pos, to_pos, from_stackpos, sprite_id);
+        return;
+    }
+
+    // Map tile -> map tile.
+    let game = g_game().lock().unwrap();
+    let player_pos = match game.get_player(creature_id) {
+        Some(p) => p.base.position,
+        None => return,
+    };
+
+    if player_pos.z != from_pos.z {
+        drop(game);
+        let text = if from_pos.z > player_pos.z { "First go downstairs." } else { "First go upstairs." };
+        send_status_message_to_player(creature_id, text);
+        return;
+    }
+
+    let dx = (player_pos.x as i32 - from_pos.x as i32).unsigned_abs();
+    let dy = (player_pos.y as i32 - from_pos.y as i32).unsigned_abs();
+    if dx > 1 || dy > 1 {
+        return;
+    }
+
+    let throw_dx = (from_pos.x as i32 - to_pos.x as i32).unsigned_abs();
+    let throw_dy = (from_pos.y as i32 - to_pos.y as i32).unsigned_abs();
+    if throw_dx > 7 || throw_dy > 5 || from_pos.z != to_pos.z {
+        drop(game);
+        send_status_message_to_player(creature_id, "Destination is out of reach.");
+        return;
+    }
+
+    let from_tile = match game.map.get_tile(from_pos) {
+        Some(t) => t,
+        None => return,
+    };
+
+    let item_idx = if from_stackpos == 0 && from_tile.ground.is_some() {
+        None
+    } else {
+        let ground_offset = if from_tile.ground.is_some() { 1 } else { 0 };
+        let idx = (from_stackpos as usize).saturating_sub(ground_offset);
+        if idx < from_tile.creature_ids.len() {
+            let pushed_creature_id = from_tile.creature_ids[from_tile.creature_ids.len() - 1 - idx];
+            drop(game);
+            handle_push_creature_free(creature_id, pushed_creature_id, to_pos);
+            return;
+        }
+        let item_idx = idx - from_tile.creature_ids.len();
+        if item_idx >= from_tile.items.len() {
+            return;
+        }
+        Some(item_idx)
+    };
+
+    let item = match item_idx {
+        Some(idx) => from_tile.items[idx].clone(),
+        None => return,
+    };
+
+    let it = game.items.get_item_type(item.server_id as usize);
+    if it.client_id != sprite_id {
+        return;
+    }
+    if !it.moveable {
+        drop(game);
+        send_status_message_to_player(creature_id, "You cannot move this object.");
+        return;
+    }
+
+    let to_tile = match game.map.get_tile(to_pos) {
+        Some(t) => t,
+        None => return,
+    };
+    if to_tile.ground.is_none() {
+        drop(game);
+        send_status_message_to_player(creature_id, "There is no way.");
+        return;
+    }
+    drop(game);
+
+    let delivered_to_mailbox = {
+        let mut game = g_game().lock().unwrap();
+        let has_mailbox = game.map.get_tile(to_pos)
+            .map(|t| t.has_flag(crate::map::tile::TILESTATE_MAILBOX))
+            .unwrap_or(false);
+        let delivered = has_mailbox
+            && crate::items::special::mailbox::Mailbox::can_send(item.server_id)
+            && mailbox_deliver(&mut game, &item);
+        if let Some(from_t) = game.map.get_tile_mut(from_pos) {
+            if let Some(idx) = item_idx {
+                from_t.items.remove(idx);
+            }
+        }
+        if !delivered {
+            if let Some(to_t) = game.map.get_tile_mut(to_pos) {
+                to_t.items.push(item.clone());
+            }
+        }
+        delivered
+    };
+
+    let mut game = g_game().lock().unwrap();
+    let from_spectators = game.map.get_spectators(from_pos, true, true, 0, 0, 0, 0);
+    let to_spectators = game.map.get_spectators(to_pos, true, true, 0, 0, 0, 0);
+    let sessions = player_sessions().lock().unwrap();
+
+    for &spec_id in &from_spectators {
+        let Some(session) = sessions.get(&spec_id) else { continue };
+        let mut output = OutputMessage::new();
+        write_remove_tile_thing(&mut output, from_pos, from_stackpos);
+        finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
+    }
+
+    if delivered_to_mailbox {
+        return;
+    }
+
+    for &spec_id in &to_spectators {
+        let Some(session) = sessions.get(&spec_id) else { continue };
+        let to_tile = game.map.get_tile(to_pos);
+        let stackpos = to_tile.map(|t| {
+            let gnd: u8 = if t.ground.is_some() { 1 } else { 0 };
+            gnd + t.creature_ids.len() as u8 + t.items.len().saturating_sub(1) as u8
+        }).unwrap_or(0);
+        let mut output = OutputMessage::new();
+        write_add_tile_item(&mut output, to_pos, stackpos, &item, &game.items);
+        finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
+    }
+}
+
+fn handle_container_move_free(player_id: CreatureId, from_pos: Position, from_stackpos: u8, sprite_id: u16, to_pos: Position) {
+    let from = MoveEndpoint::decode(from_pos, from_stackpos);
+    let to = MoveEndpoint::decode(to_pos, 0);
+
+    let mut game = g_game().lock().unwrap();
+    let item = match extract_move_item(&mut game, player_id, &from) {
+        Some(i) => i,
+        None => {
+            drop(game);
+            send_status_message_to_player(player_id, "Sorry, not possible.");
+            return;
+        }
+    };
+
+    if sprite_id != 0 {
+        let client_id = game.items.get_item_type(usize::from(item.server_id)).client_id;
+        if client_id != sprite_id {
+            insert_move_item(&mut game, player_id, &from, item);
+            drop(game);
+            send_status_message_to_player(player_id, "Sorry, not possible.");
+            return;
+        }
+    }
+
+    if !insert_move_item(&mut game, player_id, &to, item.clone()) {
+        insert_move_item(&mut game, player_id, &from, item);
+        drop(game);
+        send_status_message_to_player(player_id, "Sorry, not possible.");
+        return;
+    }
+    drop(game);
+
+    refresh_move_endpoint_free(player_id, &from);
+    if to != from {
+        refresh_move_endpoint_free(player_id, &to);
+    }
+}
+
+fn refresh_move_endpoint_free(player_id: CreatureId, ep: &MoveEndpoint) {
+    match *ep {
+        MoveEndpoint::Container { cid, .. } => resend_open_container_free(player_id, cid),
+        MoveEndpoint::Inventory { slot } => {
+            let (sid, count) = {
+                let game = g_game().lock().unwrap();
+                match game.get_player(player_id) {
+                    Some(p) => (p.inventory[slot], p.inventory_count[slot]),
+                    None => (None, 0),
+                }
+            };
+            let client_id = sid.map(|s| g_game().lock().unwrap().items.get_item_type(usize::from(s)).client_id);
+            let s = slot as u8;
+            let c = count.max(1) as u8;
+            send_packet_to_player(player_id, move |output: &mut OutputMessage| {
+                match client_id {
+                    Some(cid) => { output.add_byte(0x78); output.add_byte(s); output.add_u16(cid); output.add_byte(c); }
+                    None => { output.add_byte(0x79); output.add_byte(s); }
+                }
+            });
+        }
+        MoveEndpoint::Ground { pos, .. } => {
+            let sessions = player_sessions().lock().unwrap();
+            let Some(session) = sessions.get(&player_id) else { return };
+            let known = &mut session.known_creatures.lock().unwrap();
+            let game = g_game().lock().unwrap();
+            let mut output = OutputMessage::new();
+            output.add_byte(0x69);
+            output.add_position(pos.x, pos.y, pos.z);
+            if let Some(tile) = game.map.get_tile(pos) {
+                write_tile_description(&mut output, &game, tile, game.get_items(), known, None);
+                output.add_byte(0x00);
+                output.add_byte(0xFF);
+            } else {
+                output.add_byte(0x01);
+                output.add_byte(0xFF);
+            }
+            finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
+        }
+    }
+}
+
+fn resend_open_container_free(player_id: CreatureId, cid: u8) {
+    use crate::creatures::player::ContainerParent;
+    let game = g_game().lock().unwrap();
+    let Some(player) = game.get_player(player_id) else { return };
+    let Some(oc) = player.get_container_by_id(cid) else { return };
+    let parent = oc.parent.clone();
+
+    if let ContainerParent::Depot(depot_id) = parent {
+        let children: Vec<crate::map::tile::MapItem> =
+            player.depot_items.get(&depot_id).cloned().unwrap_or_default();
+        let items_ref = game.items.clone();
+        let chest = crate::map::tile::MapItem { server_id: 2594, ..crate::map::tile::MapItem::default() };
+        drop(game);
+        send_packet_to_player(player_id, move |output: &mut OutputMessage| {
+            write_container(output, cid, &chest, &items_ref, "Depot chest", 255, false, &children);
+        });
+        return;
+    }
+
+    let Some((root, path, _scroll)) = resolve_container_storage(player, cid) else { return };
+    let container_item = match container_item_ref(&game, player_id, &root, &path) {
+        Some(it) => it.clone(),
+        None => return,
+    };
+    let item_type = game.items.get_item_type(usize::from(container_item.server_id));
+    let name = if container_item.name.is_empty() { item_type.name.clone() } else { container_item.name.clone() };
+    let capacity = item_type.max_items.min(255) as u8;
+    let has_parent = matches!(parent, ContainerParent::Container(_, _));
+    let children = container_item.children.clone();
+    let items_ref = game.items.clone();
+    drop(game);
+
+    send_packet_to_player(player_id, move |output: &mut OutputMessage| {
+        write_container(output, cid, &container_item, &items_ref, &name, capacity, has_parent, &children);
+    });
+}
+
+fn handle_push_creature_free(player_id: CreatureId, pushed_creature_id: CreatureId, to_pos: Position) {
+    use crate::creatures::player::PLAYER_FLAG_CAN_PUSH_ALL_CREATURES;
+    use crate::map::tile::{TILESTATE_BLOCKPATH, TILESTATE_PROTECTIONZONE, TILESTATE_NOPVPZONE};
+
+    let old_pos: Position;
+    let old_stackpos: u8;
+    {
+        let game = g_game().lock().unwrap();
+        let player = match game.get_player(player_id) { Some(p) => p, None => return };
+        let player_pos = player.base.position;
+        let can_push_all = player.has_flag(PLAYER_FLAG_CAN_PUSH_ALL_CREATURES);
+
+        let creature: &crate::creatures::Creature = match game.get_creature(pushed_creature_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        if creature.base().movement_blocked {
+            send_status_message_to_player(player_id, "You cannot move this object.");
+            return;
+        }
+
+        let creature_pos = creature.position();
+        let is_pushable = match creature {
+            crate::creatures::Creature::Player(p) => p.is_pushable(),
+            crate::creatures::Creature::Monster(m) => m.is_pushable(),
+            crate::creatures::Creature::Npc(_) => true,
+        };
+
+        if !is_pushable && !can_push_all {
+            send_status_message_to_player(player_id, "You cannot move this object.");
+            return;
+        }
+
+        if creature.is_in_ghost_mode() {
+            send_status_message_to_player(player_id, "You cannot move this object.");
+            return;
+        }
+
+        let dx = (creature_pos.x as i32 - player_pos.x as i32).unsigned_abs();
+        let dy = (creature_pos.y as i32 - player_pos.y as i32).unsigned_abs();
+        let dz = if creature_pos.z > player_pos.z { (creature_pos.z - player_pos.z) as u32 } else { (player_pos.z - creature_pos.z) as u32 };
+        if dx > 1 || dy > 1 || dz > 0 {
+            send_status_message_to_player(player_id, "There is no way.");
+            return;
+        }
+
+        let throw_dx = (creature_pos.x as i32 - to_pos.x as i32).unsigned_abs();
+        let throw_dy = (creature_pos.y as i32 - to_pos.y as i32).unsigned_abs();
+        let throw_dz = if creature_pos.z > to_pos.z { (creature_pos.z - to_pos.z) as u32 } else { (to_pos.z - creature_pos.z) as u32 };
+        if throw_dx > 1 || throw_dy > 1 || throw_dz * 4 > 1 {
+            send_status_message_to_player(player_id, "Destination is out of range.");
+            return;
+        }
+
+        let to_tile = match game.map.get_tile(to_pos) {
+            Some(t) => t,
+            None => {
+                send_status_message_to_player(player_id, "Sorry, not possible.");
+                return;
+            }
+        };
+
+        if player_id != pushed_creature_id {
+            if to_tile.has_flag(TILESTATE_BLOCKPATH) {
+                send_status_message_to_player(player_id, "There is not enough room.");
+                return;
+            }
+
+            let creature_tile = game.map.get_tile(creature_pos);
+            let creature_on_pz = creature_tile.map(|t| t.has_flag(TILESTATE_PROTECTIONZONE)).unwrap_or(false);
+            let creature_on_nopvp = creature_tile.map(|t| t.has_flag(TILESTATE_NOPVPZONE)).unwrap_or(false);
+            let dest_is_pz = to_tile.has_flag(TILESTATE_PROTECTIONZONE);
+            let dest_is_nopvp = to_tile.has_flag(TILESTATE_NOPVPZONE);
+
+            if (creature_on_pz && !dest_is_pz) || (creature_on_nopvp && !dest_is_nopvp) {
+                send_status_message_to_player(player_id, "Sorry, not possible.");
+                return;
+            }
+
+            for &cid in to_tile.get_creatures() {
+                let Some(tc) = game.get_creature(cid) else { continue };
+                if !tc.is_in_ghost_mode() {
+                    send_status_message_to_player(player_id, "There is not enough room.");
+                    return;
+                }
+            }
+        }
+
+        if to_tile.ground.is_none() || to_tile.has_flag(TILESTATE_BLOCKSOLID) {
+            send_status_message_to_player(player_id, "There is not enough room.");
+            return;
+        }
+
+        old_pos = creature_pos;
+        let idx = game.map.get_tile(old_pos)
+            .map(|t| t.get_client_index_of_creature(pushed_creature_id))
+            .unwrap_or(-1);
+        old_stackpos = if idx >= 0 { idx as u8 } else { 0 };
+    }
+
+    let creature_class = {
+        let game = g_game().lock().unwrap();
+        match game.get_creature(pushed_creature_id) {
+            Some(crate::creatures::Creature::Player(_)) => "Player",
+            Some(crate::creatures::Creature::Monster(_)) => "Monster",
+            Some(crate::creatures::Creature::Npc(_)) => "Npc",
+            None => return,
+        }
+    };
+
+    {
+        let events = crate::events::g_events().lock().unwrap();
+        if !events.event_player_on_move_creature(player_id, pushed_creature_id, creature_class, old_pos, to_pos) {
+            return;
+        }
+    }
+
+    {
+        let mut game = g_game().lock().unwrap();
+        game.move_creature_position(pushed_creature_id, old_pos, to_pos);
+    }
+
+    crate::events::dispatch::execute_step_event(pushed_creature_id, old_pos, to_pos, 1);
+    crate::events::dispatch::execute_step_event(pushed_creature_id, to_pos, old_pos, 0);
+
+    broadcast_creature_move(pushed_creature_id, old_pos, to_pos, old_stackpos);
+
+    {
+        let game = g_game().lock().unwrap();
+        if game.get_creature(pushed_creature_id).map(|c| c.is_player()).unwrap_or(false)
+            && pushed_creature_id != player_id
+        {
+            let sessions = player_sessions().lock().unwrap();
+            if let Some(session) = sessions.get(&pushed_creature_id) {
+                let known = &mut session.known_creatures.lock().unwrap();
+                let mut output = OutputMessage::new();
+                output.add_byte(0x6D);
+                write_creature_movement(&mut output, old_pos, to_pos, old_stackpos, pushed_creature_id);
+                append_walk_map_slices(&mut output, &game, game.get_items(), known, old_pos, to_pos);
+                finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
+            }
+        }
+    }
 }
 
 fn game_teleport_player(creature_id: CreatureId, old_pos: Position, new_pos: Position) {
@@ -7718,7 +7573,7 @@ fn write_remove_tile_thing(output: &mut OutputMessage, pos: Position, stackpos: 
     output.add_byte(stackpos);
 }
 
-fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_pos: Position, from_stackpos: u8, sprite_id: u16, _proto: &mut ProtocolGame, _conn: &ConnectionHandle) {
+fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_pos: Position, from_stackpos: u8, sprite_id: u16) {
     // to_pos.y is the inventory slot (1-10).
     let slot = to_pos.y as usize;
     if !(crate::creatures::player::CONST_SLOT_FIRST..=crate::creatures::player::CONST_SLOT_LAST).contains(&slot) {
@@ -7804,7 +7659,7 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
     let _ = player_pos;
 }
 
-fn handle_inventory_to_ground(creature_id: CreatureId, from_pos: Position, to_pos: Position, _from_stackpos: u8, _proto: &mut ProtocolGame, _conn: &ConnectionHandle) {
+fn handle_inventory_to_ground(creature_id: CreatureId, from_pos: Position, to_pos: Position, _from_stackpos: u8) {
     let slot = from_pos.y as usize;
     if !(crate::creatures::player::CONST_SLOT_FIRST..=crate::creatures::player::CONST_SLOT_LAST).contains(&slot) {
         return;
@@ -7881,7 +7736,7 @@ fn handle_inventory_to_ground(creature_id: CreatureId, from_pos: Position, to_po
     }
 }
 
-fn handle_inventory_to_inventory(creature_id: CreatureId, from_pos: Position, to_pos: Position, _proto: &mut ProtocolGame, _conn: &ConnectionHandle) {
+fn handle_inventory_to_inventory(creature_id: CreatureId, from_pos: Position, to_pos: Position) {
     let from_slot = from_pos.y as usize;
     let to_slot = to_pos.y as usize;
     if !(crate::creatures::player::CONST_SLOT_FIRST..=crate::creatures::player::CONST_SLOT_LAST).contains(&from_slot) { return; }
