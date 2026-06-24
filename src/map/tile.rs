@@ -277,6 +277,34 @@ impl Tile {
         }
     }
 
+    /// Remove the item at `items_index`, keeping `down_item_count` consistent,
+    /// and return the removed item plus the client stackpos it occupied.
+    pub fn remove_item_at(&mut self, items_index: usize) -> Option<(MapItem, u8)> {
+        if items_index >= self.items.len() {
+            return None;
+        }
+        let stackpos = self.item_client_stackpos(items_index);
+        let item = self.items.remove(items_index);
+        if items_index < usize::from(self.down_item_count) {
+            self.down_item_count = self.down_item_count.saturating_sub(1);
+        }
+        Some((item, stackpos))
+    }
+
+    /// Add `item` to its correct partition and return the client stackpos it
+    /// now occupies (so spectators can be told the right add position).
+    pub fn add_item_get_stackpos(&mut self, item: MapItem, items: &Items) -> u8 {
+        let server_id = item.server_id;
+        let always_on_top = items.get_item_type(usize::from(server_id)).always_on_top;
+        self.internal_add_item(item, items);
+        let idx = if always_on_top {
+            self.items.iter().rposition(|it| it.server_id == server_id).unwrap_or(0)
+        } else {
+            0
+        };
+        self.item_client_stackpos(idx)
+    }
+
     /// Re-partition the item at `idx` when a transform changes its
     /// always-on-top category (down<->top). Mirrors the C++
     /// `Game::transformItem` `alwaysOnTop != alwaysOnTop` branch: remove the

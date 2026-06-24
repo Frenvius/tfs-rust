@@ -912,9 +912,7 @@ impl Game {
         let Some(stackpos) = ({
             let Some(tile) = self.map.get_tile_mut(pos) else { return };
             let Some(idx) = tile.find_item_index_by_server_id(server_id) else { return };
-            let sp = tile.item_client_stackpos(idx);
-            tile.items.remove(idx);
-            Some(sp)
+            tile.remove_item_at(idx).map(|(_, sp)| sp)
         }) else { return };
 
         let spectators = self.map.get_spectators(pos, true, true, 0, 0, 0, 0);
@@ -2592,9 +2590,10 @@ impl Game {
                     owner_id: creature_id,
                     ..crate::map::tile::MapItem::default()
                 };
+                let items_arc = self.items.clone();
                 if let Some(tile) = self.map.get_tile_mut(pos) {
-                    tile.items.push(corpse_item);
-                    (player_look_corpse, pos, (tile.items.len() - 1) as i32)
+                    tile.internal_add_item(corpse_item, &items_arc);
+                    (player_look_corpse, pos, 0i32)
                 } else {
                     (0u16, pos, -1i32)
                 }

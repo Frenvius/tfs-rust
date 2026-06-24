@@ -3358,8 +3358,8 @@ fn register_item_class(lua: &Lua) -> LuaResult<()> {
             if let Some(tile) = game.map.get_tile_mut(pos) {
                 if idx == -1 {
                     tile.ground = None;
-                } else if (idx as usize) < tile.items.len() {
-                    tile.items.remove(idx as usize);
+                } else {
+                    tile.remove_item_at(idx as usize);
                 }
             }
         }
@@ -6899,12 +6899,13 @@ fn register_npc_globals(lua: &Lua) -> LuaResult<()> {
                 if !placed && can_drop_on_map {
                     if let Some(pos) = player_pos {
                         let count_val = if stackable { stack_count as u16 } else { sub_type.max(1) as u16 };
+                        let items_arc = game.items.clone();
                         if let Some(tile) = game.map.get_tile_mut(pos) {
-                            tile.items.push(crate::map::tile::MapItem {
+                            tile.internal_add_item(crate::map::tile::MapItem {
                                 server_id: item_id,
                                 count: count_val,
                                 ..Default::default()
-                            });
+                            }, &items_arc);
                         }
                         sell_count += if stackable { stack_count } else { 1 };
                         placed = true;

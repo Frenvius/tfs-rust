@@ -2690,7 +2690,9 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
     }
     drop(game);
 
-    let delivered_to_mailbox = {
+    let items_arc = g_game().lock().unwrap().items.clone();
+
+    let (removed_stackpos, add_stackpos, delivered_to_mailbox) = {
         let mut game = g_game().lock().unwrap();
         let has_mailbox = game.map.get_tile(to_pos)
             .map(|t| t.has_flag(crate::map::tile::TILESTATE_MAILBOX))
@@ -2698,17 +2700,23 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
         let delivered = has_mailbox
             && crate::items::special::mailbox::Mailbox::can_send(item.server_id)
             && mailbox_deliver(&mut game, &item);
-        if let Some(from_t) = game.map.get_tile_mut(from_pos) {
-            if let Some(idx) = item_idx {
-                from_t.items.remove(idx);
-            }
-        }
-        if !delivered {
-            if let Some(to_t) = game.map.get_tile_mut(to_pos) {
-                to_t.items.push(item.clone());
-            }
-        }
-        delivered
+
+        // Remove from source keeping the [down|top] partition (down_item_count)
+        // consistent, and capture the real client stackpos it occupied.
+        let removed_sp = match (game.map.get_tile_mut(from_pos), item_idx) {
+            (Some(from_t), Some(idx)) => from_t.remove_item_at(idx).map(|(_, sp)| sp).unwrap_or(from_stackpos),
+            _ => from_stackpos,
+        };
+
+        // Add to destination through the partition-aware path so the broadcast
+        // stackpos matches the client's own getThingIndex.
+        let add_sp = if !delivered {
+            game.map.get_tile_mut(to_pos).map(|t| t.add_item_get_stackpos(item.clone(), &items_arc))
+        } else {
+            None
+        };
+
+        (removed_sp, add_sp, delivered)
     };
 
     let mut game = g_game().lock().unwrap();
@@ -2719,7 +2727,7 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
     for &spec_id in &from_spectators {
         let Some(session) = sessions.get(&spec_id) else { continue };
         let mut output = OutputMessage::new();
-        write_remove_tile_thing(&mut output, from_pos, from_stackpos);
+        write_remove_tile_thing(&mut output, from_pos, removed_stackpos);
         finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
     }
 
@@ -2727,15 +2735,11 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
         return;
     }
 
+    let Some(add_stackpos) = add_stackpos else { return };
     for &spec_id in &to_spectators {
         let Some(session) = sessions.get(&spec_id) else { continue };
-        let to_tile = game.map.get_tile(to_pos);
-        let stackpos = to_tile.map(|t| {
-            let gnd: u8 = if t.ground.is_some() { 1 } else { 0 };
-            gnd + t.creature_ids.len() as u8 + t.items.len().saturating_sub(1) as u8
-        }).unwrap_or(0);
         let mut output = OutputMessage::new();
-        write_add_tile_item(&mut output, to_pos, stackpos, &item, &game.items);
+        write_add_tile_item(&mut output, to_pos, add_stackpos, &item, &game.items);
         finalize_and_send(&mut output, &session.round_keys, session.checksum_enabled, &session.conn);
     }
 }
@@ -3760,8 +3764,7 @@ fn extract_move_item(
             let tile = game.map.get_tile_mut(pos)?;
             let ground_off = if tile.ground.is_some() { 1 } else { 0 };
             let idx = (stackpos as usize).checked_sub(ground_off + tile.creature_ids.len())?;
-            if idx >= tile.items.len() { return None; }
-            Some(tile.items.remove(idx))
+            tile.remove_item_at(idx).map(|(it, _)| it)
         }
     }
 }
@@ -3962,8 +3965,7 @@ fn extract_trade_item(
     match *loc {
         TradeItemLoc::Tile(pos, idx) => {
             let tile = game.map.get_tile_mut(pos)?;
-            if idx >= tile.items.len() { return None; }
-            Some(tile.items.remove(idx))
+            tile.remove_item_at(idx).map(|(it, _)| it)
         }
         TradeItemLoc::Inventory(slot) => {
             let player = game.get_player_mut(creature_id)?;
@@ -5261,9 +5263,7 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
             player.inventory_items[slot] = Some(item.clone());
         }
         if let Some(tile) = game.map.get_tile_mut(from_pos) {
-            if item_idx < tile.items.len() {
-                tile.items.remove(item_idx);
-            }
+            tile.remove_item_at(item_idx);
         }
     }
 
