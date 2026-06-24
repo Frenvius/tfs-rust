@@ -4866,8 +4866,7 @@ fn game_handle_use_item(creature_id: CreatureId, pos: Position, sprite_id: u16, 
             game.items.get_item_type(usize::from(server_id)).kind == crate::items::ItemKind::Bed
         };
         if is_bed {
-            // Bed use handled by the old method on ProtocolGame — needs session context.
-            // TODO: port handle_use_bed to free function
+            game_handle_use_bed(creature_id, pos, server_id);
             return;
         }
     }
@@ -4885,8 +4884,14 @@ fn game_handle_use_item(creature_id: CreatureId, pos: Position, sprite_id: u16, 
                     .unwrap_or(0)
             } else { 0 };
             drop(game);
-            // Container opening needs session context for the 0x6E packet.
-            // TODO: port open_container_*/open_depot to free functions
+            if is_depot && pos.x != 0xFFFF {
+                open_depot_free(creature_id, server_id, depot_id);
+            } else if pos.x == 0xFFFF {
+                open_container_in_inventory_free(creature_id, pos.y as u8, server_id);
+            } else {
+                let tile_item_index = if item_index >= 0 { item_index as usize } else { 0 };
+                open_container_on_tile_free(creature_id, pos, tile_item_index, server_id);
+            }
             return;
         }
     }
@@ -5325,6 +5330,268 @@ fn resend_open_container_free(player_id: CreatureId, cid: u8) {
 
     send_packet_to_player(player_id, move |output: &mut OutputMessage| {
         write_container(output, cid, &container_item, &items_ref, &name, capacity, has_parent, &children);
+    });
+}
+
+fn game_handle_use_bed(creature_id: CreatureId, pos: Position, server_id: u16) {
+    use crate::map::tile::TileKind;
+
+    let info = {
+        let game = g_game().lock().unwrap();
+        let Some(tile) = game.map.get_tile(pos) else { return };
+        let house_id = match tile.kind {
+            TileKind::House { house_id } => Some(house_id),
+            _ => None,
+        };
+        let is_pz = tile.has_flag(TILESTATE_PROTECTIONZONE);
+        let sleeper_guid = tile
+            .find_item_index_by_server_id(server_id)
+            .map(|idx| tile.items[idx].sleeper_guid)
+            .unwrap_or(0);
+
+        let it = game.items.get_item_type(usize::from(server_id));
+        let transform_to_free = it.transform_to_free;
+        let transform_male = it.transform_to_on_use[1];
+        let transform_female = it.transform_to_on_use[0];
+        let partner_dir = it.bed_partner_dir;
+
+        let Some(player) = game.get_player(creature_id) else { return };
+        let p_guid = player.guid;
+        let p_account = player.account_number;
+        let p_sex = player.sex;
+        let premium = player.is_premium();
+        let can_edit = player.group_flags & crate::creatures::player::PLAYER_FLAG_CAN_EDIT_HOUSES != 0;
+        let p_name = player.name.clone();
+
+        let owned_by_account = g_config().get_boolean(BooleanConfig::HouseOwnedByAccount);
+        let (house_owner, my_access) = match house_id.and_then(|hid| game.map.houses.get_house(hid)) {
+            Some(h) => (
+                h.get_owner(),
+                h.access_level_for(p_guid, p_account, can_edit, owned_by_account, &p_name, "", ""),
+            ),
+            None => (0, crate::map::houses::AccessHouseLevel::NotInvited),
+        };
+
+        BedUseInfo {
+            house_id, is_pz, sleeper_guid, transform_to_free, transform_male, transform_female,
+            partner_dir, p_guid, p_sex, premium, house_owner, my_access,
+        }
+    };
+
+    let has_house = info.house_id.is_some();
+    let can_use = if !has_house || !info.premium || !info.is_pz {
+        false
+    } else if info.sleeper_guid == 0 {
+        true
+    } else {
+        info.my_access == crate::map::houses::AccessHouseLevel::Owner
+    };
+
+    if !can_use {
+        let msg = if !has_house {
+            "You can not use this bed."
+        } else if !info.premium {
+            "You need a premium account."
+        } else {
+            "You cannot use this object."
+        };
+        send_status_message_to_player(creature_id, msg);
+        return;
+    }
+
+    if info.sleeper_guid != 0 {
+        if info.transform_to_free != 0 && info.house_owner == info.p_guid {
+            bed_wake_up_free(pos, server_id);
+        }
+        let mut game = g_game().lock().unwrap();
+        let ppos = game.get_player(creature_id).map(|p| p.base.position).unwrap_or(pos);
+        game.add_magic_effect(ppos, crate::game::CONST_ME_POFF);
+        return;
+    }
+
+    bed_sleep_free(creature_id, pos, server_id, &info);
+}
+
+fn bed_sleep_free(creature_id: CreatureId, pos: Position, server_id: u16, info: &BedUseInfo) {
+    use crate::creatures::player::PlayerSex;
+    let now = (crate::util::otsys_time() / 1000) as u32;
+    let partner_pos = next_position(info.partner_dir, pos);
+
+    {
+        let mut game = g_game().lock().unwrap();
+        let pname = game.get_player(creature_id).map(|p| p.name.clone()).unwrap_or_default();
+        let desc = format!("{} is sleeping there.", pname);
+        let guid = info.p_guid;
+
+        let partner_sid = game.map.get_tile(partner_pos).and_then(|t| {
+            t.items.iter()
+                .find(|it| game.items.get_item_type(usize::from(it.server_id)).kind == crate::items::ItemKind::Bed)
+                .map(|it| it.server_id)
+        });
+
+        game.set_item_sleeper(pos, server_id, guid, now, desc.clone());
+        if let Some(psid) = partner_sid {
+            game.set_item_sleeper(partner_pos, psid, guid, now, desc);
+        }
+        game.set_bed_sleeper(guid, pos);
+        if let Some(p) = game.get_player_mut(creature_id) {
+            p.bed_item_id = Some(server_id);
+        }
+
+        let old_pos = game.get_player(creature_id).map(|p| p.base.position).unwrap_or(pos);
+        if old_pos != pos {
+            game.move_creature_position(creature_id, old_pos, pos);
+        }
+        game.add_magic_effect(pos, crate::game::CONST_ME_SLEEP);
+
+        let sex_transform = match info.p_sex {
+            PlayerSex::Male => info.transform_male,
+            PlayerSex::Female => info.transform_female,
+        };
+        let new_id = if sex_transform != 0 { sex_transform } else { info.transform_to_free };
+        game.transform_tile_item(pos, server_id, new_id);
+
+        if let Some(psid) = partner_sid {
+            let pit = game.items.get_item_type(usize::from(psid));
+            let p_sex_t = match info.p_sex {
+                PlayerSex::Male => pit.transform_to_on_use[1],
+                PlayerSex::Female => pit.transform_to_on_use[0],
+            };
+            let p_free = pit.transform_to_free;
+            let p_new = if p_sex_t != 0 { p_sex_t } else { p_free };
+            game.transform_tile_item(partner_pos, psid, p_new);
+        }
+    }
+
+    crate::runtime::g_scheduler().add_event(crate::runtime::scheduler::SchedulerTask::new(
+        crate::runtime::scheduler::SCHEDULER_MINTICKS,
+        move || kick_player_by_id(creature_id),
+    ));
+}
+
+fn bed_wake_up_free(pos: Position, server_id: u16) {
+    g_game().lock().unwrap().wake_bed_at(pos, server_id);
+}
+
+fn open_container_on_tile_free(player_id: CreatureId, pos: Position, tile_item_index: usize, server_id: u16) {
+    use crate::creatures::player::ContainerParent;
+    let game = g_game().lock().unwrap();
+    let Some(player) = game.get_player(player_id) else { return };
+
+    if let Some(existing_cid) = player.get_container_id_by_tile(pos, tile_item_index) {
+        drop(game);
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(player_id) { player.close_container(existing_cid); }
+        drop(game);
+        send_packet_to_player(player_id, move |o: &mut OutputMessage| write_close_container(o, existing_cid));
+        return;
+    }
+
+    let Some(cid) = player.get_free_container_id() else {
+        drop(game);
+        send_status_message_to_player(player_id, "You cannot open any more containers.");
+        return;
+    };
+    let Some(tile) = game.map.get_tile(pos) else { return };
+    let Some(container_item) = tile.items.get(tile_item_index) else { return };
+
+    let item_type = game.items.get_item_type(usize::from(server_id));
+    let name = if container_item.name.is_empty() { item_type.name.clone() } else { container_item.name.clone() };
+    let capacity = item_type.max_items.min(255) as u8;
+    let container_item_clone = container_item.clone();
+    let children_clone = container_item.children.clone();
+    let items_ref = game.items.clone();
+    drop(game);
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(player_id) {
+            player.add_container(cid, ContainerParent::Tile(pos, tile_item_index));
+        }
+    }
+    send_packet_to_player(player_id, move |o: &mut OutputMessage| {
+        write_container(o, cid, &container_item_clone, &items_ref, &name, capacity, false, &children_clone);
+    });
+}
+
+fn open_depot_free(player_id: CreatureId, server_id: u16, depot_id: u32) {
+    use crate::creatures::player::ContainerParent;
+    let game = g_game().lock().unwrap();
+    let Some(player) = game.get_player(player_id) else { return };
+
+    let existing = player.open_containers.iter()
+        .find(|(_, oc)| matches!(oc.parent, ContainerParent::Depot(d) if d == depot_id))
+        .map(|(&cid, _)| cid);
+    if let Some(existing_cid) = existing {
+        drop(game);
+        let mut game = g_game().lock().unwrap();
+        if let Some(p) = game.get_player_mut(player_id) { p.close_container(existing_cid); }
+        drop(game);
+        send_packet_to_player(player_id, move |o: &mut OutputMessage| write_close_container(o, existing_cid));
+        return;
+    }
+
+    let Some(cid) = player.get_free_container_id() else {
+        drop(game);
+        send_status_message_to_player(player_id, "You cannot open any more containers.");
+        return;
+    };
+    let item_type = game.items.get_item_type(usize::from(server_id));
+    let capacity = item_type.max_items.clamp(1, 255) as u8;
+    let children: Vec<crate::map::tile::MapItem> = player.depot_items.get(&depot_id).cloned().unwrap_or_default();
+    let chest = crate::map::tile::MapItem { server_id, ..crate::map::tile::MapItem::default() };
+    let items_ref = game.items.clone();
+    drop(game);
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(p) = game.get_player_mut(player_id) {
+            p.add_container(cid, ContainerParent::Depot(depot_id));
+            p.set_last_depot_id(depot_id as i16);
+        }
+    }
+    send_packet_to_player(player_id, move |o: &mut OutputMessage| {
+        write_container(o, cid, &chest, &items_ref, "Depot chest", capacity, false, &children);
+    });
+}
+
+fn open_container_in_inventory_free(player_id: CreatureId, slot: u8, server_id: u16) {
+    use crate::creatures::player::ContainerParent;
+    let game = g_game().lock().unwrap();
+    let Some(player) = game.get_player(player_id) else { return };
+
+    if let Some(existing_cid) = player.get_container_id_by_inventory(slot) {
+        drop(game);
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(player_id) { player.close_container(existing_cid); }
+        drop(game);
+        send_packet_to_player(player_id, move |o: &mut OutputMessage| write_close_container(o, existing_cid));
+        return;
+    }
+
+    let Some(cid) = player.get_free_container_id() else {
+        drop(game);
+        send_status_message_to_player(player_id, "You cannot open any more containers.");
+        return;
+    };
+    let Some(Some(container_item)) = player.inventory_items.get(usize::from(slot)) else { return };
+
+    let item_type = game.items.get_item_type(usize::from(server_id));
+    let name = if container_item.name.is_empty() { item_type.name.clone() } else { container_item.name.clone() };
+    let capacity = item_type.max_items.min(255) as u8;
+    let container_item_clone = container_item.clone();
+    let children_clone = container_item.children.clone();
+    let items_ref = game.items.clone();
+    drop(game);
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(player_id) {
+            player.add_container(cid, ContainerParent::Inventory(slot));
+        }
+    }
+    send_packet_to_player(player_id, move |o: &mut OutputMessage| {
+        write_container(o, cid, &container_item_clone, &items_ref, &name, capacity, false, &children_clone);
     });
 }
 
