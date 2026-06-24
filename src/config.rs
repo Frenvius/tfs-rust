@@ -90,11 +90,10 @@ pub enum StringConfig {
     DefaultPriority,
     MapAuthor,
     ConfigFile,
-    ClientDatFile,
 }
 
 impl StringConfig {
-    const COUNT: usize = 19;
+    const COUNT: usize = 18;
 
     fn index(self) -> usize {
         self as usize
@@ -253,8 +252,6 @@ impl ConfigManager {
                 get_global_string(&lua, "mysqlDatabase", "forgottenserver")?;
             self.strings[StringConfig::MysqlSock.index()] =
                 get_global_string(&lua, "mysqlSock", "")?;
-            self.strings[StringConfig::ClientDatFile.index()] =
-                get_global_string(&lua, "clientDatFile", "")?;
 
             self.integers[IntegerConfig::Ip.index()] =
                 resolve_ip_to_u32(self.get_string(StringConfig::IpString))

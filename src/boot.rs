@@ -131,16 +131,6 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
         );
     }
 
-    // NOTE: is_animation must come solely from the OTB FLAG_ANIMATION (as the
-    // C++ server does). Overriding it from the client .dat desyncs the 10.98
-    // item-animation byte (0xFE) and corrupts map-slice packets.
-    // {
-    //     let dat_path = crate::config::g_config().get_string(crate::config::StringConfig::ClientDatFile).to_string();
-    //     if !dat_path.is_empty() {
-    //         items.load_dat_animation_flags(&dat_path);
-    //     }
-    // }
-
     let items_arc = std::sync::Arc::new(items);
     crate::items::init_items(items_arc.clone());
 
