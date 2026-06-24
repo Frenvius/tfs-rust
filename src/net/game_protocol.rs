@@ -4429,13 +4429,98 @@ fn game_handle_accept_trade(creature_id: CreatureId) {
 }
 
 fn game_parse_request_trade(creature_id: CreatureId, pos: Position, sprite_id: u16, stackpos: u8, target_id: u32) {
+    use crate::creatures::player::TradeState;
     if creature_id == 0 { return; }
-    let game = g_game().lock().unwrap();
-    let Some(_player) = game.get_player(creature_id) else { return };
-    let Some(_partner) = game.get_player(target_id) else { return };
-    drop(game);
-    // Trade request validation and offer exchange already handled by the old parse_request_trade method.
-    // The full logic will be wired when the old method bodies are removed.
+    let trade_player_id = target_id;
+
+    let (my_name, partner_name, item, loc, partner_was_idle) = {
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        let player_pos = player.base.position;
+        let my_name = player.name.clone();
+
+        if trade_player_id == creature_id { return; }
+        let Some(partner) = game.get_player(trade_player_id) else {
+            drop(game);
+            send_status_message_to_player(creature_id, "Select a player to trade with.");
+            return;
+        };
+        let ppos = partner.base.position;
+        if ppos.z != player_pos.z
+            || (ppos.x as i32 - player_pos.x as i32).abs() > 2
+            || (ppos.y as i32 - player_pos.y as i32).abs() > 2
+        {
+            drop(game);
+            send_status_message_to_player(creature_id, "Destination is out of reach.");
+            return;
+        }
+        let partner_name = partner.name.clone();
+        let partner_state = partner.trade_state;
+        let partner_partner = partner.trade_partner_id;
+
+        let ep = MoveEndpoint::decode(pos, stackpos);
+        let Some((item, loc)) = peek_trade_item(&game, creature_id, &ep) else {
+            drop(game);
+            send_status_message_to_player(creature_id, "Sorry, not possible.");
+            return;
+        };
+
+        let it = game.items.get_item_type(usize::from(item.server_id));
+        if it.client_id != sprite_id || !it.pickupable || item.unique_id != 0 {
+            drop(game);
+            send_status_message_to_player(creature_id, "Sorry, not possible.");
+            return;
+        }
+
+        let my_state = player.trade_state;
+        if my_state != TradeState::None
+            && !(my_state == TradeState::Acknowledge && player.trade_partner_id == Some(trade_player_id))
+        {
+            drop(game);
+            send_status_message_to_player(creature_id, "You are already trading.");
+            return;
+        }
+        if partner_state != TradeState::None && partner_partner != Some(creature_id) {
+            drop(game);
+            send_status_message_to_player(creature_id, "This player is already trading.");
+            return;
+        }
+
+        (my_name, partner_name, item, loc, partner_state == TradeState::None)
+    };
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(creature_id) {
+            player.trade_partner_id = Some(trade_player_id);
+            player.trade_item_id = Some(item.server_id);
+            player.trade_item = Some(item.clone());
+            player.trade_item_loc = Some(loc);
+            player.trade_state = TradeState::Initiated;
+        }
+    }
+
+    send_trade_offer(creature_id, &my_name, &item, true);
+
+    if partner_was_idle {
+        {
+            let mut game = g_game().lock().unwrap();
+            if let Some(partner) = game.get_player_mut(trade_player_id) {
+                partner.trade_state = TradeState::Acknowledge;
+                partner.trade_partner_id = Some(creature_id);
+            }
+        }
+        send_status_message_to_player(trade_player_id, &format!("{my_name} wants to trade with you."));
+    } else {
+        let counter = {
+            let game = g_game().lock().unwrap();
+            game.get_player(trade_player_id).and_then(|p| p.trade_item.clone())
+        };
+        if let Some(counter_item) = counter {
+            send_trade_offer(creature_id, &partner_name, &counter_item, false);
+        }
+        send_trade_offer(trade_player_id, &my_name, &item, false);
+    }
 }
 
 fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u16>, receiver_name: Option<Vec<u8>>, text: Vec<u8>) {
@@ -4450,16 +4535,19 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
     };
 
     if crate::events::dispatch::execute_spell_say(creature_id, &text_str) {
-        broadcast_creature_say(creature_id, pos, &name, level as u16, 1, text_str.as_bytes());
         return;
     }
 
-    if crate::events::dispatch::execute_talk_action(creature_id, &text_str, "", speak_type) {
+    let param = text_str.split_once(' ').map(|(_, p)| p).unwrap_or("");
+    if crate::events::dispatch::execute_talk_action(creature_id, &text_str, param, speak_type) {
         return;
     }
 
     match speak_type {
-        1 | 2 | 3 => broadcast_creature_say(creature_id, pos, &name, level as u16, speak_type, text_str.as_bytes()),
+        1 | 2 | 3 => {
+            broadcast_creature_say(creature_id, pos, &name, level as u16, speak_type, text_str.as_bytes());
+            notify_nearby_npcs(creature_id, pos, speak_type, &text_str);
+        }
         6 | 11 => {
             let recv_name = receiver_name.map(|n| String::from_utf8_lossy(&n).to_string()).unwrap_or_default();
             let game = g_game().lock().unwrap();
