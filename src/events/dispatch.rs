@@ -58,51 +58,6 @@ fn push_item(lua: &Lua, server_id: u16, pos: Position, index: i32) -> LuaResult<
     Ok(t)
 }
 
-pub async fn execute_action_use_async(
-    player_id: CreatureId,
-    item_pos: Position,
-    item_server_id: u16,
-    item_index: i32,
-    item_action_id: u16,
-    item_unique_id: u16,
-    is_hotkey: bool,
-) -> bool {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    crate::runtime::g_dispatcher().add_task(
-        crate::runtime::dispatcher::Task::new(move || {
-            let result = execute_action_use(
-                player_id, item_pos, item_server_id, item_index,
-                item_action_id, item_unique_id, is_hotkey,
-            );
-            let _ = tx.send(result);
-        }),
-    );
-    rx.await.unwrap_or(false)
-}
-
-pub async fn execute_action_use_ex_async(
-    player_id: CreatureId,
-    from_pos: Position,
-    item_server_id: u16,
-    item_index: i32,
-    item_action_id: u16,
-    item_unique_id: u16,
-    to_pos: Position,
-    to_stackpos: u8,
-    is_hotkey: bool,
-) -> bool {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    crate::runtime::g_dispatcher().add_task(
-        crate::runtime::dispatcher::Task::new(move || {
-            let result = execute_action_use_ex(
-                player_id, from_pos, item_server_id, item_index,
-                item_action_id, item_unique_id, to_pos, to_stackpos, is_hotkey,
-            );
-            let _ = tx.send(result);
-        }),
-    );
-    rx.await.unwrap_or(false)
-}
 
 pub fn execute_action_use(
     player_id: CreatureId,

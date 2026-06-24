@@ -2066,11 +2066,9 @@ fn register_table_extensions(lua: &Lua) -> LuaResult<()> {
     })?)?;
 
     tbl.set("contains", lua.create_function(|_, (tbl, value): (LuaTable, LuaValue)| {
-        for pair in tbl.sequence_values::<LuaValue>() {
-            if let Ok(v) = pair {
-                if v == value {
-                    return Ok(true);
-                }
+        for v in tbl.sequence_values::<LuaValue>().flatten() {
+            if v == value {
+                return Ok(true);
             }
         }
         Ok(false)
