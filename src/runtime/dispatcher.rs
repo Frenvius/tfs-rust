@@ -1,8 +1,17 @@
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
+
+thread_local! {
+    static IS_DISPATCHER: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn is_dispatcher_thread() -> bool {
+    IS_DISPATCHER.with(|c| c.get())
+}
 
 pub const DISPATCHER_TASK_EXPIRATION: u64 = 2000;
 
@@ -106,6 +115,7 @@ pub struct DispatcherWorker {
 
 impl DispatcherWorker {
     pub async fn run(mut self) {
+        IS_DISPATCHER.with(|c| c.set(true));
         let mut batch: Vec<Task> = Vec::new();
         loop {
             let Some(msg) = self.rx.recv().await else {

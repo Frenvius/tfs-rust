@@ -53,8 +53,6 @@ impl AccessList {
                 continue;
             }
 
-            let line = line.to_lowercase();
-
             if let Some(at_pos) = line.find('@') {
                 if at_pos == 0 {
                     self.add_guild(&line[1..]);
@@ -68,7 +66,7 @@ impl AccessList {
             } else if line.contains('!') || line.contains('*') || line.contains('?') {
                 continue;
             } else {
-                self.add_player(&line);
+                self.add_player(line);
             }
         }
     }

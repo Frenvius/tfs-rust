@@ -52,6 +52,7 @@ const FLAG_HANGABLE: u32 = 1 << 16;
 const FLAG_VERTICAL: u32 = 1 << 17;
 const FLAG_HORIZONTAL: u32 = 1 << 18;
 const FLAG_ALLOW_DIST_READ: u32 = 1 << 20;
+const FLAG_ANIMATION: u32 = 1 << 24;
 const FLAG_LOOK_THROUGH: u32 = 1 << 23;
 const FLAG_FORCE_USE: u32 = 1 << 26;
 
@@ -208,6 +209,7 @@ pub struct ItemType {
     pub look_through: bool,
     pub force_use: bool,
     pub supports_hangable: bool,
+    pub is_animation: bool,
     pub attributes: Vec<ItemAttribute>,
 }
 
@@ -296,6 +298,7 @@ impl Default for ItemType {
             look_through: false,
             force_use: false,
             supports_hangable: false,
+            is_animation: false,
             attributes: Vec::new(),
         }
     }
@@ -521,12 +524,94 @@ impl Items {
             item.allow_dist_read = has_bit_set(FLAG_ALLOW_DIST_READ, flags);
             item.rotatable = has_bit_set(FLAG_ROTATABLE, flags);
             item.can_read_text = has_bit_set(FLAG_READABLE, flags);
+            item.is_animation = has_bit_set(FLAG_ANIMATION, flags);
             item.look_through = has_bit_set(FLAG_LOOK_THROUGH, flags);
             item.force_use = has_bit_set(FLAG_FORCE_USE, flags);
         }
 
         self.items.shrink_to_fit();
         Ok(())
+    }
+
+    pub fn load_dat_animation_flags(&mut self, dat_path: &str) {
+        let data = match std::fs::read(dat_path) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("Cannot read {dat_path}: {e} — animation flags from OTB only");
+                return;
+            }
+        };
+        if data.len() < 12 {
+            tracing::warn!("{dat_path} too small");
+            return;
+        }
+
+        let item_count = u16::from_le_bytes([data[4], data[5]]) as usize;
+        let mut pos: usize = 12;
+
+        let flag_data_sizes: std::collections::HashMap<u8, usize> = [
+            (0x00, 2), (0x08, 2), (0x09, 2), (0x16, 4),
+            (0x19, 4), (0x1A, 2), (0x1D, 2), (0x1E, 2), (0x21, 2), (0x23, 2),
+        ].into_iter().collect();
+
+        let mut animated_client_ids = std::collections::HashSet::new();
+        let mut parsed = 0usize;
+
+        for i in 0..item_count {
+            let client_id = (100 + i) as u16;
+            let mut ok = true;
+
+            while pos < data.len() {
+                let flag = data[pos]; pos += 1;
+                if flag == 0xFF { break; }
+                if flag == 0x22 {
+                    if pos + 8 > data.len() { ok = false; break; }
+                    pos += 6;
+                    if pos + 2 > data.len() { ok = false; break; }
+                    let name_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+                    pos += 2 + name_len + 4;
+                } else if let Some(&sz) = flag_data_sizes.get(&flag) {
+                    pos += sz;
+                }
+            }
+
+            if !ok || pos + 7 > data.len() { break; }
+
+            let w = data[pos] as usize; pos += 1;
+            let h = data[pos] as usize; pos += 1;
+            if w > 1 || h > 1 { pos += 1; }
+            let layers = data[pos] as usize; pos += 1;
+            let px = data[pos] as usize; pos += 1;
+            let py = data[pos] as usize; pos += 1;
+            let pz = data[pos] as usize; pos += 1;
+            let frames = data[pos] as usize; pos += 1;
+
+            if frames > 1 {
+                animated_client_ids.insert(client_id);
+                pos += 6 + frames * 8;
+            }
+
+            let total_sprites = w * h * layers * px * py * pz * frames;
+            pos += total_sprites * 4;
+
+            if pos > data.len() { break; }
+            parsed = i + 1;
+        }
+
+        let mut overrides = 0u32;
+        for item in &mut self.items {
+            if item.client_id == 0 { continue; }
+            let should_anim = animated_client_ids.contains(&item.client_id);
+            if item.is_animation != should_anim {
+                overrides += 1;
+                item.is_animation = should_anim;
+            }
+        }
+
+        tracing::info!(
+            parsed, dat_animated = animated_client_ids.len(), overrides,
+            "Loaded .dat animation flags from {dat_path}"
+        );
     }
 
     fn apply_xml(&mut self, data: ItemsXml) -> Result<(), ItemsError> {

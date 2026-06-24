@@ -8,6 +8,19 @@ use tokio::task::JoinHandle;
 use self::dispatcher::Dispatcher;
 use self::scheduler::Scheduler;
 
+pub use self::dispatcher::is_dispatcher_thread;
+
+macro_rules! assert_dispatcher_thread {
+    () => {
+        debug_assert!(
+            $crate::runtime::is_dispatcher_thread(),
+            "must be called on the dispatcher thread"
+        );
+    };
+}
+
+pub(crate) use assert_dispatcher_thread;
+
 static G_DISPATCHER: OnceLock<Dispatcher> = OnceLock::new();
 static G_SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
 static G_DISPATCHER_HANDLE: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();

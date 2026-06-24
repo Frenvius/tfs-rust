@@ -25,6 +25,9 @@ bindOnlyGlobalAddress = false
 loginProtocolPort = 7171
 gameProtocolPort = 7172
 statusProtocolPort = 7171
+-- Client version: 860 for Tibia 8.60, 1097/1098 for Tibia 10.98
+clientVersionMin = 860
+clientVersionMax = 860
 maxPlayers = 0
 motd = "Welcome to The Forgotten Server!"
 onePlayerOnlinePerAccount = true

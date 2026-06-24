@@ -19,6 +19,7 @@ fn get_creature_id(t: &LuaTable) -> LuaResult<CreatureId> {
     t.raw_get::<u32>(1)
 }
 
+
 static NEXT_AREA_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 type AreaMap = std::sync::Mutex<std::collections::HashMap<u32, Vec<(i8, i8)>>>;
 static AREA_PATTERNS: std::sync::OnceLock<AreaMap> = std::sync::OnceLock::new();
@@ -160,7 +161,22 @@ pub(crate) fn push_creature_ref(lua: &Lua, cid: CreatureId, class_name: &str) ->
     Ok(t)
 }
 
+/// Build an Item ref table. Does NOT lock g_game — pass `uid`/`action_id`
+/// directly (callers iterating tiles already hold the `MapItem`). Re-locking
+/// here while a tile method holds the lock is a re-entrant deadlock on the
+/// non-reentrant g_game mutex.
 fn push_item_ref(lua: &Lua, server_id: u16, pos: Position, index: i32) -> LuaResult<LuaTable> {
+    push_item_ref_attrs(lua, server_id, pos, index, 0, 0)
+}
+
+fn push_item_ref_attrs(
+    lua: &Lua,
+    server_id: u16,
+    pos: Position,
+    index: i32,
+    uid: u16,
+    action_id: u16,
+) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
     t.raw_set(1, server_id as i64)?;
     t.raw_set("itemid", server_id as i64)?;
@@ -168,19 +184,9 @@ fn push_item_ref(lua: &Lua, server_id: u16, pos: Position, index: i32) -> LuaRes
     t.raw_set("_pos_y", pos.y)?;
     t.raw_set("_pos_z", pos.z)?;
     t.raw_set("_idx", index)?;
-
-    // Set uid and actionid from tile item if available.
-    {
-        let game = g_game().lock().unwrap();
-        if let Some(tile) = game.map.get_tile(pos) {
-            let item = if index == -1 { tile.ground.as_ref() } else { tile.items.get(index as usize) };
-            if let Some(item) = item {
-                t.raw_set("uid", item.unique_id as i64)?;
-                if item.action_id > 0 {
-                    t.raw_set("actionid", item.action_id as i64)?;
-                }
-            }
-        }
+    t.raw_set("uid", uid as i64)?;
+    if action_id > 0 {
+        t.raw_set("actionid", action_id as i64)?;
     }
 
     if let Ok(mt) = lua.named_registry_value::<LuaTable>("Item") {
@@ -910,7 +916,7 @@ fn register_legacy_globals(lua: &Lua) -> LuaResult<()> {
         }).collect();
 
         let target_ids: Vec<crate::creatures::CreatureId> = {
-            let game = crate::game::g_game().lock().unwrap();
+            let game = g_game().lock().unwrap();
             let mut ids = Vec::new();
             for pos in &affected_positions {
                 if let Some(tile) = game.map.get_tile(*pos) {
@@ -2059,6 +2065,17 @@ fn register_table_extensions(lua: &Lua) -> LuaResult<()> {
         Ok(t)
     })?)?;
 
+    tbl.set("contains", lua.create_function(|_, (tbl, value): (LuaTable, LuaValue)| {
+        for pair in tbl.sequence_values::<LuaValue>() {
+            if let Ok(v) = pair {
+                if v == value {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    })?)?;
+
     Ok(())
 }
 
@@ -2632,11 +2649,13 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             }
             _ => return Ok(LuaValue::Nil),
         };
-        let game = g_game().lock().unwrap();
-        if game.map.get_tile(pos).is_none() {
+        let tile_exists = {
+            let g = g_game().lock().unwrap();
+            g.map.get_tile(pos).is_some()
+        };
+        if !tile_exists {
             return Ok(LuaValue::Nil);
         }
-        drop(game);
         let t = lua.create_table()?;
         t.set("x", pos.x)?;
         t.set("y", pos.y)?;
@@ -2705,6 +2724,15 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
         Ok(game.map.get_tile(pos).map(|t| t.has_flag(flag)).unwrap_or(false))
     })?)?;
 
+    methods.set("isWalkable", lua.create_function(|_, this: LuaTable| -> LuaResult<bool> {
+        let pos = table_to_position(&this)?;
+        let game = g_game().lock().unwrap();
+        let Some(tile) = game.map.get_tile(pos) else { return Ok(false) };
+        if tile.ground.is_none() { return Ok(false); }
+        if tile.has_flag(crate::map::tile::TILESTATE_BLOCKSOLID) { return Ok(false); }
+        Ok(true)
+    })?)?;
+
     methods.set("hasProperty", lua.create_function(|_, (this, prop): (LuaTable, i32)| -> LuaResult<bool> {
         let pos = table_to_position(&this)?;
         let game = g_game().lock().unwrap();
@@ -2747,7 +2775,7 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
         let game = g_game().lock().unwrap();
         if let Some(tile) = game.map.get_tile(pos) {
             if let Some(ground) = &tile.ground {
-                return Ok(LuaValue::Table(push_item_ref(lua, ground.server_id, pos, -1)?));
+                return Ok(LuaValue::Table(push_item_ref_attrs(lua, ground.server_id, pos, -1, ground.unique_id, ground.action_id)?));
             }
         }
         Ok(LuaValue::Nil)
@@ -2760,14 +2788,14 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             let mut i = index;
             if let Some(ground) = &tile.ground {
                 if i == 0 {
-                    return Ok(LuaValue::Table(push_item_ref(lua, ground.server_id, pos, -1)?));
+                    return Ok(LuaValue::Table(push_item_ref_attrs(lua, ground.server_id, pos, -1, ground.unique_id, ground.action_id)?));
                 }
                 i -= 1;
             }
             let top_count = tile.get_top_item_count();
             if (i as usize) < top_count {
                 let item = &tile.items[i as usize];
-                return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, i)?));
+                return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, i, item.unique_id, item.action_id)?));
             }
             i -= top_count as i32;
             if (i as usize) < tile.creature_ids.len() {
@@ -2786,7 +2814,7 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             if (i as usize) < down_count {
                 let actual_idx = down_start + i as usize;
                 let item = &tile.items[actual_idx];
-                return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, actual_idx as i32)?));
+                return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, actual_idx as i32, item.unique_id, item.action_id)?));
             }
         }
         Ok(LuaValue::Nil)
@@ -2807,14 +2835,14 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             let top_count = tile.get_top_item_count();
             if top_count > 0 {
                 let item = &tile.items[top_count - 1];
-                return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, (top_count - 1) as i32)?));
+                return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, (top_count - 1) as i32, item.unique_id, item.action_id)?));
             }
             if !tile.creature_ids.is_empty() {
                 let cid = tile.creature_ids[0];
                 return Ok(LuaValue::Table(push_creature_ref(lua, cid, "Creature")?));
             }
             if let Some(ground) = &tile.ground {
-                return Ok(LuaValue::Table(push_item_ref(lua, ground.server_id, pos, -1)?));
+                return Ok(LuaValue::Table(push_item_ref_attrs(lua, ground.server_id, pos, -1, ground.unique_id, ground.action_id)?));
             }
         }
         Ok(LuaValue::Nil)
@@ -2826,7 +2854,7 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             let top_count = tile.get_top_item_count();
             if top_count > 0 {
                 let item = &tile.items[top_count - 1];
-                return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, (top_count - 1) as i32)?));
+                return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, (top_count - 1) as i32, item.unique_id, item.action_id)?));
             }
         }
         Ok(LuaValue::Nil)
@@ -2838,7 +2866,7 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             let top_count = tile.get_top_item_count();
             if top_count < tile.items.len() {
                 let item = &tile.items[top_count];
-                return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, top_count as i32)?));
+                return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, top_count as i32, item.unique_id, item.action_id)?));
             }
         }
         Ok(LuaValue::Nil)
@@ -2850,7 +2878,7 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             for (idx, item) in tile.items.iter().enumerate() {
                 let it = game.items.get_item_type(item.server_id as usize);
                 if it.kind == crate::items::ItemKind::MagicField {
-                    return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, idx as i32)?));
+                    return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, idx as i32, item.unique_id, item.action_id)?));
                 }
             }
         }
@@ -2863,12 +2891,12 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
         if let Some(tile) = game.map.get_tile(pos) {
             if let Some(ground) = &tile.ground {
                 if ground.server_id == item_id {
-                    return Ok(LuaValue::Table(push_item_ref(lua, ground.server_id, pos, -1)?));
+                    return Ok(LuaValue::Table(push_item_ref_attrs(lua, ground.server_id, pos, -1, ground.unique_id, ground.action_id)?));
                 }
             }
             for (idx, item) in tile.items.iter().enumerate() {
                 if item.server_id == item_id {
-                    return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, idx as i32)?));
+                    return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, idx as i32, item.unique_id, item.action_id)?));
                 }
             }
         }
@@ -2881,13 +2909,13 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             if let Some(ground) = &tile.ground {
                 let it = game.items.get_item_type(ground.server_id as usize);
                 if it.kind as u32 == item_type {
-                    return Ok(LuaValue::Table(push_item_ref(lua, ground.server_id, pos, -1)?));
+                    return Ok(LuaValue::Table(push_item_ref_attrs(lua, ground.server_id, pos, -1, ground.unique_id, ground.action_id)?));
                 }
             }
             for (idx, item) in tile.items.iter().enumerate() {
                 let it = game.items.get_item_type(item.server_id as usize);
                 if it.kind as u32 == item_type {
-                    return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, idx as i32)?));
+                    return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, idx as i32, item.unique_id, item.action_id)?));
                 }
             }
         }
@@ -2900,7 +2928,7 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
             for (idx, item) in tile.items.iter().enumerate() {
                 let it = game.items.get_item_type(item.server_id as usize);
                 if it.always_on_top && it.always_on_top_order == top_order {
-                    return Ok(LuaValue::Table(push_item_ref(lua, item.server_id, pos, idx as i32)?));
+                    return Ok(LuaValue::Table(push_item_ref_attrs(lua, item.server_id, pos, idx as i32, item.unique_id, item.action_id)?));
                 }
             }
         }
@@ -2980,11 +3008,11 @@ fn register_tile_class(lua: &Lua) -> LuaResult<()> {
         if let Some(tile) = game.map.get_tile(pos) {
             let mut lua_idx = 1i64;
             if let Some(ground) = &tile.ground {
-                result.raw_set(lua_idx, push_item_ref(lua, ground.server_id, pos, -1)?)?;
+                result.raw_set(lua_idx, push_item_ref_attrs(lua, ground.server_id, pos, -1, ground.unique_id, ground.action_id)?)?;
                 lua_idx += 1;
             }
             for (idx, item) in tile.items.iter().enumerate() {
-                result.raw_set(lua_idx, push_item_ref(lua, item.server_id, pos, idx as i32)?)?;
+                result.raw_set(lua_idx, push_item_ref_attrs(lua, item.server_id, pos, idx as i32, item.unique_id, item.action_id)?)?;
                 lua_idx += 1;
             }
         }
@@ -3630,18 +3658,49 @@ fn register_item_class(lua: &Lua) -> LuaResult<()> {
         if let (Some(x), Some(y), Some(z), Some(idx)) = (pos_x, pos_y, pos_z, idx) {
             let pos = Position { x, y, z };
             let mut game = g_game().lock().unwrap();
+            let items_arc = game.items.clone();
             if let Some(tile) = game.map.get_tile_mut(pos) {
+                let count_val = sub_type.unwrap_or(1).max(1) as u8;
+                let new_count = sub_type.and_then(|s| if s >= 0 { Some(s as u16) } else { None });
+
                 if idx == -1 {
                     if let Some(ground) = &mut tile.ground {
                         ground.server_id = new_id;
-                        if let Some(sub) = sub_type {
-                            if sub >= 0 { ground.count = sub as u16; }
-                        }
+                        if let Some(c) = new_count { ground.count = c; }
                     }
-                } else if let Some(item) = tile.items.get_mut(idx as usize) {
-                    item.server_id = new_id;
-                    if let Some(sub) = sub_type {
-                        if sub >= 0 { item.count = sub as u16; }
+                    tile.recalculate_flags(&items_arc);
+                    drop(game);
+                    crate::net::game_protocol::broadcast_tile_item_transform(
+                        pos, 0, new_id, count_val, &items_arc,
+                    );
+                } else if (idx as usize) < tile.items.len() {
+                    let old_aot = items_arc
+                        .get_item_type(tile.items[idx as usize].server_id as usize)
+                        .always_on_top;
+                    let new_aot = items_arc.get_item_type(new_id as usize).always_on_top;
+                    if old_aot != new_aot {
+                        // C++ Game::transformItem: alwaysOnTop changed (down<->top)
+                        // => remove the old item and re-add the new so it lands
+                        // in the correct partition; tell the client via remove+add.
+                        if let Some((old_sp, new_sp)) =
+                            tile.repartition_transform(idx as usize, new_id, new_count, &items_arc)
+                        {
+                            drop(game);
+                            crate::net::game_protocol::broadcast_tile_item_repartition(
+                                pos, old_sp, new_sp, new_id, count_val, &items_arc,
+                            );
+                        }
+                    } else {
+                        let ground_off = if tile.ground.is_some() { 1u8 } else { 0u8 };
+                        let item = &mut tile.items[idx as usize];
+                        item.server_id = new_id;
+                        if let Some(c) = new_count { item.count = c; }
+                        tile.recalculate_flags(&items_arc);
+                        let stackpos = (idx as u8) + ground_off;
+                        drop(game);
+                        crate::net::game_protocol::broadcast_tile_item_transform(
+                            pos, stackpos, new_id, count_val, &items_arc,
+                        );
                     }
                 }
             }
@@ -4193,6 +4252,7 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
             look_legs: outfit_tbl.get("lookLegs").unwrap_or(0),
             look_feet: outfit_tbl.get("lookFeet").unwrap_or(0),
             look_addons: outfit_tbl.get("lookAddons").unwrap_or(0),
+            look_mount: outfit_tbl.get("lookMount").unwrap_or(0),
         };
         let mut game = g_game().lock().unwrap();
         if let Some(creature) = game.get_creature_mut(cid) {
@@ -4340,7 +4400,9 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
             game.move_creature_position(cid, old_pos, new_pos);
         }
         if is_player {
+            crate::net::game_protocol::stop_auto_walk(cid);
             crate::net::game_protocol::send_teleport_map_to_player(cid, old_pos, old_stackpos, new_pos);
+            crate::net::game_protocol::send_cancel_walk_to_session(cid);
         }
         crate::net::game_protocol::broadcast_creature_teleport_pub(cid, old_pos, old_stackpos, new_pos);
         Ok(true)
@@ -5150,6 +5212,13 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
         Ok(game.get_player(cid).map(|p| p.pz_locked).unwrap_or(false))
     })?)?;
 
+    methods.set("sendCancelMessage", lua.create_function(|_, (this, code): (LuaTable, i32)| -> LuaResult<bool> {
+        let cid = get_creature_id(&this)?;
+        let msg = get_return_message(code);
+        crate::net::game_protocol::send_status_message_to_player(cid, msg);
+        Ok(true)
+    })?)?;
+
     methods.set("hasChaseMode", lua.create_function(|_, this: LuaTable| -> LuaResult<bool> {
         let cid = get_creature_id(&this)?;
         let game = g_game().lock().unwrap();
@@ -5216,9 +5285,10 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
 
     methods.set("sendTextMessage", lua.create_function(|_, (this, msg_type, text): (LuaTable, u8, String)| -> LuaResult<()> {
         let cid: u32 = this.raw_get(1)?;
-        send_packet_to_player(cid, |output| {
+        let wire_type = crate::net::protocol_version::translate_message_class_to_client(msg_type);
+        send_packet_to_player(cid, move |output| {
             output.add_byte(0xB4);
-            output.add_byte(msg_type);
+            output.add_byte(wire_type);
             output.add_string(text.as_bytes());
         });
         Ok(())
@@ -5226,12 +5296,13 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
 
     methods.set("sendChannelMessage", lua.create_function(|_, (this, author, text, msg_type, channel_id): (LuaTable, String, String, u8, u16)| -> LuaResult<()> {
         let cid: u32 = this.raw_get(1)?;
-        send_packet_to_player(cid, |output| {
+        let wire_type = crate::net::protocol_version::translate_speak_class_to_client(msg_type);
+        send_packet_to_player(cid, move |output| {
             output.add_byte(0xAA);
             output.add_u32(0x00);
             output.add_string(author.as_bytes());
             output.add_u16(0);
-            output.add_byte(msg_type);
+            output.add_byte(wire_type);
             output.add_u16(channel_id);
             output.add_string(text.as_bytes());
         });
@@ -6468,7 +6539,7 @@ fn register_npc_globals(lua: &Lua) -> LuaResult<()> {
                 output.add_u32(npc_id);
                 output.add_string(name.as_bytes());
                 output.add_u16(0); // level irrelevant for NPCs
-                output.add_byte(4); // TALKTYPE_PRIVATE_NP
+                output.add_byte(crate::net::protocol_version::translate_speak_class_to_client(4));
                 output.add_string(text.as_bytes());
             });
         } else {
@@ -7357,7 +7428,7 @@ fn register_house_class(lua: &Lua) -> LuaResult<()> {
                     for (idx, item) in tile.items.iter().enumerate() {
                         let it = game.items.get_item_type(item.server_id as usize);
                         if it.kind == crate::items::ItemKind::Bed {
-                            tbl.raw_set(i + 1, push_item_ref(lua, item.server_id, bed_pos, idx as i32)?)?;
+                            tbl.raw_set(i + 1, push_item_ref_attrs(lua, item.server_id, bed_pos, idx as i32, item.unique_id, item.action_id)?)?;
                             break;
                         }
                     }
@@ -7383,7 +7454,7 @@ fn register_house_class(lua: &Lua) -> LuaResult<()> {
                     for (idx, item) in tile.items.iter().enumerate() {
                         let it = game.items.get_item_type(item.server_id as usize);
                         if it.kind == crate::items::ItemKind::Door {
-                            tbl.raw_set(i + 1, push_item_ref(lua, item.server_id, door_pos, idx as i32)?)?;
+                            tbl.raw_set(i + 1, push_item_ref_attrs(lua, item.server_id, door_pos, idx as i32, item.unique_id, item.action_id)?)?;
                             break;
                         }
                     }
@@ -7434,7 +7505,7 @@ fn register_house_class(lua: &Lua) -> LuaResult<()> {
             for &tile_pos in &house.tiles {
                 if let Some(tile) = game.map.get_tile(tile_pos) {
                     for (idx, item) in tile.items.iter().enumerate() {
-                        tbl.raw_set(lua_idx, push_item_ref(lua, item.server_id, tile_pos, idx as i32)?)?;
+                        tbl.raw_set(lua_idx, push_item_ref_attrs(lua, item.server_id, tile_pos, idx as i32, item.unique_id, item.action_id)?)?;
                         lua_idx += 1;
                     }
                 }
@@ -7944,7 +8015,7 @@ fn register_combat_class(lua: &Lua) -> LuaResult<()> {
         let distance_effect: u8 = params.get::<u32>(3).map(|v| v as u8).unwrap_or(0);
 
         let (level, mag_level, caster_pos) = {
-            let game = crate::game::g_game().lock().unwrap();
+            let game = g_game().lock().unwrap();
             match game.get_player(caster_id) {
                 Some(p) => (p.level, p.mag_level, p.base.position),
                 None => return Ok(false),
@@ -8023,7 +8094,7 @@ fn register_combat_class(lua: &Lua) -> LuaResult<()> {
             // Single-target combat
             let resolved_id = if target_id != 0 { target_id } else { caster_id };
             let target_pos = {
-                let game = crate::game::g_game().lock().unwrap();
+                let game = g_game().lock().unwrap();
                 game.get_creature(resolved_id).map(|c| c.base().position).unwrap_or(caster_pos)
             };
             if distance_effect > 0 {
@@ -8039,7 +8110,7 @@ fn register_combat_class(lua: &Lua) -> LuaResult<()> {
             dmg.origin = origin;
             Combat::do_target_combat(Some(caster_id), resolved_id, &mut dmg, &cp);
             if create_item != 0 {
-                crate::game::g_game().lock().unwrap().place_item_on_tile(target_pos, create_item);
+                g_game().lock().unwrap().place_item_on_tile(target_pos, create_item);
             }
         } else if let Some(center) = target_pos_opt {
             if distance_effect > 0 {
@@ -8055,7 +8126,7 @@ fn register_combat_class(lua: &Lua) -> LuaResult<()> {
                 z: center.z,
             }).collect();
             let target_ids: Vec<u32> = {
-                let game = crate::game::g_game().lock().unwrap();
+                let game = g_game().lock().unwrap();
                 let mut ids = Vec::new();
                 for pos in &affected_positions {
                     if let Some(tile) = game.map.get_tile(*pos) {
@@ -8076,7 +8147,7 @@ fn register_combat_class(lua: &Lua) -> LuaResult<()> {
                 }
             }
             if create_item != 0 {
-                let mut game = crate::game::g_game().lock().unwrap();
+                let mut game = g_game().lock().unwrap();
                 for pos in &affected_positions {
                     game.place_item_on_tile(*pos, create_item);
                 }

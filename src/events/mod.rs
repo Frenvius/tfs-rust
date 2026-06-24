@@ -604,7 +604,7 @@ impl Events {
             };
             crate::net::game_protocol::send_packet_to_player(player_id, move |out: &mut crate::net::output_message::OutputMessage| {
                 out.add_byte(0xB4);
-                out.add_byte(0x13); // MESSAGE_INFO_DESCR
+                out.add_byte(crate::net::protocol_version::translate_message_class_to_client(0x13));
                 out.add_string(desc.as_bytes());
             });
             return;

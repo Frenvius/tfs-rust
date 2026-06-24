@@ -395,6 +395,7 @@ pub async fn load_player_by_name(char_name: &str) -> Option<Player> {
         look_legs,
         look_feet,
         look_addons,
+        look_mount: 0,
     };
     player.base.current_outfit = outfit;
     player.base.default_outfit = outfit;

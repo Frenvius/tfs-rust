@@ -97,13 +97,14 @@ async fn connection_loop(
     let mut packet_count = 0u32;
     let mut window_start = Instant::now();
 
-    tracing::info!("new connection from {}", conn.peer_addr);
+    tracing::info!(peer = %conn.peer_addr, "new connection");
 
     // For server_sends_first: create and initialise the game protocol before reading.
     for svc in services.iter() {
         if svc.server_sends_first {
             let mut game = ProtocolGame::new(svc.checksummed);
             game.on_connect(&conn);
+            tracing::info!(peer = %conn.peer_addr, "challenge sent");
             protocol = Some(AnyProtocol::Game(game));
             break;
         }
@@ -112,11 +113,21 @@ async fn connection_loop(
     loop {
         let mut header = [0u8; 2];
         let read_result = tokio::select! {
-            _ = close.notified() => break,
+            _ = close.notified() => {
+                tracing::info!(peer = %conn.peer_addr, "close notified, breaking");
+                break;
+            }
             r = tokio::time::timeout(READ_TIMEOUT, read_half.read_exact(&mut header)) => r,
         };
         match read_result {
-            Err(_) | Ok(Err(_)) => break,
+            Err(_) => {
+                tracing::info!(peer = %conn.peer_addr, "read timeout, breaking");
+                break;
+            }
+            Ok(Err(e)) => {
+                tracing::info!(peer = %conn.peer_addr, %e, "read error, breaking");
+                break;
+            }
             Ok(Ok(_)) => {}
         }
 
@@ -229,10 +240,11 @@ async fn connection_loop(
                             }
                         }
                     }
-                    p.on_recv_message(&mut msg, &conn).await;
+                    p.on_recv_message(&mut msg);
                 }
                 _ => break,
             }
         }
     }
+    tracing::info!(peer = %conn.peer_addr, "connection_loop ended");
 }

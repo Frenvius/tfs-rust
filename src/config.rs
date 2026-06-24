@@ -90,10 +90,11 @@ pub enum StringConfig {
     DefaultPriority,
     MapAuthor,
     ConfigFile,
+    ClientDatFile,
 }
 
 impl StringConfig {
-    const COUNT: usize = 18;
+    const COUNT: usize = 19;
 
     fn index(self) -> usize {
         self as usize
@@ -139,10 +140,12 @@ pub enum IntegerConfig {
     VipPremiumLimit,
     DepotFreeLimit,
     DepotPremiumLimit,
+    ClientVersionMin,
+    ClientVersionMax,
 }
 
 impl IntegerConfig {
-    const COUNT: usize = 37;
+    const COUNT: usize = 39;
 
     fn index(self) -> usize {
         self as usize
@@ -250,6 +253,8 @@ impl ConfigManager {
                 get_global_string(&lua, "mysqlDatabase", "forgottenserver")?;
             self.strings[StringConfig::MysqlSock.index()] =
                 get_global_string(&lua, "mysqlSock", "")?;
+            self.strings[StringConfig::ClientDatFile.index()] =
+                get_global_string(&lua, "clientDatFile", "")?;
 
             self.integers[IntegerConfig::Ip.index()] =
                 resolve_ip_to_u32(self.get_string(StringConfig::IpString))
@@ -415,6 +420,10 @@ impl ConfigManager {
             get_global_number(&lua, "depotFreeLimit", 2_000)?;
         self.integers[IntegerConfig::DepotPremiumLimit.index()] =
             get_global_number(&lua, "depotPremiumLimit", 10_000)?;
+        self.integers[IntegerConfig::ClientVersionMin.index()] =
+            get_global_number(&lua, "clientVersionMin", 860)?;
+        self.integers[IntegerConfig::ClientVersionMax.index()] =
+            get_global_number(&lua, "clientVersionMax", 860)?;
 
         self.experience_stages = load_lua_stages(&lua)?;
         self.loaded = true;

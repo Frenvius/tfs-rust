@@ -252,6 +252,37 @@ impl Tile {
         }
     }
 
+    /// Re-partition the item at `idx` when a transform changes its
+    /// always-on-top category (down<->top). Mirrors the C++
+    /// `Game::transformItem` `alwaysOnTop != alwaysOnTop` branch: remove the
+    /// old item, change its id, re-add it so it lands in the correct partition,
+    /// keeping `down_item_count` consistent. Returns
+    /// `(old_client_stackpos, new_client_stackpos)`.
+    pub fn repartition_transform(
+        &mut self,
+        idx: usize,
+        new_id: u16,
+        new_count: Option<u16>,
+        items: &Items,
+    ) -> Option<(u8, u8)> {
+        if idx >= self.items.len() {
+            return None;
+        }
+        let old_stackpos = self.item_client_stackpos(idx);
+        let mut item = self.items.remove(idx);
+        if idx < usize::from(self.down_item_count) {
+            self.down_item_count = self.down_item_count.saturating_sub(1);
+        }
+        item.server_id = new_id;
+        if let Some(c) = new_count {
+            item.count = c;
+        }
+        self.internal_add_item(item, items);
+        self.recalculate_flags(items);
+        let new_idx = self.items.iter().position(|it| it.server_id == new_id)?;
+        Some((old_stackpos, self.item_client_stackpos(new_idx)))
+    }
+
     pub fn internal_add_item(&mut self, item: MapItem, items: &Items) {
         let item_type = items.get_item_type(usize::from(item.server_id));
         if item_type.is_ground_tile() {
@@ -270,7 +301,7 @@ impl Tile {
                     items
                         .get_item_type(usize::from(existing.server_id))
                         .always_on_top_order
-                        > item_type.always_on_top_order
+                        >= item_type.always_on_top_order
                 })
                 .map(|offset| insertion_start + offset)
                 .unwrap_or(self.items.len());
@@ -295,6 +326,31 @@ impl Tile {
             }
         }
         false
+    }
+
+    pub fn recalculate_flags(&mut self, items: &Items) {
+        const ITEM_DERIVED: u32 = TILESTATE_FLOORCHANGE
+            | TILESTATE_BLOCKSOLID
+            | TILESTATE_BLOCKPATH
+            | TILESTATE_IMMOVABLEBLOCKSOLID
+            | TILESTATE_IMMOVABLEBLOCKPATH
+            | TILESTATE_IMMOVABLENOFIELDBLOCKPATH
+            | TILESTATE_NOFIELDBLOCKPATH
+            | TILESTATE_SUPPORTS_HANGABLE
+            | TILESTATE_TELEPORT
+            | TILESTATE_MAGICFIELD
+            | TILESTATE_MAILBOX
+            | TILESTATE_TRASHHOLDER
+            | TILESTATE_BED
+            | TILESTATE_DEPOT;
+        self.flags &= !ITEM_DERIVED;
+        if let Some(g) = &self.ground {
+            self.set_tile_flags(items.get_item_type(usize::from(g.server_id)));
+        }
+        for i in 0..self.items.len() {
+            let sid = self.items[i].server_id;
+            self.set_tile_flags(items.get_item_type(usize::from(sid)));
+        }
     }
 
     fn set_tile_flags(&mut self, item_type: &crate::items::ItemType) {

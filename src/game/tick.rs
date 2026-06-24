@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::combat::condition::{ConditionEffect, SKILL_FIRST, SKILL_LAST, SPECIALSKILL_FIRST, SPECIALSKILL_LAST, STAT_FIRST, STAT_LAST};
 use crate::config::{g_config, IntegerConfig};
@@ -10,8 +10,12 @@ use crate::game::{
 use crate::map::tile::TILESTATE_NOLOGOUT;
 use crate::net::game_protocol::send_packet_to_player;
 use crate::net::output_message::OutputMessage;
+use crate::runtime::scheduler::SchedulerTask;
+use crate::runtime::g_scheduler;
 use crate::util::get_milliseconds_time;
 use crate::world::vocation::g_vocations;
+
+static CREATURE_CHECK_INDEX: AtomicUsize = AtomicUsize::new(0);
 
 pub fn apply_condition_effects(creature_id: CreatureId, effects: &[ConditionEffect]) {
     let mut need_speed_broadcast = false;
@@ -54,6 +58,7 @@ pub fn apply_condition_effects(creature_id: CreatureId, effects: &[ConditionEffe
                         look_legs: oi.look_legs,
                         look_feet: oi.look_feet,
                         look_addons: oi.look_addons,
+                        look_mount: 0,
                     };
                     need_outfit_broadcast = true;
                 }
@@ -205,72 +210,82 @@ pub fn apply_condition_effects(creature_id: CreatureId, effects: &[ConditionEffe
     }
 }
 
-pub async fn run_game_tick() {
-    let creature_loop = async {
-        let mut index: usize = 0;
-        loop {
-            tokio::time::sleep(Duration::from_millis(EVENT_CHECK_CREATURE_INTERVAL)).await;
-            check_creatures(index);
-            index = (index + 1) % EVENT_CREATURECOUNT;
-        }
-    };
+pub fn schedule_tick_events() {
+    schedule_creature_check();
+    schedule_world_time();
+    schedule_light();
+    schedule_spawns();
+    schedule_global_think();
+    schedule_global_timer();
+    schedule_decay();
+}
 
-    let world_time_loop = async {
-        loop {
-            tokio::time::sleep(Duration::from_millis(EVENT_WORLDTIMEINTERVAL)).await;
-            update_world_time();
-        }
-    };
+fn schedule_creature_check() {
+    g_scheduler().add_event(SchedulerTask::new(EVENT_CHECK_CREATURE_INTERVAL as u32, || {
+        let index = CREATURE_CHECK_INDEX.fetch_add(1, Ordering::Relaxed) % EVENT_CREATURECOUNT;
+        check_creatures(index);
+        schedule_creature_check();
+    }));
+}
 
-    let light_loop = async {
-        loop {
-            tokio::time::sleep(Duration::from_millis(EVENT_LIGHTINTERVAL)).await;
-            check_light();
-        }
-    };
+fn schedule_world_time() {
+    g_scheduler().add_event(SchedulerTask::new(EVENT_WORLDTIMEINTERVAL as u32, || {
+        update_world_time();
+        schedule_world_time();
+    }));
+}
 
-    let spawn_loop = async {
-        loop {
-            // Check every 10 seconds for dead spawn blocks that need respawning.
-            tokio::time::sleep(Duration::from_millis(10_000)).await;
-            check_spawns();
-        }
-    };
+fn schedule_light() {
+    g_scheduler().add_event(SchedulerTask::new(EVENT_LIGHTINTERVAL as u32, || {
+        check_light();
+        schedule_light();
+    }));
+}
 
-    let global_think_loop = async {
-        loop {
-            tokio::time::sleep(Duration::from_millis(crate::events::global::SCHEDULER_MINTICKS as u64)).await;
-            crate::events::registry::g_script_registry().lock().unwrap().global_events.think();
-        }
-    };
+fn schedule_spawns() {
+    g_scheduler().add_event(SchedulerTask::new(10_000, || {
+        check_spawns();
+        schedule_spawns();
+    }));
+}
 
-    let global_timer_loop = async {
-        loop {
-            tokio::time::sleep(Duration::from_millis(1_000)).await;
-            crate::events::registry::g_script_registry().lock().unwrap().global_events.timer();
-        }
-    };
+fn schedule_global_think() {
+    g_scheduler().add_event(SchedulerTask::new(crate::events::global::SCHEDULER_MINTICKS as u32, || {
+        let due = crate::events::registry::g_script_registry().lock().unwrap()
+            .global_events.collect_due_think_events();
+        crate::events::global::execute_collected_events(due);
+        schedule_global_think();
+    }));
+}
 
-    // House rent check (C++ Game schedules payHouses; no-op when rent disabled).
-    let rent_loop = async {
+fn schedule_global_timer() {
+    g_scheduler().add_event(SchedulerTask::new(1_000, || {
+        let due = crate::events::registry::g_script_registry().lock().unwrap()
+            .global_events.collect_due_timer_events();
+        crate::events::global::execute_collected_events(due);
+        schedule_global_timer();
+    }));
+}
+
+fn schedule_decay() {
+    g_scheduler().add_event(SchedulerTask::new(crate::game::EVENT_DECAYINTERVAL as u32, || {
+        let mut game = g_game().lock().unwrap();
+        game.check_decay();
+        drop(game);
+        schedule_decay();
+    }));
+}
+
+pub fn schedule_rent_loop() {
+    tokio::spawn(async {
         loop {
-            tokio::time::sleep(Duration::from_millis(60_000)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(60_000)).await;
             let db = crate::db::g_database();
             if let Err(e) = crate::map::serialize::IOMapSerialize::pay_houses(db).await {
                 tracing::warn!("payHouses failed: {e}");
             }
         }
-    };
-
-    let decay_loop = async {
-        loop {
-            tokio::time::sleep(Duration::from_millis(crate::game::EVENT_DECAYINTERVAL as u64)).await;
-            let mut game = g_game().lock().unwrap();
-            game.check_decay();
-        }
-    };
-
-    tokio::join!(creature_loop, world_time_loop, light_loop, spawn_loop, global_think_loop, global_timer_loop, rent_loop, decay_loop);
+    });
 }
 
 fn check_creatures(index: usize) {
@@ -606,7 +621,7 @@ fn on_attacking(creature_id: u32) {
                     send_packet_to_player(target_id, move |output: &mut OutputMessage| {
                         let msg = "You advanced in shielding.";
                         output.add_byte(0xB4);
-                        output.add_byte(0x13);
+                        output.add_byte(crate::net::protocol_version::translate_message_class_to_client(0x13));
                         output.add_string(msg.as_bytes());
                     });
                     let new_shield_level = {
@@ -664,7 +679,7 @@ fn on_attacking(creature_id: u32) {
             send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
                 let msg = format!("You advanced in {skill_name}.");
                 output.add_byte(0xB4);
-                output.add_byte(0x13);
+                output.add_byte(crate::net::protocol_version::translate_message_class_to_client(0x13));
                 output.add_string(msg.as_bytes());
             });
             let new_level = {
@@ -1417,7 +1432,7 @@ fn player_on_think(creature_id: u32) {
                         kick_after_minutes
                     );
                     output.add_byte(0xB4);
-                    output.add_byte(0x13); // MESSAGE_STATUS_WARNING
+                    output.add_byte(crate::net::protocol_version::translate_message_class_to_client(0x13));
                     output.add_string(msg.as_bytes());
                 });
             }

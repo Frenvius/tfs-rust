@@ -2,7 +2,7 @@ use std::mem::size_of;
 
 use byteorder::{ByteOrder, LittleEndian};
 
-pub const NETWORK_MESSAGE_MAXSIZE: usize = 24_590;
+pub const NETWORK_MESSAGE_MAXSIZE: usize = 65_500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Position {

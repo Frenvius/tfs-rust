@@ -4,5 +4,6 @@ pub mod login;
 pub mod message;
 pub mod output_message;
 pub mod protocol;
+pub mod protocol_version;
 pub mod server;
 pub mod status;

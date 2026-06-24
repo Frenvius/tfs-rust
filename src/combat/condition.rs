@@ -1322,7 +1322,7 @@ impl Condition for ConditionLight {
             ConditionParam::IsBuff => self.base.is_buff = value != 0,
             ConditionParam::SubId => self.base.sub_id = value as u32,
             ConditionParam::IsAggressive => self.base.aggressive = value != 0,
-            ConditionParam::LightLevel => self.light_info.level = value as u8,
+            ConditionParam::LightLevel => self.light_info.level = (value as u8).max(1),
             ConditionParam::LightColor => self.light_info.color = value as u8,
             _ => {}
         }

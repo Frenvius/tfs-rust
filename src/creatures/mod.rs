@@ -103,6 +103,7 @@ pub struct Outfit {
     pub look_legs: u8,
     pub look_feet: u8,
     pub look_addons: u8,
+    pub look_mount: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -542,6 +543,14 @@ impl Creature {
     pub fn is_immune_condition(&self, condition_type: crate::combat::condition::ConditionType) -> bool {
         let immunities = self.get_condition_immunities();
         immunities & (condition_type as u32) != 0
+    }
+
+    pub fn get_name(&self) -> &str {
+        match self {
+            Creature::Player(p) => &p.name,
+            Creature::Monster(m) => m.get_name(),
+            Creature::Npc(n) => n.get_name(),
+        }
     }
 
     pub fn get_name_description(&self) -> String {

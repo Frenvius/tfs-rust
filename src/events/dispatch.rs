@@ -58,6 +58,52 @@ fn push_item(lua: &Lua, server_id: u16, pos: Position, index: i32) -> LuaResult<
     Ok(t)
 }
 
+pub async fn execute_action_use_async(
+    player_id: CreatureId,
+    item_pos: Position,
+    item_server_id: u16,
+    item_index: i32,
+    item_action_id: u16,
+    item_unique_id: u16,
+    is_hotkey: bool,
+) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    crate::runtime::g_dispatcher().add_task(
+        crate::runtime::dispatcher::Task::new(move || {
+            let result = execute_action_use(
+                player_id, item_pos, item_server_id, item_index,
+                item_action_id, item_unique_id, is_hotkey,
+            );
+            let _ = tx.send(result);
+        }),
+    );
+    rx.await.unwrap_or(false)
+}
+
+pub async fn execute_action_use_ex_async(
+    player_id: CreatureId,
+    from_pos: Position,
+    item_server_id: u16,
+    item_index: i32,
+    item_action_id: u16,
+    item_unique_id: u16,
+    to_pos: Position,
+    to_stackpos: u8,
+    is_hotkey: bool,
+) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    crate::runtime::g_dispatcher().add_task(
+        crate::runtime::dispatcher::Task::new(move || {
+            let result = execute_action_use_ex(
+                player_id, from_pos, item_server_id, item_index,
+                item_action_id, item_unique_id, to_pos, to_stackpos, is_hotkey,
+            );
+            let _ = tx.send(result);
+        }),
+    );
+    rx.await.unwrap_or(false)
+}
+
 pub fn execute_action_use(
     player_id: CreatureId,
     item_pos: Position,
@@ -67,6 +113,7 @@ pub fn execute_action_use(
     item_unique_id: u16,
     is_hotkey: bool,
 ) -> bool {
+    crate::runtime::assert_dispatcher_thread!();
     let (script_id, from_lua) = {
         let registry = g_script_registry().lock().unwrap();
         let action = registry.actions.get_action(item_server_id, item_unique_id, item_action_id);
@@ -103,18 +150,19 @@ pub fn execute_action_use(
         let target_tbl = push_item(lua, item_server_id, item_pos, item_index)?;
         let to_pos_tbl = push_position(lua, item_pos)?;
 
-        match func.call::<bool>((player_tbl, item_tbl, from_pos_tbl, target_tbl, to_pos_tbl, is_hotkey)) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                tracing::error!("Lua action error: {e}");
-                Ok(false)
-            }
-        }
+        let r: mlua::Value = func.call((player_tbl, item_tbl, from_pos_tbl, target_tbl, to_pos_tbl, is_hotkey))?;
+        Ok(matches!(r, mlua::Value::Boolean(true)))
     })();
 
     ScriptEnvironment::reset();
 
-    result.unwrap_or(false)
+    match result {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(%e, "execute_action_use Lua error");
+            false
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -219,6 +267,7 @@ pub fn execute_action_use_ex(
 }
 
 pub fn execute_spell_say(player_id: CreatureId, text: &str) -> bool {
+    crate::runtime::assert_dispatcher_thread!();
     let words_lower = text.to_lowercase();
     let (spell_words, param) = {
         let registry = g_script_registry().lock().unwrap();
@@ -449,6 +498,7 @@ fn push_creature(lua: &Lua, creature_id: CreatureId) -> LuaResult<LuaTable> {
 
 /// Fire all `onLogin` creature events for a player. Mirrors `CreatureEvents::playerLogin`.
 pub fn execute_creature_event_login(player_id: CreatureId) -> bool {
+    crate::runtime::assert_dispatcher_thread!();
     use crate::events::creature::CreatureEventType;
     use crate::events::registry::g_script_registry;
 
@@ -671,16 +721,19 @@ pub fn execute_creature_event_advance(player_id: CreatureId, skill: u8, old_leve
 /// Fire per-creature `onThink(creature, interval)` creature script events.
 /// Mirrors `Creature::onThink` scripting portion.
 pub fn execute_creature_event_think(creature_id: CreatureId, interval: u32) {
+    crate::runtime::assert_dispatcher_thread!();
     use crate::events::creature::CreatureEventType;
     use crate::events::registry::g_script_registry;
 
-    let script_ids: Vec<(i32, bool)> = {
+    let names: Vec<String> = {
         let game = g_game().lock().unwrap();
-        let names = match game.get_creature(creature_id) {
+        match game.get_creature(creature_id) {
             Some(c) => c.base().get_creature_event_names(CreatureEventType::Think),
             None => return,
-        };
-        if names.is_empty() { return; }
+        }
+    };
+    if names.is_empty() { return; }
+    let script_ids: Vec<(i32, bool)> = {
         let registry = g_script_registry().lock().unwrap();
         names.iter()
             .filter_map(|n| registry.creature_events.get_event_by_name(n, true).map(|e| (e.script_id, e.from_lua)))
@@ -1079,6 +1132,7 @@ pub fn execute_step_event(
     if events.is_empty() {
         return;
     }
+    tracing::info!(?tile_pos, ?etype, n_events = events.len(), thread = ?std::thread::current().id(), "DBG step_event");
 
     let lua = g_lua();
     for (script_id, from_lua, item_server_id) in events {
@@ -1107,7 +1161,10 @@ pub fn execute_step_event(
             let pos_tbl = push_position(lua, tile_pos)?;
             let from_pos_tbl = push_position(lua, from_pos)?;
 
-            match func.call::<bool>((creature_tbl, item_val, pos_tbl, from_pos_tbl)) {
+            tracing::info!(script_id, item_server_id, "DBG step_event: calling Lua onStep");
+            let r = func.call::<bool>((creature_tbl, item_val, pos_tbl, from_pos_tbl));
+            tracing::info!(script_id, ok = r.is_ok(), "DBG step_event: Lua onStep returned");
+            match r {
                 Ok(_) => Ok(()),
                 Err(e) => { tracing::error!("Lua onStep error: {e}"); Ok(()) }
             }

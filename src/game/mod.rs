@@ -66,6 +66,27 @@ pub(crate) fn init_game(game: Game) {
     G_GAME
         .set(Mutex::new(game))
         .unwrap_or_else(|_| panic!("game already initialized"));
+
+    // DBG watchdog: if g_game stays unlockable for >3s, report a likely deadlock.
+    std::thread::spawn(|| {
+        let mut stuck_since: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match G_GAME.get().and_then(|m| m.try_lock().ok()) {
+                Some(_guard) => { stuck_since = None; }
+                None => {
+                    let since = stuck_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed().as_secs() >= 3 {
+                        tracing::error!(
+                            "DBG WATCHDOG: g_game unlockable for {}s — likely DEADLOCK",
+                            since.elapsed().as_secs()
+                        );
+                        stuck_since = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+    });
 }
 
 pub const PLAYER_NAME_LENGTH: i32 = 25;
@@ -695,6 +716,13 @@ impl Game {
 
     /// Send animated floating text (0x84) to all player spectators at pos.
     pub fn add_animated_text(&mut self, pos: Position, color: u8, text: &str) {
+        // The standalone 0x84 AnimatedText S2C packet only exists on the 8.60
+        // protocol. On 10.98 it was removed — floating damage/heal numbers are
+        // carried inside the 0xB4 text message (MESSAGE_DAMAGE_*/HEALED). Emitting
+        // 0x84 to a 10.98 client desyncs the byte stream, so skip it there.
+        if crate::net::protocol_version::client_version().is_1098() {
+            return;
+        }
         let spectators = self.map.get_spectators(pos, true, true, 0, 0, 0, 0);
         let text_bytes: Vec<u8> = text.as_bytes().to_vec();
         for spec_id in spectators {
@@ -818,6 +846,7 @@ impl Game {
             let Some(idx) = tile.find_item_index_by_server_id(old_server_id) else { return };
             let sp = tile.item_client_stackpos(idx);
             tile.items[idx].server_id = new_server_id;
+            tile.recalculate_flags(&items_arc);
             let cid = items_arc.get_item_type(new_server_id as usize).client_id;
             Some((sp, cid))
         }) else { return };
@@ -1882,6 +1911,20 @@ impl Game {
     // ── Health change ─────────────────────────────────────────────────────────
 
     /// Mirrors C++ `Game::combatChangeHealth`.
+    /// True when `creature_id` has at least one registered creature-event of
+    /// `etype`. Used to gate the HEALTHCHANGE/MANACHANGE event dispatch: those
+    /// `fire_*` functions re-lock `g_game`, so they must never be entered while
+    /// the lock is already held (e.g. from inside `combat_change_health`). When
+    /// no such event is registered there is nothing to fire and we can skip the
+    /// re-locking path entirely. (Firing with the lock held remains a TODO:
+    /// custom healthchange/manachange scripts need the event to run with
+    /// `g_game` released, matching the step/death event pattern.)
+    fn has_creature_event(&self, creature_id: CreatureId, etype: crate::events::creature::CreatureEventType) -> bool {
+        self.get_creature(creature_id)
+            .map(|c| !c.base().get_creature_event_names(etype).is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn combat_change_health(
         &mut self,
         attacker_id: Option<CreatureId>,
@@ -1910,6 +1953,7 @@ impl Game {
             }
 
             if damage.origin != CombatOrigin::None
+                && self.has_creature_event(target_id, crate::events::creature::CreatureEventType::HealthChange)
                 && crate::events::dispatch::fire_health_change_events(target_id, attacker_id, damage)
             {
                 damage.origin = CombatOrigin::None;
@@ -2078,6 +2122,7 @@ impl Game {
         if remaining_damage == 0 { return true; }
 
         if damage.origin != CombatOrigin::None
+            && self.has_creature_event(target_id, crate::events::creature::CreatureEventType::HealthChange)
             && crate::events::dispatch::fire_health_change_events(target_id, attacker_id, damage)
         {
             damage.origin = CombatOrigin::None;
@@ -2182,6 +2227,7 @@ impl Game {
         }
 
         if real_damage >= cur_health
+            && self.has_creature_event(target_id, crate::events::creature::CreatureEventType::PrepareDeath)
             && !crate::events::dispatch::fire_prepare_death_events(target_id, attacker_id)
         {
             return false;
@@ -2253,6 +2299,7 @@ impl Game {
                 return false;
             }
             if damage.origin != CombatOrigin::None
+                && self.has_creature_event(target_id, crate::events::creature::CreatureEventType::ManaChange)
                 && crate::events::dispatch::fire_mana_change_events(target_id, attacker_id, damage)
             {
                 damage.origin = CombatOrigin::None;
@@ -2286,6 +2333,7 @@ impl Game {
             if mana_loss <= 0 { return true; }
 
             if damage.origin != CombatOrigin::None
+                && self.has_creature_event(target_id, crate::events::creature::CreatureEventType::ManaChange)
                 && crate::events::dispatch::fire_mana_change_events(target_id, attacker_id, damage)
             {
                 damage.origin = CombatOrigin::None;

@@ -21,6 +21,16 @@ pub struct Options {
     pub game_port: Option<u16>,
 }
 
+/// Expected items.otb `minor_version` (the CLIENT_VERSION enum from
+/// `itemloader.h`) for a given Tibia client protocol version.
+fn expected_otb_minor(client_version: u16) -> Option<u16> {
+    match client_version {
+        860 => Some(20),         // CLIENT_VERSION_860
+        1097 | 1098 => Some(57), // CLIENT_VERSION_1098
+        _ => None,
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -77,6 +87,10 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     }
     init_config(config);
 
+    // Determine protocol version from config.
+    let version_min = g_config().get_number(IntegerConfig::ClientVersionMin) as u16;
+    crate::net::protocol_version::init_client_version(version_min);
+
     // Load RSA key.
     let rsa = Rsa::load_pem("key.pem").map_err(|e| anyhow!("{e}"))?;
     init_rsa(rsa);
@@ -100,8 +114,33 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     }
     println!("OTB v{}.{}.{}", items.major_version(), items.minor_version(), items.build_number());
 
-    // Publish the global item registry before loading monsters: the monster
-    // loot loader resolves name-based loot entries through g_items().
+    // Verify the items.otb client version matches the configured client version.
+    // OTB `minor_version` is the CLIENT_VERSION enum (8.60 = 20, 10.98 = 57).
+    if let Some(expected_minor) = expected_otb_minor(version_min) {
+        if items.minor_version() != expected_minor as u32 {
+            return Err(anyhow!(
+                "items.otb client mismatch: OTB minor={} but config clientVersion={} expects OTB minor={}. \
+                 Use the items.otb/items.xml that match client {}.",
+                items.minor_version(), version_min, expected_minor, version_min
+            ));
+        }
+    } else {
+        println!(
+            ">> Warning: no known items.otb version for client {} — skipping OTB version check",
+            version_min
+        );
+    }
+
+    // NOTE: is_animation must come solely from the OTB FLAG_ANIMATION (as the
+    // C++ server does). Overriding it from the client .dat desyncs the 10.98
+    // item-animation byte (0xFE) and corrupts map-slice packets.
+    // {
+    //     let dat_path = crate::config::g_config().get_string(crate::config::StringConfig::ClientDatFile).to_string();
+    //     if !dat_path.is_empty() {
+    //         items.load_dat_animation_flags(&dat_path);
+    //     }
+    // }
+
     let items_arc = std::sync::Arc::new(items);
     crate::items::init_items(items_arc.clone());
 
@@ -302,7 +341,8 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     services.start();
 
     // Start game tick (checkCreatures, checkLight, etc.) matching C++ Game::start().
-    tokio::spawn(crate::game::tick::run_game_tick());
+    crate::game::tick::schedule_tick_events();
+    crate::game::tick::schedule_rent_loop();
 
     let server_name = g_config().get_string(StringConfig::ServerName).to_owned();
     println!(

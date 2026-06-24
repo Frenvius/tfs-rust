@@ -509,6 +509,85 @@ impl GlobalEvents {
     pub fn iter_timer(&self) -> impl Iterator<Item = (&str, &GlobalEvent)> {
         self.timer_map.iter().map(|(k, v)| (k.as_str(), v))
     }
+
+    pub fn collect_due_think_events(&mut self) -> Vec<(GlobalEvent, u32)> {
+        let now = now_ms();
+        let due: Vec<(String, u32, i64)> = self.think_map.values()
+            .filter(|e| e.next_execution <= now)
+            .map(|e| (e.name.clone(), e.interval, e.next_execution))
+            .collect();
+        let mut result = Vec::new();
+        for (name, interval, prev_exec) in due {
+            let event = match self.think_map.get(&name) {
+                Some(e) => e.clone(),
+                None => continue,
+            };
+            result.push((event, interval));
+            if let Some(ev) = self.think_map.get_mut(&name) {
+                ev.next_execution = prev_exec + interval as i64;
+            }
+        }
+        result
+    }
+
+    pub fn collect_due_timer_events(&mut self) -> Vec<(GlobalEvent, u32)> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let due: Vec<(String, u32, i64)> = self.timer_map.values()
+            .filter(|e| e.next_execution <= now)
+            .map(|e| (e.name.clone(), e.interval, e.next_execution))
+            .collect();
+        let mut result = Vec::new();
+        for (name, interval, prev_exec) in due {
+            let event = match self.timer_map.get(&name) {
+                Some(e) => e.clone(),
+                None => continue,
+            };
+            result.push((event, interval));
+            if let Some(ev) = self.timer_map.get_mut(&name) {
+                ev.next_execution = prev_exec + interval as i64;
+            }
+        }
+        result
+    }
+}
+
+pub fn execute_collected_events(events: Vec<(GlobalEvent, u32)>) {
+    use crate::lua::script::{g_lua, ScriptEnvironment};
+    use crate::events::registry::g_script_registry;
+    let lua = g_lua();
+    for (event, interval) in events {
+        if !ScriptEnvironment::reserve() {
+            tracing::error!("GlobalEvent::executeEvent - Call stack overflow");
+            continue;
+        }
+        ScriptEnvironment::set_script_id(event.script_id, "GlobalEvent Interface");
+        let _ = (|| -> mlua::Result<bool> {
+            let func = if event.from_lua {
+                let reg = g_script_registry().lock().unwrap();
+                reg.get_callback_function(lua, event.script_id)
+            } else {
+                let reg = g_script_registry().lock().unwrap();
+                reg.global_events.get_script_function(event.script_id)
+            };
+            let Some(func) = func else { return Ok(true); };
+            let needs_interval = event.event_type == GlobalEventType::None
+                || event.event_type == GlobalEventType::Timer;
+            let res = if needs_interval {
+                func.call::<bool>(interval as i64)
+            } else {
+                func.call::<bool>(())
+            };
+            match res {
+                Ok(v) => Ok(v),
+                Err(e) => { tracing::error!("Lua GlobalEvent {} error: {e}", event.name); Ok(false) }
+            }
+        })();
+        ScriptEnvironment::reset();
+    }
 }
 
 impl Default for GlobalEvents {
