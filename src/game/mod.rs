@@ -800,22 +800,21 @@ impl Game {
         if server_id == 0 { return; }
 
         let items_arc = self.items.clone();
-        let (stackpos, client_id) = {
+        let (stackpos, count) = {
+            let count = item.count.min(255).max(1) as u8;
             let Some(tile) = self.map.get_tile_mut(pos) else { return };
-            tile.internal_add_item(item, &items_arc);
-            let sp = (if tile.ground.is_some() { 1u8 } else { 0u8 })
-                .saturating_add(tile.get_top_item_count().saturating_sub(0) as u8);
-            let cid = items_arc.get_item_type(server_id as usize).client_id;
-            (sp, cid)
+            let sp = tile.add_item_get_stackpos(item, &items_arc);
+            (sp, count)
         };
 
         let spectators = self.map.get_spectators(pos, true, true, 0, 0, 0, 0);
         for spec_id in spectators {
+            let items_ref = items_arc.clone();
             send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
                 output.add_byte(0x6A);
                 output.add_position(pos.x, pos.y, pos.z);
                 output.add_byte(stackpos);
-                output.add_u16(client_id);
+                crate::net::game_protocol::write_item(output, &items_ref, server_id, count);
             });
         }
 

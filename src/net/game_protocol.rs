@@ -4345,7 +4345,7 @@ fn write_outfit(output: &mut OutputMessage, outfit: &Outfit) {
     }
 }
 
-fn write_item(output: &mut OutputMessage, items: &Items, server_id: u16, count: u8) -> bool {
+pub(crate) fn write_item(output: &mut OutputMessage, items: &Items, server_id: u16, count: u8) -> bool {
     let item_type = items.get_item_type(server_id as usize);
     if item_type.client_id == 0 {
         return false;
@@ -5331,19 +5331,17 @@ fn handle_inventory_to_ground(creature_id: CreatureId, from_pos: Position, to_po
     let dy = (player_pos.y as i32 - to_pos.y as i32).unsigned_abs();
     if dx > 7 || dy > 5 || player_pos.z != to_pos.z { return; }
 
-    let (stackpos, client_id) = {
+    let items_arc = g_game().lock().unwrap().items.clone();
+    let (stackpos, drop_count) = {
         let mut game = g_game().lock().unwrap();
-        let items_arc = game.items.clone();
         let Some(tile) = game.map.get_tile_mut(to_pos) else { return };
         if tile.ground.is_none() { return; }
         // Carry the full item (container children) onto the ground when present.
         let item = dropped_tree.clone()
             .unwrap_or_else(|| crate::map::tile::MapItem { server_id, ..crate::map::tile::MapItem::default() });
-        tile.internal_add_item(item, &items_arc);
-        let sp = (if tile.ground.is_some() { 1u8 } else { 0u8 })
-            .saturating_add(tile.get_top_item_count().saturating_sub(1) as u8);
-        let cid = items_arc.get_item_type(server_id as usize).client_id;
-        (sp, cid)
+        let cnt = item.count.min(255).max(1) as u8;
+        let sp = tile.add_item_get_stackpos(item, &items_arc);
+        (sp, cnt)
     };
 
     {
@@ -5380,12 +5378,12 @@ fn handle_inventory_to_ground(creature_id: CreatureId, from_pos: Position, to_po
         game.map.get_spectators(to_pos, true, true, 0, 0, 0, 0)
     };
     for spec_id in spectators {
+        let items_ref = items_arc.clone();
         send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
             output.add_byte(0x6A);
             output.add_position(to_pos.x, to_pos.y, to_pos.z);
             output.add_byte(stackpos);
-            output.add_u16(client_id);
-            output.add_byte(1);
+            write_item(output, &items_ref, server_id, drop_count);
         });
     }
 }
