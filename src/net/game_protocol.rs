@@ -5560,10 +5560,28 @@ fn write_container(output: &mut OutputMessage, cid: u8, container_item: &crate::
     output.add_string(name.as_bytes());
     output.add_byte(capacity);
     output.add_byte(if has_parent { 0x01 } else { 0x00 });
-    let count = contents.len().min(255);
-    output.add_byte(count as u8);
-    for item in contents.iter().take(count) {
-        write_item(output, items, item.server_id, item.count.min(255) as u8);
+
+    if client_version().is_1098() {
+        output.add_byte(0x01); // drag and drop (unlocked)
+        output.add_byte(0x00); // pagination disabled
+        let size = contents.len().min(0xFFFF) as u16;
+        output.add_u16(size);  // container size
+        output.add_u16(0);     // first index
+        if size > 0 {
+            let to_send = (capacity as usize).min(size as usize).min(255);
+            output.add_byte(to_send as u8);
+            for item in contents.iter().take(to_send) {
+                write_item(output, items, item.server_id, item.count.min(255) as u8);
+            }
+        } else {
+            output.add_byte(0x00);
+        }
+    } else {
+        let count = contents.len().min(255);
+        output.add_byte(count as u8);
+        for item in contents.iter().take(count) {
+            write_item(output, items, item.server_id, item.count.min(255) as u8);
+        }
     }
 }
 
