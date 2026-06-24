@@ -6646,8 +6646,9 @@ fn write_creature_data(
     output.add_byte(base.direction as u8);
     write_outfit(output, &base.current_outfit);
 
-    output.add_byte(base.internal_light.level);
-    output.add_byte(base.internal_light.color);
+    let light = creature.as_player().map(|p| p.get_creature_light()).unwrap_or(base.internal_light);
+    output.add_byte(light.level);
+    output.add_byte(light.color);
 
     let speed = base.get_speed() as u16;
     if is_1098 {
@@ -6686,7 +6687,7 @@ fn write_creature_appearance(output: &mut OutputMessage, player: &Player, is_new
     output.add_byte(player.base.direction as u8);
     write_outfit(output, &player.base.current_outfit);
 
-    let light = player.base.internal_light;
+    let light = player.get_creature_light();
     output.add_byte(if player.is_access_player() { 0xFF } else { light.level });
     output.add_byte(light.color);
 
@@ -7648,6 +7649,21 @@ pub fn broadcast_tile_item_repartition(
             write_item(output, items_ref, new_server_id, count);
         });
     }
+}
+
+/// Send a single inventory-slot update (0x78) to a player, using the full
+/// 10.98 item encoding (mark byte + animation byte) via `write_item`. Used when
+/// a carried item transforms (e.g. lighting a torch in an equipment slot).
+pub fn send_inventory_slot_update(creature_id: CreatureId, slot: u8, server_id: u16, count: u8, items: &Items) {
+    if items.get_item_type(server_id as usize).client_id == 0 {
+        return;
+    }
+    let items_ref = items;
+    send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
+        output.add_byte(0x78);
+        output.add_byte(slot);
+        write_item(output, items_ref, server_id, count);
+    });
 }
 
 pub fn broadcast_tile_item_transform(pos: Position, stackpos: u8, new_server_id: u16, count: u8, items: &Items) {

@@ -976,6 +976,40 @@ impl Player {
         self.has_flag(PLAYER_FLAG_CAN_SENSE_INVISIBILITY) || self.group_access
     }
 
+    /// Creature light as seen by the client: the brighter of the player's own
+    /// internal light and the aggregate light of equipped items. Mirrors C++
+    /// `Player::getCreatureLight`.
+    pub fn get_creature_light(&self) -> crate::creatures::LightInfo {
+        if self.base.internal_light.level >= self.items_light.level {
+            self.base.internal_light
+        } else {
+            self.items_light
+        }
+    }
+
+    /// Recompute the aggregate light emitted by equipped items (the brightest
+    /// equipped item wins). Returns true if it changed. Mirrors C++
+    /// `Player::updateItemsLight`.
+    pub fn update_items_light(&mut self) -> bool {
+        use crate::items::g_items;
+        let items = g_items();
+        let mut max_light = crate::creatures::LightInfo::default();
+        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+            if let Some(sid) = self.inventory[slot] {
+                let it = items.get_item_type(sid as usize);
+                if it.light_level > max_light.level {
+                    max_light = crate::creatures::LightInfo { level: it.light_level, color: it.light_color };
+                }
+            }
+        }
+        if max_light.level != self.items_light.level || max_light.color != self.items_light.color {
+            self.items_light = max_light;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_access_player(&self) -> bool {
         self.group_access
     }

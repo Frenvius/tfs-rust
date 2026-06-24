@@ -146,8 +146,10 @@ pub fn execute_action_use(
 
         let player_tbl = push_player(lua, player_id)?;
         let item_tbl = push_item(lua, item_server_id, item_pos, item_index)?;
+        item_tbl.raw_set("_owner_cid", player_id)?;
         let from_pos_tbl = push_position(lua, item_pos)?;
         let target_tbl = push_item(lua, item_server_id, item_pos, item_index)?;
+        target_tbl.raw_set("_owner_cid", player_id)?;
         let to_pos_tbl = push_position(lua, item_pos)?;
 
         let r: mlua::Value = func.call((player_tbl, item_tbl, from_pos_tbl, target_tbl, to_pos_tbl, is_hotkey))?;

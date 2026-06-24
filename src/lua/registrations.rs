@@ -3655,6 +3655,47 @@ fn register_item_class(lua: &Lua) -> LuaResult<()> {
         let pos_z: Option<u8> = this.raw_get("_pos_z").ok();
         let idx: Option<i32> = this.raw_get("_idx").ok();
 
+        // Inventory item (pos.x == 0xFFFF): transform the owning player's
+        // equipment slot and push a 0x78 slot update, rather than a tile update.
+        if pos_x == Some(0xFFFF) {
+            let slot = pos_y.unwrap_or(0) as usize;
+            let owner: Option<u32> = this.raw_get("_owner_cid").ok();
+            if let (Some(cid), true) = (
+                owner,
+                (crate::creatures::player::CONST_SLOT_HEAD..=crate::creatures::player::CONST_SLOT_LAST)
+                    .contains(&slot),
+            ) {
+                let new_count = sub_type.and_then(|s| if s >= 0 { Some(s as u16) } else { None });
+                let mut game = g_game().lock().unwrap();
+                let items_arc = game.items.clone();
+                let mut sent_count = 1u8;
+                let mut light_update: Option<(crate::map::Position, crate::creatures::LightInfo)> = None;
+                if let Some(player) = game.get_player_mut(cid) {
+                    if player.inventory[slot].is_some() {
+                        player.inventory[slot] = Some(new_id);
+                        if let Some(c) = new_count {
+                            player.inventory_count[slot] = c.max(1);
+                        }
+                        if let Some(it) = player.inventory_items[slot].as_mut() {
+                            it.server_id = new_id;
+                            if let Some(c) = new_count { it.count = c; }
+                        }
+                        sent_count = player.inventory_count[slot].max(1) as u8;
+                        if player.update_items_light() {
+                            light_update = Some((player.base.position, player.get_creature_light()));
+                        }
+                    }
+                }
+                drop(game);
+                crate::net::game_protocol::send_inventory_slot_update(cid, slot as u8, new_id, sent_count, &items_arc);
+                if let Some((pos, light)) = light_update {
+                    crate::net::game_protocol::broadcast_creature_light(cid, pos, light);
+                }
+            }
+            this.raw_set(1, new_id as i64)?;
+            return Ok(true);
+        }
+
         if let (Some(x), Some(y), Some(z), Some(idx)) = (pos_x, pos_y, pos_z, idx) {
             let pos = Position { x, y, z };
             let mut game = g_game().lock().unwrap();

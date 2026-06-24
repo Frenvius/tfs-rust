@@ -551,6 +551,10 @@ pub async fn load_player_by_name(char_name: &str) -> Option<Player> {
         player.base.conditions.push(Box::new(regen));
     }
 
+    // Aggregate equipped-item light so a player logging in with a lit light
+    // source (e.g. a torch) emits light immediately.
+    player.update_items_light();
+
     Some(player)
 }
 
