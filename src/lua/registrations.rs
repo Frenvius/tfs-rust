@@ -3732,12 +3732,11 @@ fn register_item_class(lua: &Lua) -> LuaResult<()> {
                             );
                         }
                     } else {
-                        let ground_off = if tile.ground.is_some() { 1u8 } else { 0u8 };
                         let item = &mut tile.items[idx as usize];
                         item.server_id = new_id;
                         if let Some(c) = new_count { item.count = c; }
                         tile.recalculate_flags(&items_arc);
-                        let stackpos = (idx as u8) + ground_off;
+                        let stackpos = tile.item_client_stackpos(idx as usize);
                         drop(game);
                         crate::net::game_protocol::broadcast_tile_item_transform(
                             pos, stackpos, new_id, count_val, &items_arc,

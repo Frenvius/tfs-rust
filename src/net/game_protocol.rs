@@ -4636,9 +4636,15 @@ fn game_parse_look_at(creature_id: CreatureId, pos: Position, _sprite_id: u16, s
         if let Some((cid, cn)) = found_creature {
             Some(crate::events::LookThingType::Creature(cid, cn))
         } else {
-            let item = tile.items.iter().rev().find(|item| {
-                !game.items.get_item_type(item.server_id as usize).look_through
-            });
+            // Topmost visible item: highest client stackpos first — down items
+            // (reverse), then top items (reverse), then ground. Mirrors C++
+            // Tile::getTopVisibleThing.
+            let down = tile.get_down_item_count();
+            let item = tile.items[..down].iter().rev()
+                .chain(tile.items[down..].iter().rev())
+                .find(|item| {
+                    !game.items.get_item_type(item.server_id as usize).look_through
+                });
             if let Some(item) = item {
                 Some(crate::events::LookThingType::Item(item.server_id, item.count as u32))
             } else {
@@ -5374,7 +5380,7 @@ fn game_handle_use_item(creature_id: CreatureId, pos: Position, sprite_id: u16, 
         if let Some(tile) = game.map.get_tile(pos) {
             let item = tile.get_use_item(stackpos);
             match item {
-                Some(item) => (item.action_id, item.unique_id, stackpos as i32 - if tile.ground.is_some() { 1 } else { 0 }),
+                Some(item) => (item.action_id, item.unique_id, tile.use_item_vec_index(stackpos)),
                 None => (0u16, 0u16, -1i32),
             }
         } else {

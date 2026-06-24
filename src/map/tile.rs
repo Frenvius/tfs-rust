@@ -147,19 +147,41 @@ impl Tile {
     }
 
     pub fn get_use_item(&self, stackpos: u8) -> Option<&MapItem> {
-        if stackpos == 0 {
+        if self.ground.is_some() && stackpos == 0 {
             return self.ground.as_ref();
         }
-
-        let mut index = usize::from(stackpos - 1);
-        let top_start = self.get_down_item_count();
-        let top_items = &self.items[top_start..];
-        if index < top_items.len() {
-            return top_items.get(index);
+        match self.use_item_vec_index(stackpos) {
+            i if i >= 0 => self.items.get(i as usize),
+            _ => None,
         }
+    }
 
-        index -= top_items.len();
-        self.items.get(index)
+    /// Index into `self.items` for the item the client addressed at `stackpos`,
+    /// or -1 for the ground. Inverse of the `[down.., top..]` layout used by
+    /// `get_use_item` — the client renders top items before down items, so a low
+    /// client stackpos maps to a high `self.items` index (the top region).
+    pub fn use_item_vec_index(&self, stackpos: u8) -> i32 {
+        let s = usize::from(stackpos);
+        let g = if self.ground.is_some() { 1usize } else { 0 };
+        if g == 1 && s == 0 {
+            return -1; // ground
+        }
+        let down = self.get_down_item_count();
+        let top = self.items.len().saturating_sub(down);
+        let c = self.creature_ids.len();
+        // top items occupy client stackpos g .. g+top
+        if s >= g && s < g + top {
+            return (down + (s - g)) as i32;
+        }
+        // down items occupy client stackpos g+top+c ..
+        let down_start = g + top + c;
+        if s >= down_start {
+            let i = s - down_start;
+            if i < down {
+                return i as i32;
+            }
+        }
+        -1 // creature region or out of range
     }
 
     pub fn is_walkable(&self) -> bool {
@@ -244,10 +266,13 @@ impl Tile {
         let ground = if self.ground.is_some() { 1u8 } else { 0u8 };
         let down = self.get_down_item_count();
         if items_index >= down {
+            // top item: ground, then top items
             ground.saturating_add((items_index - down) as u8)
         } else {
+            // down item: ground, top items, creatures, then down items
             ground
                 .saturating_add(self.get_top_item_count() as u8)
+                .saturating_add(self.creature_ids.len() as u8)
                 .saturating_add(items_index as u8)
         }
     }
