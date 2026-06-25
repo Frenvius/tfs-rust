@@ -118,6 +118,8 @@ pub enum ConditionType {
     ExhaustCombat = 1 << 23,
     ExhaustHeal = 1 << 24,
     Pacified = 1 << 25,
+    SpellCooldown = 1 << 26,
+    SpellGroupCooldown = 1 << 27,
 }
 
 
@@ -151,6 +153,8 @@ impl ConditionType {
             x if x == Self::ExhaustCombat as u32 => Self::ExhaustCombat,
             x if x == Self::ExhaustHeal as u32 => Self::ExhaustHeal,
             x if x == Self::Pacified as u32 => Self::Pacified,
+            x if x == Self::SpellCooldown as u32 => Self::SpellCooldown,
+            x if x == Self::SpellGroupCooldown as u32 => Self::SpellGroupCooldown,
             _ => Self::None,
         }
     }

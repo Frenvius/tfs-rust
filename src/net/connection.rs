@@ -44,6 +44,10 @@ impl ConnectionHandle {
             _ => 0,
         }
     }
+
+    pub fn peer_addr_str(&self) -> String {
+        self.peer_addr.ip().to_string()
+    }
 }
 
 enum AnyProtocol {

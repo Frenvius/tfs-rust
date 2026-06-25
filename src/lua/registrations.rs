@@ -9123,6 +9123,7 @@ fn register_spell_class(lua: &Lua) -> LuaResult<()> {
 
         let name: String = this.get("_name").unwrap_or_default();
         let words: String = this.get("_words").unwrap_or_default();
+        let spell_id: u8 = this.get::<u32>("_spellId").unwrap_or(0) as u8;
         let spell_type: i32 = this.get("_spellType").unwrap_or(1);
         let level: u32 = this.get("_level").unwrap_or(0);
         let magic_level: u32 = this.get("_magicLevel").unwrap_or(0);
@@ -9130,8 +9131,10 @@ fn register_spell_class(lua: &Lua) -> LuaResult<()> {
         let mana_percent: u32 = this.get("_manaPercent").unwrap_or(0);
         let soul: u32 = this.get("_soul").unwrap_or(0);
         let group: u32 = this.get("_group").unwrap_or(0);
+        let secondary_group: u32 = this.get("_secondaryGroup").unwrap_or(0);
         let cooldown: u32 = this.get("_cooldown").unwrap_or(1000);
         let group_cooldown: u32 = this.get("_groupCooldown").unwrap_or(1000);
+        let secondary_group_cooldown: u32 = this.get("_secondaryGroupCooldown").unwrap_or(0);
         let need_target: bool = this.get("_needTarget").unwrap_or(false);
         let need_weapon: bool = this.get("_needWeapon").unwrap_or(false);
         let need_learn: bool = this.get("_needLearn").unwrap_or(false);
@@ -9140,6 +9143,7 @@ fn register_spell_class(lua: &Lua) -> LuaResult<()> {
         let pz_lock: bool = this.get("_pzLock").unwrap_or(false);
         let has_params: bool = this.get("_hasParams").unwrap_or(false);
         let has_player_name_param: bool = this.get("_hasPlayerNameParam").unwrap_or(false);
+        let premium: bool = this.get("_premium").unwrap_or(false);
         let enabled: bool = this.get("_enabled").unwrap_or(true);
 
         let mut registry = crate::events::registry::g_script_registry().lock()
@@ -9159,14 +9163,17 @@ fn register_spell_class(lua: &Lua) -> LuaResult<()> {
                 words: words.clone(),
                 script_id,
                 spell_type,
+                spell_id,
                 level,
                 magic_level,
                 mana,
                 mana_percent,
                 soul,
                 group,
+                secondary_group,
                 cooldown,
                 group_cooldown,
+                secondary_group_cooldown,
                 need_target,
                 need_weapon,
                 need_learn,
@@ -9175,7 +9182,10 @@ fn register_spell_class(lua: &Lua) -> LuaResult<()> {
                 pz_lock,
                 has_params,
                 has_player_name_param,
+                premium,
+                learnable: need_learn && spell_type == 1,
                 enabled,
+                vocations: Vec::new(),
             };
             registry.spells.insert(words.to_lowercase(), entry);
         }

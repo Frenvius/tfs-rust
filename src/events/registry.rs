@@ -37,14 +37,17 @@ pub struct SpellEntry {
     pub words: String,
     pub script_id: i32,
     pub spell_type: i32,
+    pub spell_id: u8,
     pub level: u32,
     pub magic_level: u32,
     pub mana: u32,
     pub mana_percent: u32,
     pub soul: u32,
     pub group: u32,
+    pub secondary_group: u32,
     pub cooldown: u32,
     pub group_cooldown: u32,
+    pub secondary_group_cooldown: u32,
     pub need_target: bool,
     pub need_weapon: bool,
     pub need_learn: bool,
@@ -53,7 +56,10 @@ pub struct SpellEntry {
     pub pz_lock: bool,
     pub has_params: bool,
     pub has_player_name_param: bool,
+    pub premium: bool,
+    pub learnable: bool,
     pub enabled: bool,
+    pub vocations: Vec<u32>,
 }
 
 pub struct ScriptRegistry {

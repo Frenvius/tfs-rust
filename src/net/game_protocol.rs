@@ -38,9 +38,14 @@ fn dispatch(f: impl FnOnce() + Send + 'static) {
 }
 
 static PLAYER_SESSIONS: OnceLock<Mutex<HashMap<CreatureId, PlayerSession>>> = OnceLock::new();
+static MUTE_COUNT_MAP: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
 
 fn player_sessions() -> &'static Mutex<HashMap<CreatureId, PlayerSession>> {
     PLAYER_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mute_count_map() -> &'static Mutex<HashMap<u32, u32>> {
+    MUTE_COUNT_MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn register_player_connection(creature_id: CreatureId, conn: ConnectionHandle, round_keys: Arc<RoundKeys>, checksum_enabled: bool, known_creatures: HashSet<u32>) {
@@ -165,6 +170,20 @@ pub fn send_status_message_to_player(creature_id: CreatureId, text: &str) {
         output.add_byte(msg_type);
         output.add_string(&bytes);
     });
+}
+
+fn send_text_message(creature_id: CreatureId, msg_type: u8, text: &str) {
+    let wire_type = crate::net::protocol_version::translate_message_class_to_client(msg_type);
+    let bytes = text.as_bytes().to_vec();
+    send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
+        output.add_byte(0xB4);
+        output.add_byte(wire_type);
+        output.add_string(&bytes);
+    });
+}
+
+pub fn send_cancel_message(creature_id: CreatureId, text: &str) {
+    send_text_message(creature_id, 25, text);
 }
 
 fn format_date_short(timestamp: u32) -> String {
@@ -603,6 +622,18 @@ impl ProtocolGame {
             }
         }
 
+        // IP ban check — before authentication.
+        let client_ip = conn.peer_addr_str();
+        if let Some(ban_info) = crate::db::ban::get_ip_ban_info(&client_ip).await {
+            let msg = if ban_info.expires_at > 0 {
+                format!("Your IP has been banned until {}.\n\nReason specified:\n{}", format_date_short(ban_info.expires_at as u32), ban_info.reason)
+            } else {
+                format!("Your IP has been permanently banned.\n\nReason specified:\n{}", ban_info.reason)
+            };
+            self.disconnect_client(conn, &msg);
+            return;
+        }
+
         tracing::info!(account = %account_name, char_name = %char_name, "game login: authenticating");
         if !gameworld_authentication(&account_name, &password, &char_name).await {
             tracing::warn!(account = %account_name, "game login: auth failed");
@@ -618,11 +649,47 @@ impl ProtocolGame {
                 return;
             }
         };
+
+        // CanAlwaysLogin: bypass game-state closing/closed + maxPlayers wait queue.
+        let can_always_login = player.has_flag(crate::creatures::player::PLAYER_FLAG_CAN_ALWAYS_LOGIN)
+            || player.account_type >= crate::creatures::player::AccountType::GameMaster;
+        {
+            let game_state = g_game().lock().unwrap().get_game_state();
+            if game_state == GameState::Closing && !can_always_login {
+                self.disconnect_client(conn, "The game is just going down.\nPlease try again later.");
+                return;
+            }
+            if game_state == GameState::Closed && !can_always_login {
+                self.disconnect_client(conn, "Server is currently closed.\nPlease try again later.");
+                return;
+            }
+        }
+        if !can_always_login {
+            let max_players = crate::config::g_config().get_number(crate::config::IntegerConfig::MaxPlayers) as usize;
+            if max_players > 0 {
+                let online = g_game().lock().unwrap().get_all_players().len();
+                if online >= max_players {
+                    self.disconnect_client(conn, "Too many players online.\nPlease try again later.");
+                    return;
+                }
+            }
+        }
+
+        // CannotBeBanned: skip ban check at login.
+        if !player.has_flag(crate::creatures::player::PLAYER_FLAG_CANNOT_BE_BANNED) {
+            if let Some(ban_info) = crate::db::ban::get_account_ban_info(player.account_number).await {
+                let msg = if ban_info.expires_at > 0 {
+                    format!("Your account has been banned until {}.\n\nReason specified:\n{}", format_date_short(ban_info.expires_at as u32), ban_info.reason)
+                } else {
+                    format!("Your account has been permanently banned.\n\nReason specified:\n{}", ban_info.reason)
+                };
+                self.disconnect_client(conn, &msg);
+                return;
+            }
+        }
+
         // C++ ProtocolGame::login checks getPlayerByName first and kicks
-        // the old session before placing the new one.  Without this, a
-        // lingering old connection (e.g. unclean disconnect) leaves the
-        // player in the world and the new login either double-inserts or
-        // gets rejected.
+        // the old session before placing the new one.
         {
             let existing_id = g_game().lock().unwrap().get_player_id_by_name(&char_name);
             if let Some(old_id) = existing_id {
@@ -1313,6 +1380,28 @@ fn game_handle_walk(creature_id: CreatureId, dir: Direction) {
         if let Some(player) = game.get_player_mut(creature_id) {
             player.base.direction = dir;
         }
+
+        // onChangeZone: player entering PZ cancels their own attack target.
+        let dest_pz = game.map.get_tile(new_pos)
+            .map(|t| t.has_flag(crate::map::tile::TILESTATE_PROTECTIONZONE))
+            .unwrap_or(false);
+        if dest_pz {
+            let should_cancel = game.get_player(creature_id)
+                .map(|p| p.base.attacked_creature_id.is_some()
+                    && !p.has_flag(crate::creatures::player::PLAYER_FLAG_IGNORE_PROTECTION_ZONE))
+                .unwrap_or(false);
+            if should_cancel {
+                if let Some(player) = game.get_player_mut(creature_id) {
+                    player.base.attacked_creature_id = None;
+                }
+                send_packet_to_player(creature_id, |output: &mut OutputMessage| {
+                    output.add_byte(0xA3);
+                    output.add_u32(0);
+                });
+            }
+        }
+        // Note: onAttackedCreatureChangeZone (target moves into PZ) is handled
+        // inside move_creature_position for ALL creature moves, not just player walks.
     }
 
     crate::events::dispatch::execute_step_event(creature_id, old_pos, new_pos, 1);
@@ -1459,21 +1548,122 @@ fn game_parse_fight_modes(creature_id: CreatureId, fight_mode: u8, chase_mode: u
 }
 
 fn game_parse_attack(creature_id: CreatureId, target_id: u32) {
+    use crate::creatures::player::*;
+    use crate::map::tile::*;
+
     if creature_id == 0 { return; }
 
-    let (had_target, target_exists) = {
+    if target_id != 0 {
+        let game = g_game().lock().unwrap();
+        let target_exists = game.get_creature(target_id).is_some();
+        if !target_exists {
+            drop(game);
+            send_packet_to_player(creature_id, |output: &mut OutputMessage| {
+                output.add_byte(0xA3);
+                output.add_u32(0);
+            });
+            return;
+        }
+
+        // canTargetCreature — mirrors C++ Combat::canTargetCreature
+        if let Some(player) = game.get_player(creature_id) {
+            // Can't attack self
+            if creature_id == target_id {
+                drop(game);
+                send_cancel_message(creature_id, "You may not attack this player.");
+                send_packet_to_player(creature_id, |o: &mut OutputMessage| { o.add_byte(0xA3); o.add_u32(0); });
+                return;
+            }
+
+            if !player.has_flag(PLAYER_FLAG_IGNORE_PROTECTION_ZONE) {
+                // Attacker in PZ
+                let attacker_in_pz = game.map.get_tile(player.base.position)
+                    .map(|t| t.has_flag(TILESTATE_PROTECTIONZONE)).unwrap_or(false);
+                if attacker_in_pz {
+                    drop(game);
+                    send_cancel_message(creature_id, "You may not attack from a protection zone.");
+                    send_packet_to_player(creature_id, |o: &mut OutputMessage| { o.add_byte(0xA3); o.add_u32(0); });
+                    return;
+                }
+                // Target in PZ
+                let target_in_pz = game.get_creature(target_id)
+                    .and_then(|c| game.map.get_tile(c.position()))
+                    .map(|t| t.has_flag(TILESTATE_PROTECTIONZONE)).unwrap_or(false);
+                if target_in_pz {
+                    drop(game);
+                    send_cancel_message(creature_id, "You may not attack a person in a protection zone.");
+                    send_packet_to_player(creature_id, |o: &mut OutputMessage| { o.add_byte(0xA3); o.add_u32(0); });
+                    return;
+                }
+                // Nopvp zone checks for player targets
+                let target_is_player_combat = game.get_creature(target_id)
+                    .map(|c| c.is_player() || (c.as_monster()
+                        .map(|m| m.base.is_summon() && m.base.master_id
+                            .and_then(|mid| game.get_creature(mid))
+                            .map(|c2| c2.is_player()).unwrap_or(false))
+                        .unwrap_or(false)))
+                    .unwrap_or(false);
+                if target_is_player_combat {
+                    let attacker_nopvp = game.map.get_tile(player.base.position)
+                        .map(|t| t.has_flag(TILESTATE_NOPVPZONE)).unwrap_or(false);
+                    if attacker_nopvp {
+                        drop(game);
+                        send_cancel_message(creature_id, "You may not attack a person while in a no-PvP zone.");
+                        send_packet_to_player(creature_id, |o: &mut OutputMessage| { o.add_byte(0xA3); o.add_u32(0); });
+                        return;
+                    }
+                    let target_nopvp = game.get_creature(target_id)
+                        .and_then(|c| game.map.get_tile(c.position()))
+                        .map(|t| t.has_flag(TILESTATE_NOPVPZONE)).unwrap_or(false);
+                    if target_nopvp {
+                        drop(game);
+                        send_cancel_message(creature_id, "You may not attack a person in a protection zone.");
+                        send_packet_to_player(creature_id, |o: &mut OutputMessage| { o.add_byte(0xA3); o.add_u32(0); });
+                        return;
+                    }
+                }
+            }
+
+            // CannotUseCombat / not attackable
+            if player.has_flag(PLAYER_FLAG_CANNOT_USE_COMBAT) || !game.get_creature(target_id).map(|c| c.is_attackable()).unwrap_or(false) {
+                drop(game);
+                send_cancel_message(creature_id, "You may not attack this creature.");
+                send_packet_to_player(creature_id, |o: &mut OutputMessage| { o.add_byte(0xA3); o.add_u32(0); });
+                return;
+            }
+
+            // Secure mode
+            if let Some(target_player) = game.get_creature(target_id).and_then(|c| c.as_player()) {
+                if player.has_secure_mode() {
+                    let both_pvp = game.map.get_tile(player.base.position)
+                        .map(|t| t.has_flag(TILESTATE_PVPZONE)).unwrap_or(false)
+                        && game.map.get_tile(target_player.base.position)
+                            .map(|t| t.has_flag(TILESTATE_PVPZONE)).unwrap_or(false);
+                    let wt = game.get_world_type();
+                    if !both_pvp && player.get_skull_client_of_player(target_player, wt) == crate::creatures::Skull::None {
+                        drop(game);
+                        send_cancel_message(creature_id, "Turn secure mode off if you really want to attack unmarked players.");
+                        send_packet_to_player(creature_id, |o: &mut OutputMessage| { o.add_byte(0xA3); o.add_u32(0); });
+                        return;
+                    }
+                }
+            }
+        }
+        drop(game);
+    }
+
+    let had_target = {
         let mut game = g_game().lock().unwrap();
-        let had_target = game.get_player(creature_id)
+        let had = game.get_player(creature_id)
             .map(|p| p.base.attacked_creature_id.is_some())
             .unwrap_or(false);
-        let target_exists = target_id != 0 && game.get_creature(target_id).is_some();
         if let Some(player) = game.get_player_mut(creature_id) {
-            player.base.attacked_creature_id = if target_exists { Some(target_id) } else { None };
+            player.base.attacked_creature_id = if target_id != 0 { Some(target_id) } else { None };
         }
-        (had_target, target_exists)
+        had
     };
 
-    if target_id == 0 && had_target || (target_id != 0 && !target_exists) {
+    if target_id == 0 && had_target {
         send_packet_to_player(creature_id, |output: &mut OutputMessage| {
             output.add_byte(0xA3);
             output.add_u32(0);
@@ -2117,17 +2307,26 @@ fn game_parse_request_trade(creature_id: CreatureId, pos: Position, sprite_id: u
 }
 
 fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u16>, receiver_name: Option<Vec<u8>>, text: Vec<u8>) {
+    use crate::creatures::player::{
+        PLAYER_FLAG_CAN_BROADCAST,
+        PLAYER_FLAG_CAN_TALK_RED_PRIVATE, PLAYER_FLAG_IGNORE_YELL_CHECK,
+        PLAYER_FLAG_IGNORE_SEND_PRIVATE_CHECK, PLAYER_FLAG_CANNOT_BE_MUTED,
+        AccountType,
+    };
+    use crate::config::{g_config, BooleanConfig, IntegerConfig};
+
     if creature_id == 0 { return; }
     let text_str = String::from_utf8_lossy(&text).to_string();
     if text_str.is_empty() { return; }
 
-    let (pos, name, level, is_access) = {
+    let (pos, name, level, is_access, group_flags, account_type, is_premium) = {
         let game = g_game().lock().unwrap();
         let Some(player) = game.get_player(creature_id) else { return };
-        (player.base.position, player.name.clone(), player.level, player.is_access_player())
+        (player.base.position, player.name.clone(), player.level,
+         player.is_access_player(), player.group_flags, player.account_type, player.is_premium())
     };
 
-    // TalkActions first, mirroring C++ Game::playerSaySpell ordering.
+    // TalkActions + spells first (C++ playerSaySpell runs before mute check).
     let param = text_str.split_once(' ').map(|(_, p)| p).unwrap_or("");
     if let Some(false) = crate::events::dispatch::execute_talk_action(creature_id, &text_str, param, speak_type) {
         return;
@@ -2137,9 +2336,7 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
         return;
     }
 
-    // TALKTYPE_PRIVATE_PN (internal 4): the player is talking to an NPC through
-    // the NPC conversation channel — route to NPCs only, no public broadcast.
-    // Mirrors Game::playerSay -> playerSpeakToNpc.
+    // TALKTYPE_PRIVATE_PN (internal 4)
     if speak_type == 4 {
         notify_nearby_npcs(creature_id, pos, speak_type, &text_str);
         return;
@@ -2150,18 +2347,224 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
         return;
     }
 
+    // Mute check — mirrors C++ Player::isMuted (after spells/talkactions, before type switch)
+    if group_flags & PLAYER_FLAG_CANNOT_BE_MUTED == 0 {
+        let mute_seconds = {
+            let game = g_game().lock().unwrap();
+            game.get_creature(creature_id)
+                .and_then(|c| {
+                    c.base().conditions.iter()
+                        .filter(|cond| cond.get_type() == crate::combat::condition::ConditionType::Muted)
+                        .map(|cond| cond.get_ticks().max(0) as u32 / 1000)
+                        .max()
+                })
+                .unwrap_or(0)
+        };
+        if mute_seconds > 0 {
+            send_text_message(creature_id, 25,
+                &format!("You are still muted for {} seconds.", mute_seconds));
+            return;
+        }
+    }
+
+    // removeMessageBuffer — increment spam counter, auto-mute if exceeded.
+    if group_flags & PLAYER_FLAG_CANNOT_BE_MUTED == 0 {
+        let max_buffer = crate::config::g_config().get_number(IntegerConfig::MaxMessageBuffer) as i32;
+        if max_buffer != 0 {
+            let mut game = g_game().lock().unwrap();
+            if let Some(p) = game.get_player_mut(creature_id) {
+                let guid = p.guid;
+                if p.message_buffer_count <= max_buffer + 1 {
+                    p.message_buffer_count += 1;
+                    if p.message_buffer_count > max_buffer {
+                        let mut map = mute_count_map().lock().unwrap();
+                        let mute_count = map.get(&guid).copied().unwrap_or(1);
+                        let mute_time = 5 * mute_count * mute_count;
+                        map.insert(guid, mute_count + 1);
+                        drop(map);
+                        let cond = crate::combat::condition::ConditionGeneric {
+                            base: crate::combat::condition::ConditionBase::new(
+                                crate::combat::condition::ConditionId::Default,
+                                crate::combat::condition::ConditionType::Muted,
+                                (mute_time * 1000) as i32, false, 0, false,
+                            ),
+                        };
+                        let base_speed = p.base.base_speed as i32;
+                        crate::combat::condition::add_condition_to_creature(
+                            &mut p.base.conditions, Box::new(cond), base_speed,
+                        );
+                        drop(game);
+                        send_text_message(creature_id, 25,
+                            &format!("You are muted for {} seconds.", mute_time));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Reset idle time on say — mirrors C++ player->resetIdleTime()
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(creature_id) {
+            player.idle_time = 0;
+        }
+    }
+
     match speak_type {
-        1..=3 => {
+        // YELL (internal 3) — C++ Game::playerYell
+        3 => {
+            // Yell exhaustion check
+            {
+                let game = g_game().lock().unwrap();
+                if game.get_creature(creature_id)
+                    .map(|c| c.base().has_condition(crate::combat::condition::ConditionType::YellTicks))
+                    .unwrap_or(false)
+                {
+                    drop(game);
+                    send_cancel_message(creature_id, "You are exhausted.");
+                    return;
+                }
+            }
+
+            if !is_access && group_flags & PLAYER_FLAG_IGNORE_YELL_CHECK == 0 {
+                let min_level = g_config().get_number(IntegerConfig::YellMinimumLevel) as u32;
+                if level < min_level {
+                    if g_config().get_boolean(BooleanConfig::YellAllowPremium) {
+                        if !is_premium {
+                            send_text_message(creature_id, 25,
+                                &format!("You may not yell unless you have reached level {} or have a premium account.", min_level));
+                            return;
+                        }
+                    } else {
+                        send_text_message(creature_id, 25,
+                            &format!("You may not yell unless you have reached level {}.", min_level));
+                        return;
+                    }
+                }
+
+                // Apply yell exhaustion (30s)
+                let mut game = g_game().lock().unwrap();
+                if let Some(creature) = game.get_creature_mut(creature_id) {
+                    let cond = crate::combat::condition::ConditionGeneric {
+                        base: crate::combat::condition::ConditionBase::new(
+                            crate::combat::condition::ConditionId::Default,
+                            crate::combat::condition::ConditionType::YellTicks,
+                            30000, false, 0, false,
+                        ),
+                    };
+                    let base_speed = creature.base().base_speed as i32;
+                    crate::combat::condition::add_condition_to_creature(
+                        &mut creature.base_mut().conditions, Box::new(cond), base_speed,
+                    );
+                }
+            }
+            let yelled = text_str.to_uppercase();
+            broadcast_creature_say(creature_id, pos, &name, level as u16, speak_type, yelled.as_bytes());
+            notify_nearby_npcs(creature_id, pos, speak_type, &text_str);
+        }
+        // SAY (1)
+        1 => {
             broadcast_creature_say(creature_id, pos, &name, level as u16, speak_type, text_str.as_bytes());
             notify_nearby_npcs(creature_id, pos, speak_type, &text_str);
         }
-        6 => {
+        // WHISPER (2) — players >1 tile away hear "pspsps"
+        2 => {
+            let mut game_g = g_game().lock().unwrap();
+            let spectators = game_g.map.get_spectators(pos, false, true, 0, 0, 0, 0);
+            drop(game_g);
+            for spec_id in spectators {
+                let spec_pos = g_game().lock().unwrap().get_creature(spec_id)
+                    .map(|c| c.position()).unwrap_or_default();
+                let dx = (pos.x as i32 - spec_pos.x as i32).abs();
+                let dy = (pos.y as i32 - spec_pos.y as i32).abs();
+                let in_range = dx <= 1 && dy <= 1;
+                let msg = if in_range { text_str.as_bytes() } else { b"pspsps" as &[u8] };
+                let wire_type = translate_speak_class_to_client(2);
+                let name_c = name.clone();
+                let msg_c = msg.to_vec();
+                send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
+                    output.add_byte(0xAA);
+                    output.add_u32(0);
+                    output.add_string(name_c.as_bytes());
+                    output.add_u16(level as u16);
+                    output.add_byte(wire_type);
+                    output.add_string(&msg_c);
+                });
+            }
+            notify_nearby_npcs(creature_id, pos, speak_type, &text_str);
+        }
+        // PRIVATE / PRIVATE_RED (internal 6/14) — C++ Game::playerSpeakTo
+        6 | 14 => {
+            if !is_access && group_flags & PLAYER_FLAG_IGNORE_SEND_PRIVATE_CHECK == 0 {
+                let min_level = g_config().get_number(IntegerConfig::MinimumLevelToSendPrivate) as u32;
+                if level < min_level {
+                    if g_config().get_boolean(BooleanConfig::PremiumToSendPrivate) {
+                        if !is_premium {
+                            send_text_message(creature_id, 25,
+                                &format!("You may not send private messages unless you have reached level {} or have a premium account.", min_level));
+                            return;
+                        }
+                    } else {
+                        send_text_message(creature_id, 25,
+                            &format!("You may not send private messages unless you have reached level {}.", min_level));
+                        return;
+                    }
+                }
+            }
+
             let recv_name = receiver_name.map(|n| String::from_utf8_lossy(&n).to_string()).unwrap_or_default();
             let game = g_game().lock().unwrap();
-            if let Some(target) = game.get_player_by_name(&recv_name) {
-                let target_id = target.base.id;
+            let Some(target) = game.get_player_by_name(&recv_name) else {
                 drop(game);
-                send_packet_to_player(target_id, {
+                send_text_message(creature_id, 25, "A player with this name is not online.");
+                return;
+            };
+            let target_id = target.base.id;
+            drop(game);
+
+            // CanTalkRedPrivate or GameMaster+ → red private message
+            let actual_type = if speak_type == 6
+                && (group_flags & PLAYER_FLAG_CAN_TALK_RED_PRIVATE != 0
+                    || account_type >= AccountType::GameMaster)
+            { 14 } else { 6 }; // 14 = PRIVATE_RED, 6 = PRIVATE
+
+            send_packet_to_player(target_id, {
+                let name = name.clone();
+                let text = text_str.clone();
+                let from_type = if actual_type == 14 { 14 } else { 6 };
+                move |output: &mut OutputMessage| {
+                    output.add_byte(0xAA);
+                    output.add_u32(0);
+                    output.add_string(name.as_bytes());
+                    output.add_u16(level as u16);
+                    output.add_byte(translate_speak_class_to_client(from_type));
+                    output.add_string(text.as_bytes());
+                }
+            });
+            send_packet_to_player(creature_id, {
+                let name = recv_name;
+                move |output: &mut OutputMessage| {
+                    output.add_byte(0xAA);
+                    output.add_u32(0);
+                    output.add_string(name.as_bytes());
+                    output.add_u16(0);
+                    output.add_byte(translate_speak_class_to_client(actual_type));
+                    output.add_string(text_str.as_bytes());
+                }
+            });
+        }
+        // BROADCAST (internal 12) — C++ Game::playerBroadcastMessage
+        12 => {
+            if group_flags & PLAYER_FLAG_CAN_BROADCAST == 0 {
+                return;
+            }
+            println!("> {} broadcasted: \"{}\"", name, text_str);
+            let game = g_game().lock().unwrap();
+            let all_ids: Vec<CreatureId> = game.get_all_players();
+            drop(game);
+            for pid in all_ids {
+                send_packet_to_player(pid, {
                     let name = name.clone();
                     let text = text_str.clone();
                     move |output: &mut OutputMessage| {
@@ -2169,19 +2572,8 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
                         output.add_u32(0);
                         output.add_string(name.as_bytes());
                         output.add_u16(level as u16);
-                        output.add_byte(translate_speak_class_to_client(speak_type));
+                        output.add_byte(translate_speak_class_to_client(12));
                         output.add_string(text.as_bytes());
-                    }
-                });
-                send_packet_to_player(creature_id, {
-                    let name = recv_name;
-                    move |output: &mut OutputMessage| {
-                        output.add_byte(0xAA);
-                        output.add_u32(0);
-                        output.add_string(name.as_bytes());
-                        output.add_u16(0);
-                        output.add_byte(translate_speak_class_to_client(speak_type));
-                        output.add_string(text_str.as_bytes());
                     }
                 });
             }
@@ -2483,25 +2875,61 @@ fn game_handle_request_outfit(creature_id: CreatureId) {
 }
 
 fn game_parse_add_vip(creature_id: CreatureId, name: Vec<u8>) {
+    use crate::creatures::player::PLAYER_FLAG_SPECIAL_VIP;
+
     let name_str = String::from_utf8_lossy(&name).into_owned();
     if name_str.is_empty() || name_str.len() > 25 { return; }
     if creature_id == 0 { return; }
 
     let game = g_game().lock().unwrap();
     let Some(player) = game.get_player(creature_id) else { return };
+    let player_has_special_vip = player.has_flag(PLAYER_FLAG_SPECIAL_VIP);
     if player.vip_list.len() >= 200 {
         send_status_message_to_player(creature_id, "You cannot add more buddies.");
         return;
     }
     let target = game.get_player_by_name(&name_str);
-    let (target_guid, target_online) = if let Some(t) = target {
-        (t.guid, true)
+    let (target_guid, target_online, target_is_special_vip) = if let Some(t) = target {
+        (t.guid, !t.is_in_ghost_mode(), t.has_flag(PLAYER_FLAG_SPECIAL_VIP))
     } else {
         drop(game);
-        return;
+        // Offline path: DB lookup for guid + specialVip flag.
+        let db = crate::db::g_database();
+        use crate::db::DatabaseEngine;
+        let query = format!(
+            "SELECT `id`, `group_id` FROM `players` WHERE `name` = {}",
+            db.escape_string(&name_str)
+        );
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(db.store_query(&query))
+        });
+        match result {
+            Ok(Some(row)) => {
+                let guid = row.get_u64("id").unwrap_or(0) as u32;
+                if guid == 0 {
+                    send_text_message(creature_id, 25, "A player with this name does not exist.");
+                    return;
+                }
+                let group_id = row.get_u64("group_id").unwrap_or(0) as u32;
+                let flags = crate::world::groups::flags_for_group_id(group_id);
+                let is_special = flags & PLAYER_FLAG_SPECIAL_VIP != 0;
+                (guid, false, is_special)
+            }
+            _ => {
+                send_text_message(creature_id, 25, "A player with this name does not exist.");
+                return;
+            }
+        }
     };
-    if player.vip_list.contains(&target_guid) { return; }
-    drop(game);
+    if target_is_special_vip && !player_has_special_vip {
+        send_text_message(creature_id, 25, "You can not add this player.");
+        return;
+    }
+    {
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        if player.vip_list.contains(&target_guid) { return; }
+    }
 
     {
         let mut game = g_game().lock().unwrap();
@@ -6238,11 +6666,16 @@ fn write_creature_shield(output: &mut OutputMessage, creature_id: u32, party_shi
     output.add_byte(party_shield);
 }
 
-#[allow(dead_code)]
 fn write_creature_skull(output: &mut OutputMessage, creature_id: u32, skull: Skull) {
     output.add_byte(0x90);
     output.add_u32(creature_id);
     output.add_byte(skull as u8);
+}
+
+pub fn send_creature_skull_to_player(observer_id: CreatureId, creature_id: CreatureId, skull: Skull) {
+    send_packet_to_player(observer_id, move |output: &mut OutputMessage| {
+        write_creature_skull(output, creature_id, skull);
+    });
 }
 
 #[allow(dead_code)]

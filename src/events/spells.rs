@@ -59,12 +59,18 @@ struct SpellsXml {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct SpellDef {
+    #[serde(rename = "@spellid", default)]
+    spellid: u8,
     #[serde(rename = "@name", default)]
     name: String,
     #[serde(rename = "@words", default)]
     words: String,
     #[serde(rename = "@group", default)]
     group: String,
+    #[serde(rename = "@secondarygroup", default)]
+    secondary_group: String,
+    #[serde(rename = "@secondarygroupcooldown", default)]
+    secondary_group_cooldown: u32,
     #[serde(rename = "@level", default)]
     level: u32,
     #[serde(rename = "@magiclevel", default)]
@@ -105,6 +111,14 @@ struct SpellDef {
     pz_lock: u8,
     #[serde(rename = "@script")]
     script: Option<String>,
+    #[serde(default)]
+    vocation: Vec<SpellVocationNode>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct SpellVocationNode {
+    #[serde(rename = "@name", default)]
+    name: String,
 }
 
 pub fn load_spells() {
@@ -148,6 +162,13 @@ pub fn load_spells() {
             "special" => 4,
             _ => 0,
         };
+        let secondary_group_num: u32 = match def.secondary_group.as_str() {
+            "attack" => 1,
+            "healing" => 2,
+            "support" => 3,
+            "special" => 4,
+            _ => 0,
+        };
         let cooldown = if def.cooldown > 0 { def.cooldown } else { 1000 };
         let group_cooldown = if def.group_cooldown > 0 { def.group_cooldown } else { cooldown };
 
@@ -159,14 +180,17 @@ pub fn load_spells() {
             words: def.words.clone(),
             script_id,
             spell_type,
+            spell_id: def.spellid,
             level: def.level,
             magic_level: def.magic_level,
             mana: def.mana,
             mana_percent: def.mana_percent,
             soul: def.soul,
             group: group_num,
+            secondary_group: secondary_group_num,
             cooldown,
             group_cooldown,
+            secondary_group_cooldown: def.secondary_group_cooldown,
             need_target: def.needtarget != 0,
             need_weapon: def.needweapon != 0,
             need_learn: def.needlearn != 0,
@@ -175,7 +199,15 @@ pub fn load_spells() {
             pz_lock: def.pz_lock != 0,
             has_params: def.hasparams != 0,
             has_player_name_param: def.has_player_name_param != 0,
+            premium: def.premium != 0,
+            learnable: spell_type == 1 && def.needlearn != 0,
             enabled,
+            vocations: {
+                use crate::world::vocation::g_vocations;
+                def.vocation.iter().filter_map(|v| {
+                    g_vocations().get_vocation_id(&v.name).map(|id| id as u32)
+                }).collect()
+            },
         };
 
         let key = def.words.to_lowercase();

@@ -286,60 +286,189 @@ pub fn execute_spell_say(player_id: CreatureId, text: &str) -> bool {
         }
     };
 
-    let (level, mag_level, mana, mana_max, group_flags) = {
+    let (level, mag_level, mana, mana_max, group_flags, vocation_id, player_soul, is_premium) = {
         let game = g_game().lock().unwrap();
         match game.get_player(player_id) {
-            Some(p) => (p.level, p.mag_level, p.mana, p.mana_max, p.group_flags),
+            Some(p) => (p.level, p.mag_level, p.mana, p.mana_max, p.group_flags,
+                        p.vocation_id, p.get_soul() as u32, p.is_premium()),
             None => return false,
         }
     };
 
-    if !spell_words.enabled {
-        return true;
-    }
-
-    // Player flag gates, mirroring C++ Spell::playerSpellCheck.
+    // Mirrors C++ Spell::playerSpellCheck order verbatim.
     use crate::creatures::player::{
         PLAYER_FLAG_CANNOT_USE_SPELLS, PLAYER_FLAG_IGNORE_SPELL_CHECK, PLAYER_FLAG_HAS_INFINITE_MANA,
+        PLAYER_FLAG_HAS_INFINITE_SOUL, PLAYER_FLAG_HAS_NO_EXHAUSTION,
     };
+
     if group_flags & PLAYER_FLAG_CANNOT_USE_SPELLS != 0 {
-        return true; // cannot cast; treat as handled (no normal talk)
+        return true;
     }
     let ignore_checks = group_flags & PLAYER_FLAG_IGNORE_SPELL_CHECK != 0;
-
-    if !ignore_checks {
-        if level < spell_words.level {
-            let msg = "You do not have enough level.".to_string();
-            let mut game = g_game().lock().unwrap();
-            game.send_text_message(player_id, crate::game::MESSAGE_INFO_DESCR, msg);
+    if ignore_checks {
+        // IgnoreSpellCheck bypasses everything below — proceed to cast.
+    } else {
+        if !spell_words.enabled {
             return true;
         }
 
-        if mag_level < spell_words.magic_level {
-            let msg = "You do not have enough magic level.".to_string();
+        let poff = |pid| {
             let mut game = g_game().lock().unwrap();
-            game.send_text_message(player_id, crate::game::MESSAGE_INFO_DESCR, msg);
+            let pos = game.get_player(pid).map(|p| p.base.position).unwrap_or_default();
+            game.add_magic_effect(pos, crate::game::CONST_ME_POFF);
+        };
+
+        // Black skull range check — C++ spells.cpp:537
+        if spell_words.aggressive || spell_words.pz_lock {
+            let blocked = {
+                let game = g_game().lock().unwrap();
+                game.get_player(player_id).map(|p| {
+                    p.base.skull == crate::creatures::Skull::Black
+                        && p.base.attacked_creature_id.is_none()
+                }).unwrap_or(false)
+            };
+            if blocked {
+                crate::net::game_protocol::send_cancel_message(player_id, "Sorry, not possible.");
+                return true;
+            }
+        }
+
+        // Pacified check
+        if spell_words.aggressive || spell_words.pz_lock {
+            let pacified = g_game().lock().unwrap().get_creature(player_id)
+                .map(|c| c.base().has_condition(crate::combat::condition::ConditionType::Pacified))
+                .unwrap_or(false);
+            if pacified {
+                crate::net::game_protocol::send_cancel_message(player_id, "You are exhausted.");
+                poff(player_id);
+                return true;
+            }
+        }
+
+        // PZ check
+        let ignore_pz = group_flags & crate::creatures::player::PLAYER_FLAG_IGNORE_PROTECTION_ZONE != 0;
+        if (spell_words.aggressive || spell_words.pz_lock) && !ignore_pz {
+            let in_pz = {
+                let game = g_game().lock().unwrap();
+                game.get_player(player_id)
+                    .and_then(|p| game.map.get_tile(p.base.position))
+                    .map(|t| t.has_flag(crate::map::tile::TILESTATE_PROTECTIONZONE))
+                    .unwrap_or(false)
+            };
+            if in_pz {
+                crate::net::game_protocol::send_cancel_message(player_id, "You may not cast this spell while in a protection zone.");
+                return true;
+            }
+        }
+
+        // Exhaustion check — per-spell cooldown + per-group + secondary group
+        {
+            let exhausted = {
+                let game = g_game().lock().unwrap();
+                game.get_creature(player_id)
+                    .map(|c| {
+                        let base = c.base();
+                        base.has_condition_sub(crate::combat::condition::ConditionType::SpellCooldown, spell_words.spell_id as u32)
+                        || base.has_condition_sub(crate::combat::condition::ConditionType::SpellGroupCooldown, spell_words.group)
+                        || (spell_words.secondary_group != 0
+                            && base.has_condition_sub(crate::combat::condition::ConditionType::SpellGroupCooldown, spell_words.secondary_group))
+                    })
+                    .unwrap_or(false)
+            };
+            if exhausted {
+                crate::net::game_protocol::send_cancel_message(player_id, "You are exhausted.");
+                poff(player_id);
+                return true;
+            }
+        }
+
+        // Level check
+        if level < spell_words.level {
+            crate::net::game_protocol::send_cancel_message(player_id, "You do not have enough level.");
+            poff(player_id);
+            return true;
+        }
+
+        // Magic level check
+        if mag_level < spell_words.magic_level {
+            crate::net::game_protocol::send_cancel_message(player_id, "You do not have enough magic level.");
+            poff(player_id);
+            return true;
+        }
+
+        // Mana check
+        let required_mana_check = if spell_words.mana_percent > 0 {
+            (mana_max as u64 * spell_words.mana_percent as u64 / 100) as u32
+        } else {
+            spell_words.mana
+        };
+        let infinite_mana_flag = group_flags & PLAYER_FLAG_HAS_INFINITE_MANA != 0;
+        if !infinite_mana_flag && mana < required_mana_check {
+            crate::net::game_protocol::send_cancel_message(player_id, "You do not have enough mana.");
+            poff(player_id);
+            return true;
+        }
+
+        // Soul check
+        let infinite_soul_flag = group_flags & PLAYER_FLAG_HAS_INFINITE_SOUL != 0;
+        if !infinite_soul_flag && spell_words.soul > 0 && player_soul < spell_words.soul {
+            crate::net::game_protocol::send_cancel_message(player_id, "You do not have enough soul.");
+            poff(player_id);
+            return true;
+        }
+
+        // Learnable / vocation check
+        if spell_words.learnable {
+            let learned = g_game().lock().unwrap().get_player(player_id)
+                .map(|p| p.learned_instant_spells.iter().any(|s| s.eq_ignore_ascii_case(&spell_words.name)))
+                .unwrap_or(false);
+            if !learned {
+                crate::net::game_protocol::send_cancel_message(player_id, "You need to learn this spell first.");
+                poff(player_id);
+                return true;
+            }
+        } else if !spell_words.vocations.is_empty()
+            && !spell_words.vocations.contains(&(vocation_id as u32))
+        {
+            crate::net::game_protocol::send_cancel_message(player_id, "Your vocation cannot use this spell.");
+            poff(player_id);
+            return true;
+        }
+
+        // needWeapon check
+        if spell_words.need_weapon {
+            let has_weapon = {
+                let game = g_game().lock().unwrap();
+                game.get_player(player_id).map(|p| {
+                    let wt = p.get_weapon_type();
+                    wt == 1 || wt == 2 || wt == 3 // SWORD, CLUB, AXE
+                }).unwrap_or(false)
+            };
+            if !has_weapon {
+                crate::net::game_protocol::send_cancel_message(player_id, "You need to equip the right weapon to use this spell.");
+                poff(player_id);
+                return true;
+            }
+        }
+
+        // Premium check
+        if spell_words.premium && !is_premium {
+            crate::net::game_protocol::send_cancel_message(player_id, "You need a premium account to use this spell.");
+            poff(player_id);
             return true;
         }
     }
+
+    // -- All checks passed, compute values for postCastSpell --
+    let infinite_soul = ignore_checks || (group_flags & PLAYER_FLAG_HAS_INFINITE_SOUL != 0);
+    let no_exhaustion = ignore_checks || (group_flags & PLAYER_FLAG_HAS_NO_EXHAUSTION != 0);
+    let infinite_mana = ignore_checks || (group_flags & PLAYER_FLAG_HAS_INFINITE_MANA != 0);
 
     let required_mana = if spell_words.mana_percent > 0 {
         (mana_max as u64 * spell_words.mana_percent as u64 / 100) as u32
     } else {
         spell_words.mana
     };
-
-    // `required_mana` stays the real cost (C++ getManaCost ignores the infinite
-    // flag); the flag only bypasses the availability check below and the actual
-    // deduction in postCastSpell (changeMana still runs → sends stats).
-    let infinite_mana = ignore_checks || (group_flags & PLAYER_FLAG_HAS_INFINITE_MANA != 0);
-
-    if !ignore_checks && !infinite_mana && mana < required_mana {
-        let msg = "You do not have enough mana.".to_string();
-        let mut game = g_game().lock().unwrap();
-        game.send_text_message(player_id, crate::game::MESSAGE_INFO_DESCR, msg);
-        return true;
-    }
 
     let script_id = spell_words.script_id;
     if script_id == 0 {
@@ -410,13 +539,10 @@ pub fn execute_spell_say(player_id: CreatureId, text: &str) -> bool {
 
     ScriptEnvironment::reset();
 
-    // postCastSpell: deduct mana, advance magic level, and send stats — after
-    // the cast effect, matching C++ order. These flow into the open bundle.
+    // postCastSpell: deduct mana + soul, advance magic level, apply cooldowns.
     let new_magic_level = if required_mana > 0 {
         let mut game = g_game().lock().unwrap();
         if let Some(p) = game.get_player_mut(player_id) {
-            // C++ postCastSpell: addManaSpent always (magic-level progress);
-            // changeMana deducts only for non-infinite-mana players.
             if !infinite_mana {
                 p.mana = p.mana.saturating_sub(required_mana);
             }
@@ -427,6 +553,81 @@ pub fn execute_spell_say(player_id: CreatureId, text: &str) -> bool {
     } else {
         None
     };
+
+    // Soul deduction — mirrors C++ Spell::postCastSpell (spells.cpp:767)
+    if !infinite_soul && spell_words.soul > 0 {
+        let mut game = g_game().lock().unwrap();
+        if let Some(p) = game.get_player_mut(player_id) {
+            p.soul = p.soul.saturating_sub(spell_words.soul as u8);
+        }
+    }
+
+    // Cooldown — mirrors C++ Spell::postCastSpell (spells.cpp:734)
+    // HasNoExhaustion skips all cooldown conditions.
+    if !no_exhaustion {
+        if spell_words.cooldown > 0 {
+            let mut game = g_game().lock().unwrap();
+            if let Some(creature) = game.get_creature_mut(player_id) {
+                use crate::combat::condition::*;
+                let cond = ConditionGeneric {
+                    base: ConditionBase::new(
+                        ConditionId::Default,
+                        ConditionType::SpellCooldown,
+                        spell_words.cooldown as i32,
+                        false,
+                        spell_words.spell_id as u32,
+                        false,
+                    ),
+                };
+                let base_speed = creature.base().base_speed as i32;
+                add_condition_to_creature(&mut creature.base_mut().conditions, Box::new(cond), base_speed);
+            }
+        }
+        if spell_words.group_cooldown > 0 {
+            let mut game = g_game().lock().unwrap();
+            if let Some(creature) = game.get_creature_mut(player_id) {
+                use crate::combat::condition::*;
+                let cond = ConditionGeneric {
+                    base: ConditionBase::new(
+                        ConditionId::Default,
+                        ConditionType::SpellGroupCooldown,
+                        spell_words.group_cooldown as i32,
+                        false,
+                        spell_words.group,
+                        false,
+                    ),
+                };
+                let base_speed = creature.base().base_speed as i32;
+                add_condition_to_creature(&mut creature.base_mut().conditions, Box::new(cond), base_speed);
+            }
+        }
+        if spell_words.secondary_group_cooldown > 0 && spell_words.secondary_group != 0 {
+            let mut game = g_game().lock().unwrap();
+            if let Some(creature) = game.get_creature_mut(player_id) {
+                use crate::combat::condition::*;
+                let cond = ConditionGeneric {
+                    base: ConditionBase::new(
+                        ConditionId::Default,
+                        ConditionType::SpellGroupCooldown,
+                        spell_words.secondary_group_cooldown as i32,
+                        false,
+                        spell_words.secondary_group,
+                        false,
+                    ),
+                };
+                let base_speed = creature.base().base_speed as i32;
+                add_condition_to_creature(&mut creature.base_mut().conditions, Box::new(cond), base_speed);
+            }
+        }
+    }
+
+    // addInFightTicks for aggressive spells — mirrors C++ Spell::postCastSpell.
+    if spell_words.aggressive {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(player_id) {
+            player.add_in_fight_ticks(false);
+        }
+    }
 
     if let Some(new_ml) = new_magic_level {
         let msg = format!("You advanced to magic level {new_ml}.");

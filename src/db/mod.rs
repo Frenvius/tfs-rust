@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::config::{ConfigManager, IntegerConfig, StringConfig};
 
+pub mod ban;
 pub mod guild;
 pub mod login;
 pub mod manager;

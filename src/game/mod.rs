@@ -273,6 +273,22 @@ impl Game {
             return;
         }
         self.game_state = new_state;
+
+        if new_state == GameState::Closed {
+            let to_kick: Vec<crate::creatures::CreatureId> = self.player_name_to_id.values()
+                .copied()
+                .filter(|&id| {
+                    self.get_player(id)
+                        .map(|p| !p.has_flag(crate::creatures::player::PLAYER_FLAG_CAN_ALWAYS_LOGIN))
+                        .unwrap_or(false)
+                })
+                .collect();
+            for id in to_kick {
+                self.remove_creature_check(id);
+                self.remove_player(id);
+                crate::net::game_protocol::unregister_player_connection(id);
+            }
+        }
     }
 
     pub fn set_world_type(&mut self, world_type: WorldType) {
@@ -580,6 +596,36 @@ impl Game {
         self.map.move_creature_on_map(old_pos, new_pos, creature_id, is_player);
         if let Some(creature) = self.creatures.get_mut(&creature_id) {
             creature.base_mut().position = new_pos;
+        }
+
+        // onAttackedCreatureChangeZone: when this creature enters PZ or nopvp,
+        // cancel attack for all players targeting it (unless IgnoreProtectionZone).
+        let dest_pz = self.map.get_tile(new_pos)
+            .map(|t| t.has_flag(crate::map::tile::TILESTATE_PROTECTIONZONE))
+            .unwrap_or(false);
+        let dest_nopvp = self.map.get_tile(new_pos)
+            .map(|t| t.has_flag(crate::map::tile::TILESTATE_NOPVPZONE))
+            .unwrap_or(false);
+        let moved_is_player = self.creatures.get(&creature_id).map(|c| c.is_player()).unwrap_or(false);
+        if dest_pz || (dest_nopvp && moved_is_player) {
+            let to_cancel: Vec<CreatureId> = self.creatures.values()
+                .filter_map(|c| {
+                    let p = c.as_player()?;
+                    if p.base.attacked_creature_id != Some(creature_id) { return None; }
+                    if p.has_flag(crate::creatures::player::PLAYER_FLAG_IGNORE_PROTECTION_ZONE) { return None; }
+                    if dest_nopvp && !moved_is_player { return None; }
+                    Some(p.base.id)
+                })
+                .collect();
+            for pid in &to_cancel {
+                if let Some(p) = self.get_player_mut(*pid) {
+                    p.base.attacked_creature_id = None;
+                }
+                crate::net::game_protocol::send_packet_to_player(*pid, |output| {
+                    output.add_byte(0xA3);
+                    output.add_u32(0);
+                });
+            }
         }
     }
 
@@ -1974,7 +2020,11 @@ impl Game {
         let attacker_is_player = attacker_id.and_then(|id| self.creatures.get(&id)).map(|c| c.is_player()).unwrap_or(false);
         let attacker_skull = attacker_id.and_then(|id| self.creatures.get(&id)).map(|c| c.get_skull()).unwrap_or(Skull::None);
         let attacker_skull_of_target = if let (Some(aid), true) = (attacker_id, target_is_player) {
-            self.creatures.get(&aid).and_then(|c| c.as_player()).map(|p| p.get_skull_client(Skull::None)).unwrap_or(Skull::None)
+            let wt = self.get_world_type();
+            match (self.get_player(aid), self.get_player(target_id)) {
+                (Some(ap), Some(tp)) => ap.get_skull_client_of_player(tp, wt),
+                _ => Skull::None,
+            }
         } else {
             Skull::None
         };
@@ -2285,6 +2335,127 @@ impl Game {
                 if let Some(creature) = self.creatures.get_mut(&target_id) {
                     creature.base_mut().add_damage_points(aid, real_damage);
                     creature.base_mut().last_hit_creature_id = aid;
+                }
+
+                // onAttackedCreature + onAttacked — mirrors C++ player.cpp:3347-3406 verbatim.
+                let attacker_is_player_here = self.get_player(aid).is_some();
+                if attacker_is_player_here {
+                    // target->getZone() == ZONE_PVP → skip skull logic entirely
+                    let target_in_pvp = self.get_creature(target_id)
+                        .and_then(|c| self.map.get_tile(c.position()))
+                        .map(|t| t.has_flag(crate::map::tile::TILESTATE_PVPZONE))
+                        .unwrap_or(false);
+
+                    let not_gain_in_fight = self.get_player(aid)
+                        .map(|p| p.has_flag(crate::creatures::player::PLAYER_FLAG_NOT_GAIN_IN_FIGHT))
+                        .unwrap_or(false);
+
+                    if target_is_player && !target_in_pvp && !not_gain_in_fight {
+                        // Check party/guild exemption
+                        let is_partner = {
+                            let ap = self.get_player(aid);
+                            let tp = self.get_player(target_id);
+                            match (ap, tp) {
+                                (Some(a), Some(t)) => {
+                                    (a.party_id.is_some() && a.party_id == t.party_id)
+                                    || (a.guild_id.is_some() && a.guild_id == t.guild_id)
+                                }
+                                _ => false,
+                            }
+                        };
+
+                        if !is_partner {
+                            // PVP_ENFORCED: immediate pzLock
+                            if self.get_world_type() == crate::game::WorldType::PvpEnforced {
+                                let was_locked = self.get_player(aid).map(|p| p.pz_locked).unwrap_or(true);
+                                if !was_locked {
+                                    if let Some(ap) = self.get_player_mut(aid) {
+                                        ap.pz_locked = true;
+                                    }
+                                    crate::net::game_protocol::send_icons_to_player(aid);
+                                }
+                            }
+
+                            // Target gets InFight
+                            if let Some(tp) = self.get_player_mut(target_id) {
+                                tp.add_in_fight_ticks(false);
+                            }
+
+                            let (attacker_skull, attacker_skull_of_target, target_skull, target_has_attacked) = {
+                                let ap = self.get_player(aid);
+                                let tp = self.get_player(target_id);
+                                match (ap, tp) {
+                                    (Some(a), Some(t)) => {
+                                        let wt = self.get_world_type();
+                                        (
+                                            a.base.skull, a.get_skull_client_of_player(t, wt),
+                                            t.base.skull, t.has_attacked(a.guid),
+                                        )
+                                    }
+                                    _ => (Skull::None, Skull::None, Skull::None, false),
+                                }
+                            };
+
+                            let both_in_pvp_zone = {
+                                let ap_pvp = self.get_creature(aid)
+                                    .and_then(|c| self.map.get_tile(c.position()))
+                                    .map(|t| t.has_flag(crate::map::tile::TILESTATE_PVPZONE))
+                                    .unwrap_or(false);
+                                let tp_pvp = self.get_creature(target_id)
+                                    .and_then(|c| self.map.get_tile(c.position()))
+                                    .map(|t| t.has_flag(crate::map::tile::TILESTATE_PVPZONE))
+                                    .unwrap_or(false);
+                                ap_pvp && tp_pvp
+                            };
+
+                            let target_guid = self.get_player(target_id).map(|p| p.guid).unwrap_or(0);
+
+                            if attacker_skull == Skull::None && attacker_skull_of_target == Skull::Yellow {
+                                // Yellow skull path: reciprocal attack recording
+                                if let Some(ap) = self.get_player_mut(aid) {
+                                    ap.attacked_set.insert(target_guid);
+                                }
+                                crate::net::game_protocol::send_creature_skull_to_player(target_id, aid, Skull::None);
+                            } else if !target_has_attacked {
+                                // Target hasn't attacked us → pzLock + possible white skull
+                                let was_locked = self.get_player(aid).map(|p| p.pz_locked).unwrap_or(true);
+                                if !was_locked {
+                                    if let Some(ap) = self.get_player_mut(aid) {
+                                        ap.pz_locked = true;
+                                    }
+                                    crate::net::game_protocol::send_icons_to_player(aid);
+                                }
+
+                                if !both_in_pvp_zone {
+                                    if let Some(ap) = self.get_player_mut(aid) {
+                                        ap.attacked_set.insert(target_guid);
+                                    }
+                                    if target_skull == Skull::None && attacker_skull == Skull::None {
+                                        if let Some(ap) = self.get_player_mut(aid) {
+                                            ap.base.skull = Skull::White;
+                                        }
+                                    }
+                                    // Send skull to target (only if attacker has no skull)
+                                    let current_skull = self.get_player(aid).map(|p| p.base.skull).unwrap_or(Skull::None);
+                                    if current_skull == Skull::None {
+                                        crate::net::game_protocol::send_creature_skull_to_player(target_id, aid, Skull::None);
+                                    } else {
+                                        crate::net::game_protocol::send_creature_skull_to_player(target_id, aid, current_skull);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Attacker gets InFight (pzlock for PvP targets)
+                    if let Some(p) = self.get_player_mut(aid) {
+                        p.add_in_fight_ticks(target_is_player && !target_in_pvp);
+                    }
+                } else if target_is_player {
+                    // Non-player attacker (monster) → target gets InFight (onAttacked)
+                    if let Some(p) = self.get_player_mut(target_id) {
+                        p.add_in_fight_ticks(false);
+                    }
                 }
 
                 // Party in-fight ticks (port of Party::updatePlayerTicks via
@@ -2657,7 +2828,11 @@ impl Game {
             // Place corpse with loot (0 = no corpse defined → POFF effect).
             if look_corpse > 0 {
                 let mut corpse = crate::map::tile::MapItem { server_id: look_corpse, ..crate::map::tile::MapItem::default() };
-                if loot_drop && skill_loss {
+                let killer_suppresses_loot = last_hit_id
+                    .and_then(|id| self.get_player(id))
+                    .map(|p| p.has_flag(crate::creatures::player::PLAYER_FLAG_NOT_GENERATE_LOOT))
+                    .unwrap_or(false);
+                if loot_drop && skill_loss && !killer_suppresses_loot {
                     let rate_loot = crate::config::g_config().get_number(crate::config::IntegerConfig::RateLoot);
                     if rate_loot > 0 {
                         for lb in &loot_items {
@@ -2712,6 +2887,9 @@ impl Game {
 
         let (level, exp_before, health_max, mana_max, cap, voc_id) = {
             let Some(player) = self.get_player(attacker_id) else { return };
+            if player.has_flag(crate::creatures::player::PLAYER_FLAG_NOT_GAIN_EXPERIENCE) || gained == 0 {
+                return;
+            }
             (player.level, player.experience, player.base.health_max, player.mana_max, player.capacity, player.vocation_id)
         };
 

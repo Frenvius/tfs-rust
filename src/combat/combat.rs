@@ -651,6 +651,226 @@ impl Combat {
         false
     }
 
+    /// Full creature-vs-creature combat permission check.
+    /// Mirrors C++ `Combat::canDoCombat(Creature* attacker, Creature* target)`.
+    pub fn can_do_combat_creature(
+        attacker_id: crate::creatures::CreatureId,
+        target_id: crate::creatures::CreatureId,
+        aggressive: bool,
+    ) -> ReturnValue {
+        use crate::game::g_game;
+        use crate::creatures::player::*;
+        use crate::map::tile::*;
+
+        let game = g_game().lock().unwrap();
+        let Some(attacker) = game.get_creature(attacker_id) else { return ReturnValue::NoError };
+
+        // CannotUseCombat
+        if let Some(ap) = attacker.as_player() {
+            if ap.has_flag(PLAYER_FLAG_CANNOT_USE_COMBAT) {
+                return if game.get_creature(target_id).map(|c| c.is_player()).unwrap_or(false) {
+                    ReturnValue::YouMayNotAttackThisPlayer
+                } else {
+                    ReturnValue::YouMayNotAttackThisCreature
+                };
+            }
+        }
+
+        // Target not attackable (CannotBeAttacked)
+        if let Some(target) = game.get_creature(target_id) {
+            if !target.is_attackable() {
+                return if target.is_player() {
+                    ReturnValue::YouMayNotAttackThisPlayer
+                } else {
+                    ReturnValue::YouMayNotAttackThisCreature
+                };
+            }
+        }
+
+        if !aggressive || attacker_id == target_id {
+            return ReturnValue::NoError;
+        }
+
+        let target_is_player = game.get_creature(target_id).map(|c| c.is_player()).unwrap_or(false);
+        let target_is_monster = game.get_creature(target_id).map(|c| c.is_monster()).unwrap_or(false);
+
+        // Target is player
+        if target_is_player {
+            let target_player = game.get_creature(target_id).and_then(|c| c.as_player());
+
+            if let Some(ap) = attacker.as_player() {
+                if ap.has_flag(PLAYER_FLAG_CANNOT_ATTACK_PLAYER) {
+                    return ReturnValue::YouMayNotAttackThisPlayer;
+                }
+
+                // Secure mode: can't attack unmarked players unless in PvP zone
+                if ap.has_secure_mode() {
+                    let both_in_pvp = game.map.get_tile(ap.base.position)
+                        .map(|t| t.has_flag(TILESTATE_PVPZONE)).unwrap_or(false)
+                        && game.get_creature(target_id).and_then(|c| game.map.get_tile(c.position()))
+                            .map(|t| t.has_flag(TILESTATE_PVPZONE)).unwrap_or(false);
+                    if !both_in_pvp {
+                        let wt = game.get_world_type();
+                        let skull_of_target = target_player
+                            .map(|tp| ap.get_skull_client_of_player(tp, wt))
+                            .unwrap_or(crate::creatures::Skull::None);
+                        if skull_of_target == crate::creatures::Skull::None {
+                            return ReturnValue::TurnSecureModeToAttackUnmarkedPlayers;
+                        }
+                    }
+                }
+
+                // isProtected: protection level + vocation pvp + skull
+                if let Some(tp) = target_player {
+                    use crate::world::vocation::g_vocations;
+                    let wt = game.get_world_type();
+                    let prot_level = crate::config::g_config().get_number(
+                        crate::config::IntegerConfig::ProtectionLevel) as u32;
+                    let ap_allows_pvp = g_vocations().get_vocation(ap.vocation_id)
+                        .map(|v| v.allow_pvp).unwrap_or(true);
+                    let tp_allows_pvp = g_vocations().get_vocation(tp.vocation_id)
+                        .map(|v| v.allow_pvp).unwrap_or(true);
+                    if Self::is_protected(
+                        ap.level, ap_allows_pvp, ap.base.skull, ap.get_skull_client_of_player(tp, wt),
+                        tp.level, tp_allows_pvp, prot_level,
+                    ) {
+                        return ReturnValue::YouMayNotAttackThisPlayer;
+                    }
+                }
+
+                // Nopvp zone checks
+                if let Some(tp) = target_player {
+                    let target_pos = tp.base.position;
+                    if game.map.get_tile(target_pos)
+                        .map(|t| t.has_flag(TILESTATE_NOPVPZONE))
+                        .unwrap_or(false)
+                    {
+                        return ReturnValue::ActionNotPermittedInANoPvpZone;
+                    }
+                    let ap_pos = ap.base.position;
+                    let ap_in_nopvp = game.map.get_tile(ap_pos)
+                        .map(|t| t.has_flag(TILESTATE_NOPVPZONE))
+                        .unwrap_or(false);
+                    let tp_not_in_pz_or_nopvp = !game.map.get_tile(target_pos)
+                        .map(|t| t.has_flag(TILESTATE_PROTECTIONZONE) || t.has_flag(TILESTATE_NOPVPZONE))
+                        .unwrap_or(false);
+                    if ap_in_nopvp && tp_not_in_pz_or_nopvp {
+                        return ReturnValue::ActionNotPermittedInANoPvpZone;
+                    }
+                }
+
+            }
+
+            // Summon-master checks
+            if attacker.as_monster().map(|m| m.base.is_summon()).unwrap_or(false) {
+                let master_id = attacker.as_monster().and_then(|m| m.base.master_id);
+                if let Some(mid) = master_id {
+                    if let Some(master_player) = game.get_creature(mid).and_then(|c| c.as_player()) {
+                        if master_player.has_flag(PLAYER_FLAG_CANNOT_ATTACK_PLAYER) {
+                            return ReturnValue::YouMayNotAttackThisPlayer;
+                        }
+                        if let Some(tp) = target_player {
+                            use crate::world::vocation::g_vocations;
+                            let prot_level = crate::config::g_config().get_number(
+                                crate::config::IntegerConfig::ProtectionLevel) as u32;
+                            let mp_allows_pvp = g_vocations().get_vocation(master_player.vocation_id)
+                                .map(|v| v.allow_pvp).unwrap_or(true);
+                            let tp_allows_pvp = g_vocations().get_vocation(tp.vocation_id)
+                                .map(|v| v.allow_pvp).unwrap_or(true);
+                            let wt = game.get_world_type();
+                            if Self::is_protected(
+                                master_player.level, mp_allows_pvp, master_player.base.skull,
+                                master_player.get_skull_client_of_player(tp, wt),
+                                tp.level, tp_allows_pvp, prot_level,
+                            ) {
+                                return ReturnValue::YouMayNotAttackThisPlayer;
+                            }
+                        }
+                        let target_pos = game.get_creature(target_id).map(|c| c.position()).unwrap_or_default();
+                        if game.map.get_tile(target_pos)
+                            .map(|t| t.has_flag(TILESTATE_NOPVPZONE))
+                            .unwrap_or(false)
+                        {
+                            return ReturnValue::ActionNotPermittedInANoPvpZone;
+                        }
+                    }
+                }
+            }
+        } else if target_is_monster {
+            // Attacker player vs monster
+            if let Some(ap) = attacker.as_player() {
+                if ap.has_flag(PLAYER_FLAG_CANNOT_ATTACK_MONSTER) {
+                    return ReturnValue::YouMayNotAttackThisCreature;
+                }
+                // Summon in nopvp zone
+                let target_is_summon = game.get_creature(target_id)
+                    .and_then(|c| c.as_monster())
+                    .map(|m| m.base.is_summon() && m.base.master_id
+                        .and_then(|mid| game.get_creature(mid))
+                        .map(|c| c.is_player()).unwrap_or(false))
+                    .unwrap_or(false);
+                if target_is_summon {
+                    let target_pos = game.get_creature(target_id).map(|c| c.position()).unwrap_or_default();
+                    if game.map.get_tile(target_pos)
+                        .map(|t| t.has_flag(TILESTATE_NOPVPZONE))
+                        .unwrap_or(false)
+                    {
+                        return ReturnValue::ActionNotPermittedInANoPvpZone;
+                    }
+                }
+            }
+            // Monster-vs-monster: non-player-summon can't attack non-player-summon
+            if let Some(am) = attacker.as_monster() {
+                let target_master_is_player = game.get_creature(target_id)
+                    .and_then(|c| c.as_monster())
+                    .and_then(|m| m.base.master_id)
+                    .and_then(|mid| game.get_creature(mid))
+                    .map(|c| c.is_player())
+                    .unwrap_or(false);
+                if !target_master_is_player {
+                    let attacker_master_is_player = am.base.master_id
+                        .and_then(|mid| game.get_creature(mid))
+                        .map(|c| c.is_player())
+                        .unwrap_or(false);
+                    if !attacker_master_is_player {
+                        return ReturnValue::YouMayNotAttackThisCreature;
+                    }
+                }
+            }
+        }
+
+        // NO_PVP world: player/player-summon can't attack player/player-summon outside PvP zone
+        if game.get_world_type() == crate::game::WorldType::NoPvp {
+            let attacker_is_player_or_player_summon = attacker.is_player()
+                || (attacker.as_monster().map(|m| m.base.is_summon()
+                    && m.base.master_id.and_then(|mid| game.get_creature(mid))
+                        .map(|c| c.is_player()).unwrap_or(false))
+                    .unwrap_or(false));
+            if attacker_is_player_or_player_summon {
+                let both_in_pvp = game.map.get_tile(attacker.position())
+                    .map(|t| t.has_flag(TILESTATE_PVPZONE)).unwrap_or(false)
+                    && game.get_creature(target_id).and_then(|c| game.map.get_tile(c.position()))
+                        .map(|t| t.has_flag(TILESTATE_PVPZONE)).unwrap_or(false);
+                if !both_in_pvp {
+                    if target_is_player {
+                        return ReturnValue::YouMayNotAttackThisPlayer;
+                    }
+                    let target_is_player_summon = game.get_creature(target_id)
+                        .and_then(|c| c.as_monster())
+                        .map(|m| m.base.is_summon() && m.base.master_id
+                            .and_then(|mid| game.get_creature(mid))
+                            .map(|c| c.is_player()).unwrap_or(false))
+                        .unwrap_or(false);
+                    if target_is_player_summon {
+                        return ReturnValue::YouMayNotAttackThisCreature;
+                    }
+                }
+            }
+        }
+
+        ReturnValue::NoError
+    }
+
     /// Target is player-controlled (player or player's summon).
     ///
     /// Matches C++ Combat::isPlayerCombat verbatim.
@@ -885,13 +1105,6 @@ impl Combat {
 
     // ── Static combat permission/effects helpers ────────────────────────────
 
-    pub fn can_do_combat_creature(
-        _attacker_id: Option<crate::creatures::CreatureId>,
-        _target_id: crate::creatures::CreatureId,
-    ) -> ReturnValue {
-        ReturnValue::NoError
-    }
-
     pub fn post_combat_effects_static(
         _caster_id: Option<crate::creatures::CreatureId>,
         _pos: Position,
@@ -947,6 +1160,12 @@ impl Combat {
             SPECIALSKILL_MANALEECHCHANCE, SPECIALSKILL_MANALEECHAMOUNT,
         };
         use crate::game::{CONST_ME_BLOODYSTEPS, CONST_ME_MAGIC_RED, CONST_ME_MAGIC_BLUE};
+
+        if let Some(cid) = caster_id {
+            if Self::can_do_combat_creature(cid, target_id, params.aggressive) != ReturnValue::NoError {
+                return;
+            }
+        }
 
         // Distance effect
         if params.distance_effect != CONST_ANI_NONE {

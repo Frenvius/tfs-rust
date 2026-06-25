@@ -954,6 +954,9 @@ impl Player {
     }
 
     pub fn has_attacked(&self, attacked_guid: u32) -> bool {
+        if self.has_flag(PLAYER_FLAG_NOT_GAIN_IN_FIGHT) {
+            return false;
+        }
         self.attacked_set.contains(&attacked_guid)
     }
 
@@ -1017,8 +1020,10 @@ impl Player {
             .unwrap_or(1500)
     }
 
-    /// addSkillAdvance — port of Player::addSkillAdvance from player.cpp.
     pub fn add_skill_advance(&mut self, skill: usize, count: u64) -> bool {
+        if self.has_flag(PLAYER_FLAG_NOT_GAIN_SKILL) {
+            return false;
+        }
         use crate::world::vocation::g_vocations;
         if skill >= SKILL_COUNT {
             return false;
@@ -1052,9 +1057,10 @@ impl Player {
         leveled_up
     }
 
-    /// Accumulate mana spent and level up magic if threshold met.
-    /// Returns new magic level if leveled, else None.
     pub fn add_mana_spent(&mut self, amount: u64) -> Option<u32> {
+        if self.has_flag(PLAYER_FLAG_NOT_GAIN_MANA) {
+            return None;
+        }
         use crate::world::vocation::g_vocations;
         let voc = g_vocations().get_vocation(self.vocation_id)?.clone();
         let next_req = voc.get_req_mana(self.mag_level + 1);
@@ -1212,6 +1218,30 @@ impl Player {
             return false;
         }
         !self.base.has_condition(crate::combat::condition::ConditionType::InFight)
+    }
+
+    pub fn add_in_fight_ticks(&mut self, pz_lock: bool) {
+        if self.has_flag(PLAYER_FLAG_NOT_GAIN_IN_FIGHT) {
+            return;
+        }
+        if pz_lock {
+            self.pz_locked = true;
+        }
+        let duration = crate::config::g_config().get_number(crate::config::IntegerConfig::PzLocked) as i32;
+        let cond = crate::combat::condition::ConditionGeneric {
+            base: crate::combat::condition::ConditionBase::new(
+                crate::combat::condition::ConditionId::Default,
+                crate::combat::condition::ConditionType::InFight,
+                duration,
+                false,
+                0,
+                false,
+            ),
+        };
+        let base_speed = self.base.base_speed as i32;
+        crate::combat::condition::add_condition_to_creature(
+            &mut self.base.conditions, Box::new(cond), base_speed,
+        );
     }
 
     pub fn update_base_speed(&mut self, vocation_base_speed: u32) {
@@ -1407,6 +1437,23 @@ impl Player {
     pub fn get_skull_client(&self, other_skull: Skull) -> Skull {
         other_skull
     }
+
+    pub fn get_skull_client_of_player(&self, target: &Player, world_type: crate::game::WorldType) -> Skull {
+        if world_type != crate::game::WorldType::Pvp {
+            return Skull::None;
+        }
+        if target.base.skull != Skull::None {
+            return target.base.skull;
+        }
+        if target.attacked_set.contains(&self.guid) {
+            return Skull::Yellow;
+        }
+        if self.party_id.is_some() && self.party_id == target.party_id {
+            return Skull::Green;
+        }
+        target.base.skull
+    }
+
 
     pub fn set_chase_mode(&mut self, mode: bool) {
         self.chase_mode = mode;

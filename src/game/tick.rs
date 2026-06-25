@@ -379,7 +379,10 @@ fn execute_conditions(creature_id: u32) {
                 base.health = (base.health + health_delta).clamp(0, base.health_max);
             }
         }
-        if mana_delta != 0 {
+        let no_gain_mana = game.get_player(creature_id)
+            .map(|p| p.has_flag(crate::creatures::player::PLAYER_FLAG_NOT_GAIN_MANA))
+            .unwrap_or(false);
+        if mana_delta != 0 && !no_gain_mana {
             if let Some(player) = game.get_player_mut(creature_id) {
                 let new_mana = (player.mana as i64 + mana_delta as i64).clamp(0, player.mana_max as i64) as u32;
                 player.mana = new_mana;
@@ -868,24 +871,61 @@ fn monster_think(creature_id: u32) {
         return;
     }
 
-    // Update target list: find all players in the viewport and mark them as potential targets.
-    let nearby_players: Vec<u32> = {
-        let mut game = g_game().lock().unwrap();
-        game.map.get_spectators(
-            pos,
-            true, // multifloor
-            true, // only_players
-            MAX_VIEWPORT_X,
-            MAX_VIEWPORT_X,
-            MAX_VIEWPORT_Y,
-            MAX_VIEWPORT_Y,
-        )
+    // Update target list: find all creatures in the viewport and filter to valid opponents.
+    // Mirrors C++ Monster::isOpponent: non-summon monsters target players without
+    // IgnoredByMonsters and player-owned summons; player-summon monsters target everyone
+    // except their master.
+    let (is_summon, master_id) = {
+        let game = g_game().lock().unwrap();
+        let m = game.get_creature(creature_id).and_then(|c| c.as_monster());
+        let is_summon = m.map(|m| m.base.is_summon()).unwrap_or(false);
+        let master_id = m.and_then(|m| m.base.master_id);
+        (is_summon, master_id)
     };
 
-    // Filter to players that aren't the monster itself.
-    let opponent_ids: Vec<u32> = nearby_players.into_iter()
-        .filter(|&id| id != creature_id)
-        .collect();
+    let opponent_ids: Vec<u32> = {
+        let mut game = g_game().lock().unwrap();
+        let nearby = game.map.get_spectators(
+            pos,
+            true,  // multifloor
+            false, // all creatures, not just players
+            MAX_VIEWPORT_X,
+            MAX_VIEWPORT_X,
+            MAX_VIEWPORT_Y,
+            MAX_VIEWPORT_Y,
+        );
+        nearby.into_iter()
+            .filter(|&id| {
+                if id == creature_id { return false; }
+                let Some(creature) = game.get_creature(id) else { return false };
+                if is_summon {
+                    // Player-summon: everyone except master is an opponent.
+                    let master_is_player = master_id
+                        .and_then(|mid| game.get_creature(mid))
+                        .map(|c| c.is_player())
+                        .unwrap_or(false);
+                    if master_is_player {
+                        return Some(id) != master_id;
+                    }
+                    return false;
+                }
+                // Non-summon: players without IgnoredByMonsters, or player-owned summons.
+                if let Some(p) = creature.as_player() {
+                    return !p.has_flag(crate::creatures::player::PLAYER_FLAG_IGNORED_BY_MONSTERS)
+                        && !p.is_in_ghost_mode();
+                }
+                if let Some(m) = creature.as_monster() {
+                    if m.base.is_summon() {
+                        return m.base.master_id
+                            .and_then(|mid| game.get_creature(mid))
+                            .map(|c| c.is_player())
+                            .unwrap_or(false);
+                    }
+                }
+                false
+            })
+            .collect()
+    };
 
     // Add new opponents to the target_list.
     {
@@ -908,22 +948,28 @@ fn monster_think(creature_id: u32) {
         }
     }
 
-    // If current target is dead or out of view, clear it.
+    // Prune target_list: remove dead or no-longer-opponent targets.
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(monster) = game.get_creature_mut(creature_id).and_then(|c| c.as_monster_mut()) {
+            monster.target_list.retain(|id| opponent_ids.contains(id));
+        }
+    }
+
+    // If current target is dead or no longer a valid opponent, clear it.
     {
         let game = g_game().lock().unwrap();
         let current_target = game.get_creature(creature_id)
             .and_then(|c| c.base().attacked_creature_id);
         if let Some(tid) = current_target {
-            let target_alive = game.get_creature(tid)
+            let target_valid = game.get_creature(tid)
                 .map(|t| t.base().health > 0)
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && opponent_ids.contains(&tid);
             drop(game);
 
-            if !target_alive {
+            if !target_valid {
                 let mut game = g_game().lock().unwrap();
-                if let Some(monster) = game.get_creature_mut(creature_id).and_then(|c| c.as_monster_mut()) {
-                    monster.target_list.retain(|&id| id != tid);
-                }
                 if let Some(creature) = game.get_creature_mut(creature_id) {
                     creature.base_mut().attacked_creature_id = None;
                 }
@@ -1333,6 +1379,24 @@ fn player_on_think(creature_id: u32) {
         });
     }
 
+    // Message buffer decay — mirrors C++ Player::onThink → addMessageBuffer.
+    // Every 1500ms, decrement the message spam counter (unless CannotBeMuted).
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(creature_id) {
+            player.message_buffer_ticks += crate::creatures::EVENT_CREATURE_THINK_INTERVAL as u32;
+            if player.message_buffer_ticks >= 1500 {
+                player.message_buffer_ticks = 0;
+                if player.message_buffer_count > 0
+                    && crate::config::g_config().get_number(crate::config::IntegerConfig::MaxMessageBuffer) != 0
+                    && !player.has_flag(crate::creatures::player::PLAYER_FLAG_CANNOT_BE_MUTED)
+                {
+                    player.message_buffer_count -= 1;
+                }
+            }
+        }
+    }
+
     let no_pong_time = now - last_pong;
 
     // Cancel attack on player target after 7s of no pong (C++ Player::sendPing).
@@ -1586,10 +1650,17 @@ fn check_spawns() {
     };
 
     for w in work_items {
-        // Check if any player is near the spawn position.
+        // Check if any non-IgnoredByMonsters player is near the spawn position.
+        // Mirrors C++ Spawn::findPlayer: only non-flagged players suppress spawns.
         let has_nearby_player: bool = {
             let mut game = g_game().lock().unwrap();
-            !game.map.get_spectators(w.pos, false, true, 0, 0, 0, 0).is_empty()
+            let specs = game.map.get_spectators(w.pos, false, true, 0, 0, 0, 0);
+            specs.iter().any(|&id| {
+                game.get_creature(id)
+                    .and_then(|c| c.as_player())
+                    .map(|p| !p.has_flag(crate::creatures::player::PLAYER_FLAG_IGNORED_BY_MONSTERS))
+                    .unwrap_or(false)
+            })
         };
 
         if has_nearby_player {

@@ -316,6 +316,10 @@ impl CreatureBase {
         self.conditions.iter().any(|c| c.get_type() == condition_type)
     }
 
+    pub fn has_condition_sub(&self, condition_type: crate::combat::condition::ConditionType, sub_id: u32) -> bool {
+        self.conditions.iter().any(|c| c.get_type() == condition_type && c.get_sub_id() == sub_id)
+    }
+
     pub fn get_condition(
         &self,
         condition_type: crate::combat::condition::ConditionType,
@@ -497,7 +501,7 @@ impl Creature {
     pub fn is_attackable(&self) -> bool {
         match self {
             Creature::Monster(m) => m.is_attackable(),
-            Creature::Player(_) => true,
+            Creature::Player(p) => !p.has_flag(crate::creatures::player::PLAYER_FLAG_CANNOT_BE_ATTACKED),
             Creature::Npc(_) => false,
         }
     }
