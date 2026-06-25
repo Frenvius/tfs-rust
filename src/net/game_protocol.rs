@@ -2838,15 +2838,10 @@ fn refresh_move_endpoint_free(player_id: CreatureId, ep: &MoveEndpoint) {
                     None => (None, 0),
                 }
             };
-            let client_id = sid.map(|s| g_game().lock().unwrap().items.get_item_type(usize::from(s)).client_id);
-            let s = slot as u8;
-            let c = count.max(1) as u8;
-            send_packet_to_player(player_id, move |output: &mut OutputMessage| {
-                match client_id {
-                    Some(cid) => { output.add_byte(0x78); output.add_byte(s); output.add_u16(cid); output.add_byte(c); }
-                    None => { output.add_byte(0x79); output.add_byte(s); }
-                }
-            });
+            match sid {
+                Some(s) => send_inventory_item_to_player(player_id, slot as u8, s, count.max(1)),
+                None => send_clear_inventory_slot(player_id, slot as u8),
+            }
         }
         MoveEndpoint::Ground { pos, .. } => {
             let sessions = player_sessions().lock().unwrap();
@@ -3879,6 +3874,7 @@ fn insert_move_item(
 ) -> bool {
     match *to {
         MoveEndpoint::Container { cid, .. } => {
+            let stackable = game.items.get_item_type(usize::from(item.server_id)).stackable;
             let resolved = {
                 match game.get_player(creature_id).and_then(|p| resolve_container_storage(p, cid)) {
                     Some(r) => r,
@@ -3887,23 +3883,60 @@ fn insert_move_item(
             };
             let (root, path, _) = resolved;
             match container_children_mut(game, creature_id, &root, &path) {
-                // New items are placed at the top of the container (index 0),
-                // matching the client's expectation for a fresh insert.
-                Some(children) => { children.insert(0, item); true }
+                Some(children) => {
+                    if stackable {
+                        // Mirror Container::queryDestination + internalMoveItem:
+                        // merge into the first matching partial stack (cap 100),
+                        // any remainder becomes a new stack at the front.
+                        let mut remaining = item.count.max(1);
+                        if let Some(child) = children
+                            .iter_mut()
+                            .find(|c| c.server_id == item.server_id && c.count < 100)
+                        {
+                            let add = remaining.min(100 - child.count);
+                            child.count += add;
+                            remaining -= add;
+                        }
+                        if remaining > 0 {
+                            let mut it = item;
+                            it.count = remaining;
+                            children.insert(0, it);
+                        }
+                    } else {
+                        children.insert(0, item);
+                    }
+                    true
+                }
                 None => false,
             }
         }
         MoveEndpoint::Inventory { slot } => {
             use crate::creatures::player::{CONST_SLOT_FIRST, CONST_SLOT_LAST};
             if !(CONST_SLOT_FIRST..=CONST_SLOT_LAST).contains(&slot) { return false; }
+            let stackable = game.items.get_item_type(usize::from(item.server_id)).stackable;
             let Some(player) = game.get_player_mut(creature_id) else { return false };
-            if player.inventory[slot].is_some() { return false; }
-            player.inventory[slot] = Some(item.server_id);
-            player.inventory_count[slot] = item.count.max(1);
-            // Keep the full item (attributes + any container tree) so its
-            // attributes persist on save.
-            player.inventory_items[slot] = Some(item);
-            true
+            match player.inventory[slot] {
+                None => {
+                    player.inventory[slot] = Some(item.server_id);
+                    player.inventory_count[slot] = item.count.max(1);
+                    // Keep the full item (attributes + any container tree) so its
+                    // attributes persist on save.
+                    player.inventory_items[slot] = Some(item);
+                    true
+                }
+                Some(existing) if stackable && existing == item.server_id => {
+                    let cur = player.inventory_count[slot] as u32;
+                    if cur + item.count.max(1) as u32 <= 100 {
+                        let new = (cur + item.count.max(1) as u32) as u16;
+                        player.inventory_count[slot] = new;
+                        if let Some(ref mut inv) = player.inventory_items[slot] { inv.count = new; }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            }
         }
         MoveEndpoint::Ground { pos, .. } => {
             let has_mailbox = game
