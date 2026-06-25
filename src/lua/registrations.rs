@@ -1125,14 +1125,14 @@ fn register_config_manager_table(lua: &Lua) -> LuaResult<()> {
     tbl.set("getString", lua.create_function(|_, key: i32| -> LuaResult<String> {
         let cfg = g_config();
         let sc = match key {
-            0 => StringConfig::IpString,
-            1 => StringConfig::MapName,
-            2 => StringConfig::HouseRentPeriod,
-            3 => StringConfig::ServerName,
-            4 => StringConfig::OwnerName,
-            5 => StringConfig::OwnerEmail,
-            6 => StringConfig::Url,
-            7 => StringConfig::Location,
+            0 => StringConfig::MapName,
+            1 => StringConfig::HouseRentPeriod,
+            2 => StringConfig::ServerName,
+            3 => StringConfig::OwnerName,
+            4 => StringConfig::OwnerEmail,
+            5 => StringConfig::Url,
+            6 => StringConfig::Location,
+            7 => StringConfig::IpString,
             8 => StringConfig::Motd,
             9 => StringConfig::WorldType,
             10 => StringConfig::MysqlHost,
@@ -1149,43 +1149,48 @@ fn register_config_manager_table(lua: &Lua) -> LuaResult<()> {
     tbl.set("getNumber", lua.create_function(|_, key: i32| -> LuaResult<i32> {
         let cfg = g_config();
         let ic = match key {
-            0 => IntegerConfig::Ip,
-            1 => IntegerConfig::SqlPort,
-            2 => IntegerConfig::MaxPlayers,
-            3 => IntegerConfig::PzLocked,
-            4 => IntegerConfig::DefaultDespawnRange,
-            5 => IntegerConfig::DefaultDespawnRadius,
-            6 => IntegerConfig::DefaultWalkToSpawnRadius,
-            7 => IntegerConfig::RateExperience,
-            8 => IntegerConfig::RateSkill,
-            9 => IntegerConfig::RateLoot,
-            10 => IntegerConfig::RateMagic,
-            11 => IntegerConfig::RateSpawn,
-            12 => IntegerConfig::HousePrice,
-            13 => IntegerConfig::KillsToRed,
-            14 => IntegerConfig::KillsToBlack,
-            15 => IntegerConfig::MaxMessageBuffer,
-            16 => IntegerConfig::ActionsDelayInterval,
-            17 => IntegerConfig::ExActionsDelayInterval,
-            18 => IntegerConfig::KickAfterMinutes,
-            19 => IntegerConfig::ProtectionLevel,
-            20 => IntegerConfig::DeathLosePercent,
-            21 => IntegerConfig::StatusQueryTimeout,
+            0 => IntegerConfig::SqlPort,
+            1 => IntegerConfig::MaxPlayers,
+            2 => IntegerConfig::PzLocked,
+            3 => IntegerConfig::DefaultDespawnRange,
+            4 => IntegerConfig::DefaultDespawnRadius,
+            5 => IntegerConfig::DefaultWalkToSpawnRadius,
+            6 => IntegerConfig::RateExperience,
+            7 => IntegerConfig::RateSkill,
+            8 => IntegerConfig::RateLoot,
+            9 => IntegerConfig::RateMagic,
+            10 => IntegerConfig::RateSpawn,
+            11 => IntegerConfig::HousePrice,
+            12 => IntegerConfig::KillsToRed,
+            13 => IntegerConfig::KillsToBlack,
+            14 => IntegerConfig::MaxMessageBuffer,
+            15 => IntegerConfig::ActionsDelayInterval,
+            16 => IntegerConfig::ExActionsDelayInterval,
+            17 => IntegerConfig::KickAfterMinutes,
+            18 => IntegerConfig::ProtectionLevel,
+            19 => IntegerConfig::DeathLosePercent,
+            20 => IntegerConfig::StatusQueryTimeout,
+            21 => return Ok(0), // STATUS_COUNT_MAX_PLAYERS_PER_IP
             22 => IntegerConfig::FragTime,
             23 => IntegerConfig::WhiteSkullTime,
             24 => IntegerConfig::GamePort,
             25 => IntegerConfig::LoginPort,
             26 => IntegerConfig::StatusPort,
             27 => IntegerConfig::StairhopDelay,
-            28 => IntegerConfig::ExpFromPlayersLevelRange,
-            29 => IntegerConfig::MaxPacketsPerSecond,
-            30 => IntegerConfig::ServerSaveNotifyDuration,
-            31 => IntegerConfig::YellMinimumLevel,
-            32 => IntegerConfig::MinimumLevelToSendPrivate,
-            33 => IntegerConfig::VipFreeLimit,
-            34 => IntegerConfig::VipPremiumLimit,
-            35 => IntegerConfig::DepotFreeLimit,
-            36 => IntegerConfig::DepotPremiumLimit,
+            28 => return Ok(30 * 24 * 60 * 60), // MARKET_OFFER_DURATION (30 days in seconds)
+            29 => return Ok(60), // CHECK_EXPIRED_MARKET_OFFERS_EACH_MINUTES
+            30 => return Ok(100), // MAX_MARKET_OFFERS_AT_A_TIME_PER_PLAYER
+            31 => IntegerConfig::ExpFromPlayersLevelRange,
+            32 => IntegerConfig::MaxPacketsPerSecond,
+            33 => IntegerConfig::ServerSaveNotifyDuration,
+            34 => IntegerConfig::YellMinimumLevel,
+            35 => IntegerConfig::MinimumLevelToSendPrivate,
+            36 => IntegerConfig::VipFreeLimit,
+            37 => IntegerConfig::VipPremiumLimit,
+            38 => IntegerConfig::DepotFreeLimit,
+            39 => IntegerConfig::DepotPremiumLimit,
+            40 => return Ok(3 * 60), // STAMINA_REGEN_MINUTE (timeToRegenMinuteStamina default)
+            41 => return Ok(10 * 60), // STAMINA_REGEN_PREMIUM (timeToRegenMinutePremiumStamina default)
             _ => return Ok(0),
         };
         Ok(cfg.get_number(ic))
@@ -1200,14 +1205,14 @@ fn register_config_manager_table(lua: &Lua) -> LuaResult<()> {
             4 => BooleanConfig::RemoveWeaponAmmo,
             5 => BooleanConfig::RemoveWeaponCharges,
             6 => BooleanConfig::RemovePotionCharges,
-            7 => BooleanConfig::PzLockSkullAttacker,
-            8 => BooleanConfig::ExperienceFromPlayers,
-            9 => BooleanConfig::FreePremium,
-            10 => BooleanConfig::ReplaceKickOnLogin,
-            11 => BooleanConfig::AllowClones,
-            12 => BooleanConfig::AllowWalkthrough,
-            13 => BooleanConfig::BindOnlyGlobalAddress,
-            14 => BooleanConfig::OptimizeDatabase,
+            7 => BooleanConfig::ExperienceFromPlayers,
+            8 => BooleanConfig::FreePremium,
+            9 => BooleanConfig::ReplaceKickOnLogin,
+            10 => BooleanConfig::AllowClones,
+            11 => BooleanConfig::AllowWalkthrough,
+            12 => BooleanConfig::BindOnlyGlobalAddress,
+            13 => BooleanConfig::OptimizeDatabase,
+            14 => return Ok(true), // MARKET_PREMIUM
             15 => BooleanConfig::EmoteSpells,
             16 => BooleanConfig::StaminaSystem,
             17 => BooleanConfig::WarnUnsafeScripts,
@@ -1225,12 +1230,11 @@ fn register_config_manager_table(lua: &Lua) -> LuaResult<()> {
             29 => BooleanConfig::ForceMonsterTypeLoad,
             30 => BooleanConfig::DefaultWorldLight,
             31 => BooleanConfig::HouseOwnedByAccount,
-            32 => BooleanConfig::LuaItemDesc,
-            33 => BooleanConfig::CleanProtectionZones,
-            34 => BooleanConfig::HouseDoorShowPrice,
-            35 => BooleanConfig::OnlyInvitedCanMoveHouseItems,
-            36 => BooleanConfig::RemoveOnDespawn,
-            37 => BooleanConfig::PlayerConsoleLogs,
+            32 => BooleanConfig::CleanProtectionZones,
+            33 => BooleanConfig::HouseDoorShowPrice,
+            34 => BooleanConfig::OnlyInvitedCanMoveHouseItems,
+            35 => BooleanConfig::RemoveOnDespawn,
+            36 => BooleanConfig::PlayerConsoleLogs,
             _ => return Ok(false),
         };
         Ok(cfg.get_boolean(bc))
@@ -1453,6 +1457,13 @@ fn register_enums(lua: &Lua) -> LuaResult<()> {
     e!("CONDITION_DAZZLED", 2097152); e!("CONDITION_CURSED", 4194304);
     e!("CONDITION_EXHAUST_COMBAT", 8388608); e!("CONDITION_EXHAUST_HEAL", 16777216);
     e!("CONDITION_PACIFIED", 33554432);
+    e!("CONDITION_SPELLCOOLDOWN", 1 << 26);
+    e!("CONDITION_SPELLGROUPCOOLDOWN", 1 << 27);
+    e!("CONDITION_ROOT", 1 << 28);
+
+    // STAT
+    e!("STAT_MAXHITPOINTS", 0); e!("STAT_MAXMANAPOINTS", 1);
+    e!("STAT_SOULPOINTS", 2); e!("STAT_MAGICPOINTS", 3);
 
     // CONDITIONID
     e!("CONDITIONID_DEFAULT", -1); e!("CONDITIONID_COMBAT", 0);
@@ -1609,6 +1620,11 @@ fn register_enums(lua: &Lua) -> LuaResult<()> {
     e!("CREATURETYPE_PLAYER", 0); e!("CREATURETYPE_MONSTER", 1);
     e!("CREATURETYPE_NPC", 2); e!("CREATURETYPE_SUMMON_OWN", 3);
     e!("CREATURETYPE_SUMMON_OTHERS", 4);
+
+    // SPEECHBUBBLE
+    e!("SPEECHBUBBLE_NONE", 0); e!("SPEECHBUBBLE_NORMAL", 1);
+    e!("SPEECHBUBBLE_TRADE", 2); e!("SPEECHBUBBLE_QUEST", 3);
+    e!("SPEECHBUBBLE_QUESTTRADER", 4);
 
     // CLIENTOS
     e!("CLIENTOS_NONE", 0); e!("CLIENTOS_LINUX", 1);
@@ -2002,45 +2018,59 @@ fn register_config_keys(lua: &Lua) -> LuaResult<()> {
     let tbl = lua.create_table()?;
     macro_rules! ck { ($name:expr, $val:expr) => { tbl.set($name, $val as i64)?; }; }
 
-    // BooleanConfig (0-based)
+    // BooleanConfig (0-based, matches 10.98 configmanager.h boolean_config_t)
     ck!("ALLOW_CHANGEOUTFIT", 0); ck!("ONE_PLAYER_ON_ACCOUNT", 1);
     ck!("AIMBOT_HOTKEY_ENABLED", 2); ck!("REMOVE_RUNE_CHARGES", 3);
     ck!("REMOVE_WEAPON_AMMO", 4); ck!("REMOVE_WEAPON_CHARGES", 5);
-    ck!("REMOVE_POTION_CHARGES", 6); ck!("PZLOCK_SKULL_ATTACKER", 7);
-    ck!("EXPERIENCE_FROM_PLAYERS", 8); ck!("FREE_PREMIUM", 9);
-    ck!("REPLACE_KICK_ON_LOGIN", 10); ck!("ALLOW_CLONES", 11);
-    ck!("BIND_ONLY_GLOBAL_ADDRESS", 13); ck!("OPTIMIZE_DATABASE", 14);
+    ck!("REMOVE_POTION_CHARGES", 6);
+    ck!("EXPERIENCE_FROM_PLAYERS", 7); ck!("FREE_PREMIUM", 8);
+    ck!("REPLACE_KICK_ON_LOGIN", 9); ck!("ALLOW_CLONES", 10);
+    ck!("ALLOW_WALKTHROUGH", 11); ck!("BIND_ONLY_GLOBAL_ADDRESS", 12);
+    ck!("OPTIMIZE_DATABASE", 13); ck!("MARKET_PREMIUM", 14);
     ck!("EMOTE_SPELLS", 15); ck!("STAMINA_SYSTEM", 16);
     ck!("WARN_UNSAFE_SCRIPTS", 17); ck!("CONVERT_UNSAFE_SCRIPTS", 18);
     ck!("CLASSIC_EQUIPMENT_SLOTS", 19); ck!("CLASSIC_ATTACK_SPEED", 20);
+    ck!("SCRIPTS_CONSOLE_LOGS", 21);
     ck!("SERVER_SAVE_NOTIFY_MESSAGE", 22); ck!("SERVER_SAVE_CLEAN_MAP", 23);
     ck!("SERVER_SAVE_CLOSE", 24); ck!("SERVER_SAVE_SHUTDOWN", 25);
-    ck!("ONLINE_OFFLINE_CHARLIST", 26); ck!("LUA_ITEM_DESC", 32);
-    ck!("PLAYER_CONSOLE_LOGS", 37);
+    ck!("ONLINE_OFFLINE_CHARLIST", 26); ck!("YELL_ALLOW_PREMIUM", 27);
+    ck!("PREMIUM_TO_SEND_PRIVATE", 28); ck!("FORCE_MONSTERTYPE_LOAD", 29);
+    ck!("DEFAULT_WORLD_LIGHT", 30); ck!("HOUSE_OWNED_BY_ACCOUNT", 31);
+    ck!("CLEAN_PROTECTION_ZONES", 32); ck!("HOUSE_DOOR_SHOW_PRICE", 33);
+    ck!("ONLY_INVITED_CAN_MOVE_HOUSE_ITEMS", 34); ck!("REMOVE_ON_DESPAWN", 35);
+    ck!("PLAYER_CONSOLE_LOGS", 36); ck!("CHECK_DUPLICATE_STORAGE_KEYS", 37);
+    ck!("MONSTER_OVERSPAWN", 38);
 
-    // StringConfig (0-based)
-    ck!("MAP_NAME", 1); ck!("HOUSE_RENT_PERIOD", 2); ck!("SERVER_NAME", 3);
-    ck!("OWNER_NAME", 4); ck!("OWNER_EMAIL", 5); ck!("URL", 6);
-    ck!("LOCATION", 7); ck!("MOTD", 8); ck!("WORLD_TYPE", 9);
+    // StringConfig (0-based, matches 10.98 configmanager.h string_config_t)
+    ck!("MAP_NAME", 0); ck!("HOUSE_RENT_PERIOD", 1); ck!("SERVER_NAME", 2);
+    ck!("OWNER_NAME", 3); ck!("OWNER_EMAIL", 4); ck!("URL", 5);
+    ck!("LOCATION", 6); ck!("IP", 7); ck!("MOTD", 8); ck!("WORLD_TYPE", 9);
     ck!("MYSQL_HOST", 10); ck!("MYSQL_USER", 11); ck!("MYSQL_PASS", 12);
     ck!("MYSQL_DB", 13); ck!("MYSQL_SOCK", 14); ck!("DEFAULT_PRIORITY", 15);
     ck!("MAP_AUTHOR", 16);
 
-    // IntegerConfig (0-based) — IP conflicts with StringConfig so we use the int value
-    ck!("SQL_PORT", 1); ck!("MAX_PLAYERS", 2); ck!("PZ_LOCKED", 3);
-    ck!("DEFAULT_DESPAWNRANGE", 4); ck!("DEFAULT_DESPAWNRADIUS", 5);
-    ck!("DEFAULT_WALKTOSPAWNRADIUS", 6); ck!("REMOVE_ON_DESPAWN", 7);
-    ck!("RATE_EXPERIENCE", 7); ck!("RATE_SKILL", 8); ck!("RATE_LOOT", 9);
-    ck!("RATE_MAGIC", 10); ck!("RATE_SPAWN", 11); ck!("HOUSE_PRICE", 12);
-    ck!("KILLS_TO_RED", 13); ck!("KILLS_TO_BLACK", 14);
-    ck!("MAX_MESSAGEBUFFER", 15); ck!("ACTIONS_DELAY_INTERVAL", 16);
-    ck!("EX_ACTIONS_DELAY_INTERVAL", 17); ck!("KICK_AFTER_MINUTES", 18);
-    ck!("PROTECTION_LEVEL", 19); ck!("DEATH_LOSE_PERCENT", 20);
-    ck!("STATUSQUERY_TIMEOUT", 21); ck!("FRAG_TIME", 22);
-    ck!("WHITE_SKULL_TIME", 23); ck!("GAME_PORT", 24);
-    ck!("LOGIN_PORT", 25); ck!("STATUS_PORT", 26); ck!("STAIRHOP_DELAY", 27);
-    ck!("EXP_FROM_PLAYERS_LEVEL_RANGE", 28); ck!("MAX_PACKETS_PER_SECOND", 29);
-    ck!("SERVER_SAVE_NOTIFY_DURATION", 30);
+    // IntegerConfig (0-based, matches 10.98 configmanager.h integer_config_t)
+    ck!("SQL_PORT", 0); ck!("MAX_PLAYERS", 1); ck!("PZ_LOCKED", 2);
+    ck!("DEFAULT_DESPAWNRANGE", 3); ck!("DEFAULT_DESPAWNRADIUS", 4);
+    ck!("DEFAULT_WALKTOSPAWNRADIUS", 5);
+    ck!("RATE_EXPERIENCE", 6); ck!("RATE_SKILL", 7); ck!("RATE_LOOT", 8);
+    ck!("RATE_MAGIC", 9); ck!("RATE_SPAWN", 10); ck!("HOUSE_PRICE", 11);
+    ck!("KILLS_TO_RED", 12); ck!("KILLS_TO_BLACK", 13);
+    ck!("MAX_MESSAGEBUFFER", 14); ck!("ACTIONS_DELAY_INTERVAL", 15);
+    ck!("EX_ACTIONS_DELAY_INTERVAL", 16); ck!("KICK_AFTER_MINUTES", 17);
+    ck!("PROTECTION_LEVEL", 18); ck!("DEATH_LOSE_PERCENT", 19);
+    ck!("STATUSQUERY_TIMEOUT", 20); ck!("STATUS_COUNT_MAX_PLAYERS_PER_IP", 21);
+    ck!("FRAG_TIME", 22); ck!("WHITE_SKULL_TIME", 23);
+    ck!("GAME_PORT", 24); ck!("LOGIN_PORT", 25); ck!("STATUS_PORT", 26);
+    ck!("STAIRHOP_DELAY", 27); ck!("MARKET_OFFER_DURATION", 28);
+    ck!("CHECK_EXPIRED_MARKET_OFFERS_EACH_MINUTES", 29);
+    ck!("MAX_MARKET_OFFERS_AT_A_TIME_PER_PLAYER", 30);
+    ck!("EXP_FROM_PLAYERS_LEVEL_RANGE", 31); ck!("MAX_PACKETS_PER_SECOND", 32);
+    ck!("SERVER_SAVE_NOTIFY_DURATION", 33);
+    ck!("YELL_MINIMUM_LEVEL", 34); ck!("MINIMUM_LEVEL_TO_SEND_PRIVATE", 35);
+    ck!("VIP_FREE_LIMIT", 36); ck!("VIP_PREMIUM_LIMIT", 37);
+    ck!("DEPOT_FREE_LIMIT", 38); ck!("DEPOT_PREMIUM_LIMIT", 39);
+    ck!("STAMINA_REGEN_MINUTE", 40); ck!("STAMINA_REGEN_PREMIUM", 41);
 
     lua.globals().set("configKeys", tbl)?;
     Ok(())
@@ -2497,6 +2527,21 @@ fn register_game_class(lua: &Lua) -> LuaResult<()> {
 
     tbl.set("saveAccountStorageValues", lua.create_function(|_, ()| -> LuaResult<bool> {
         Ok(true)
+    })?)?;
+
+    tbl.set("getMounts", lua.create_function(|lua, ()| -> LuaResult<LuaTable> {
+        let result = lua.create_table()?;
+        let mounts = crate::world::mounts::g_mounts();
+        for (i, m) in mounts.iter().enumerate() {
+            let entry = lua.create_table()?;
+            entry.set("name", m.name.as_str())?;
+            entry.set("speed", m.speed as i64)?;
+            entry.set("clientId", m.client_id as i64)?;
+            entry.set("id", m.id as i64)?;
+            entry.set("premium", m.premium)?;
+            result.raw_set(i as i64 + 1, entry)?;
+        }
+        Ok(result)
     })?)?;
 
     Ok(())
@@ -4823,6 +4868,25 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
         }
     })?)?;
 
+    methods.set("getStorageValue", lua.create_function(|_, (this, key): (LuaTable, u32)| -> LuaResult<i32> {
+        let cid = get_creature_id(&this)?;
+        let game = g_game().lock().unwrap();
+        Ok(game.get_player(cid).and_then(|p| p.storage_map.get(&key).copied()).unwrap_or(-1))
+    })?)?;
+
+    methods.set("setStorageValue", lua.create_function(|_, (this, key, value): (LuaTable, u32, i32)| -> LuaResult<()> {
+        let cid = get_creature_id(&this)?;
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(cid) {
+            if value == -1 {
+                player.storage_map.remove(&key);
+            } else {
+                player.storage_map.insert(key, value);
+            }
+        }
+        Ok(())
+    })?)?;
+
     Ok(())
 }
 
@@ -4890,6 +4954,32 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
         let cid = get_creature_id(&this)?;
         let game = g_game().lock().unwrap();
         Ok(game.get_player(cid).map(|p| p.last_logout).unwrap_or(0))
+    })?)?;
+
+    methods.set("setClientExpDisplay", lua.create_function(|_, (_this, _rate): (LuaTable, i64)| -> LuaResult<()> {
+        Ok(())
+    })?)?;
+    methods.set("setClientStaminaBonusDisplay", lua.create_function(|_, (_this, _bonus): (LuaTable, i64)| -> LuaResult<()> {
+        Ok(())
+    })?)?;
+    methods.set("setClientLowLevelBonusDisplay", lua.create_function(|_, (_this, _bonus): (LuaTable, i64)| -> LuaResult<()> {
+        Ok(())
+    })?)?;
+
+    methods.set("getOfflineTrainingSkill", lua.create_function(|_, _this: LuaTable| -> LuaResult<i32> {
+        Ok(-1)
+    })?)?;
+
+    methods.set("setOfflineTrainingSkill", lua.create_function(|_, (_this, _skill): (LuaTable, i32)| -> LuaResult<()> {
+        Ok(())
+    })?)?;
+
+    methods.set("addOfflineTrainingTime", lua.create_function(|_, (_this, _time): (LuaTable, i64)| -> LuaResult<()> {
+        Ok(())
+    })?)?;
+
+    methods.set("getOfflineTrainingTime", lua.create_function(|_, _this: LuaTable| -> LuaResult<i64> {
+        Ok(0)
     })?)?;
 
     methods.set("getAccountType", lua.create_function(|_, this: LuaTable| -> LuaResult<u8> {
@@ -9566,10 +9656,11 @@ fn register_creature_event_class(lua: &Lua) -> LuaResult<()> {
             "death" => 5,
             "kill" => 6,
             "advance" => 7,
-            "textedit" => 8,
-            "healthchange" => 9,
-            "manachange" => 10,
-            "extendedopcode" => 11,
+            "modalwindow" => 8,
+            "textedit" => 9,
+            "healthchange" => 10,
+            "manachange" => 11,
+            "extendedopcode" => 12,
             other => {
                 tracing::error!("[Error - CreatureEvent::configureLuaEvent] Invalid type for creature event: {other}");
                 0
@@ -9592,10 +9683,11 @@ fn register_creature_event_class(lua: &Lua) -> LuaResult<()> {
             5 => "onDeath",
             6 => "onKill",
             7 => "onAdvance",
-            8 => "onTextEdit",
-            9 => "onHealthChange",
-            10 => "onManaChange",
-            11 => "onExtendedOpcode",
+            8 => "onModalWindow",
+            9 => "onTextEdit",
+            10 => "onHealthChange",
+            11 => "onManaChange",
+            12 => "onExtendedOpcode",
             _ => {
                 tracing::warn!("[Warning - CreatureEvent::register] unknown event type {event_type_i} for '{name}'");
                 return Ok(false);
@@ -9645,8 +9737,8 @@ fn register_creature_event_class(lua: &Lua) -> LuaResult<()> {
 
     for cb_name in &[
         "onLogin", "onLogout", "onThink", "onPrepareDeath",
-        "onDeath", "onKill", "onAdvance", "onTextEdit",
-        "onHealthChange", "onManaChange", "onExtendedOpcode",
+        "onDeath", "onKill", "onAdvance", "onModalWindow",
+        "onTextEdit", "onHealthChange", "onManaChange", "onExtendedOpcode",
     ] {
         let field_name = cb_name.to_string();
         methods.set(*cb_name, lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<LuaTable> {

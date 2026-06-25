@@ -207,6 +207,15 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
         crate::world::outfit::init_outfits(crate::world::outfit::Outfits::default());
     }
 
+    // Load mounts.
+    let mount_path = first_existing(&["data/XML/mounts.xml", "data/mounts.xml"]);
+    if let Some(mount_path) = mount_path {
+        match crate::world::mounts::Mounts::load_from_xml(mount_path) {
+            Ok(mounts) => crate::world::mounts::init_mounts(mounts),
+            Err(e) => tracing::warn!("Mounts::load_from_xml failed: {e}"),
+        }
+    }
+
     // Load map from OTBM.
     println!(">> Loading map");
     let map_name = g_config().get_string(StringConfig::MapName);

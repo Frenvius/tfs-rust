@@ -1,9 +1,20 @@
 use std::path::Path;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::util::xml::{self, XmlLoadError};
+
+static G_MOUNTS: OnceLock<Mounts> = OnceLock::new();
+
+pub fn init_mounts(m: Mounts) {
+    G_MOUNTS.set(m).ok();
+}
+
+pub fn g_mounts() -> &'static [Mount] {
+    G_MOUNTS.get().map(|m| m.get_mounts()).unwrap_or(&[])
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {

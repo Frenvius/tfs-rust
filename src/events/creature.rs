@@ -20,10 +20,11 @@ pub enum CreatureEventType {
     Death = 5,
     Kill = 6,
     Advance = 7,
-    TextEdit = 8,
-    HealthChange = 9,
-    ManaChange = 10,
-    ExtendedOpcode = 11,
+    ModalWindow = 8,
+    TextEdit = 9,
+    HealthChange = 10,
+    ManaChange = 11,
+    ExtendedOpcode = 12,
 }
 
 impl CreatureEventType {
@@ -38,6 +39,7 @@ impl CreatureEventType {
             "death" => Some(Self::Death),
             "kill" => Some(Self::Kill),
             "advance" => Some(Self::Advance),
+            "modalwindow" => Some(Self::ModalWindow),
             "textedit" => Some(Self::TextEdit),
             "healthchange" => Some(Self::HealthChange),
             "manachange" => Some(Self::ManaChange),
@@ -56,6 +58,7 @@ impl CreatureEventType {
             Self::Death => "onDeath",
             Self::Kill => "onKill",
             Self::Advance => "onAdvance",
+            Self::ModalWindow => "onModalWindow",
             Self::TextEdit => "onTextEdit",
             Self::HealthChange => "onHealthChange",
             Self::ManaChange => "onManaChange",
