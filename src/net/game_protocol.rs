@@ -946,7 +946,6 @@ impl ProtocolGame {
         let opcode = msg.get_byte();
         match opcode {
             0x14 => {
-                self.accept_packets = false;
                 dispatch(move || game_handle_logout(cid));
             }
             0x1D | 0x1E => dispatch(move || game_handle_ping_back(cid)),
@@ -1210,13 +1209,61 @@ fn game_handle_ping_back(creature_id: CreatureId) {
 }
 
 fn game_handle_logout(creature_id: CreatureId) {
-    if creature_id != 0 {
-        perform_player_logout(creature_id);
+    if creature_id == 0 {
+        return;
     }
-    let sessions = player_sessions().lock().unwrap();
-    if let Some(session) = sessions.get(&creature_id) {
-        session.conn.disconnect();
+
+    {
+        let game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player(creature_id) {
+            if !player.is_access_player() {
+                let pos = player.base.position;
+                if let Some(tile) = game.map.get_tile(pos) {
+                    if tile.has_flag(crate::map::tile::TILESTATE_NOLOGOUT) {
+                        drop(game);
+                        send_status_message_to_player(creature_id, "You can not logout here.");
+                        return;
+                    }
+                    if !tile.has_flag(crate::map::tile::TILESTATE_PROTECTIONZONE)
+                        && player.base.has_condition(crate::combat::condition::ConditionType::InFight)
+                    {
+                        drop(game);
+                        send_status_message_to_player(
+                            creature_id,
+                            "You may not logout during or immediately after a fight!",
+                        );
+                        return;
+                    }
+                }
+            }
+        }
     }
+
+    if !crate::events::dispatch::execute_creature_event_logout(creature_id) {
+        return;
+    }
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player(creature_id) {
+            let hp = player.base.health;
+            let ghost = player.is_ghost_mode;
+            let pos = player.base.position;
+            if hp > 0 && !ghost {
+                game.add_magic_effect(pos, crate::game::CONST_ME_POFF);
+            }
+        }
+    }
+
+    let conn = {
+        let sessions = player_sessions().lock().unwrap();
+        sessions.get(&creature_id).map(|s| s.conn.clone())
+    };
+    if let Some(conn) = &conn {
+        conn.disconnect();
+    }
+
+    perform_player_logout(creature_id);
 }
 
 fn game_handle_walk(creature_id: CreatureId, dir: Direction) {
@@ -3573,7 +3620,6 @@ fn perform_player_logout(creature_id: u32) {
         broadcast_creature_disappear(creature_id, pos, stackpos as u8);
     }
 
-    crate::events::dispatch::execute_creature_event_logout(creature_id);
     if !name.is_empty() && g_config().get_boolean(BooleanConfig::PlayerConsoleLogs) {
         println!("> {} has logged out.", name);
     }
