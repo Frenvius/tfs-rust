@@ -2255,7 +2255,7 @@ fn register_game_class(lua: &Lua) -> LuaResult<()> {
         let game = g_game().lock().unwrap();
         let currency_items = game.items.get_currency_items();
         let mut i = 1i64;
-        for (_, &item_id) in currency_items.iter() {
+        for (_, &item_id) in currency_items.iter().rev() {
             let t = lua.create_table()?;
             t.raw_set(1, item_id)?;
             if let Ok(mt) = lua.named_registry_value::<LuaTable>("ItemType") {

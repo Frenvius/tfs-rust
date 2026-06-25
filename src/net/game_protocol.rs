@@ -3872,7 +3872,7 @@ impl MoveEndpoint {
 
 /// Where an open container's backing item ultimately lives.
 #[derive(Debug, Clone)]
-enum StorageRoot {
+pub(crate) enum StorageRoot {
     TileItem(Position, usize),
     InvItem(usize),
     /// Depot chest contents (`Player.depot_items[depot_id]`) — a Vec root with
@@ -3883,7 +3883,7 @@ enum StorageRoot {
 /// Resolve an open container `cid` to its storage root, the child-index path
 /// from that root item down to the container item, and its scroll offset.
 /// Mirrors walking the `ContainerParent` chain in C++.
-fn resolve_container_storage(
+pub(crate) fn resolve_container_storage(
     player: &Player,
     cid: u8,
 ) -> Option<(StorageRoot, Vec<usize>, u16)> {
@@ -3981,7 +3981,7 @@ pub(crate) fn lua_remove_inventory_item(owner_cid: u32, pos: Position, count: i3
 }
 
 /// Shared access to the container item identified by `(root, path)`.
-fn container_item_ref<'a>(
+pub(crate) fn container_item_ref<'a>(
     game: &'a crate::game::Game,
     creature_id: CreatureId,
     root: &StorageRoot,

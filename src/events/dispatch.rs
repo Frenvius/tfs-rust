@@ -28,6 +28,10 @@ fn push_player(lua: &Lua, creature_id: CreatureId) -> LuaResult<LuaTable> {
 }
 
 fn push_item(lua: &Lua, server_id: u16, pos: Position, index: i32) -> LuaResult<LuaTable> {
+    push_item_for(lua, server_id, pos, index, 0)
+}
+
+fn push_item_for(lua: &Lua, server_id: u16, pos: Position, index: i32, owner_cid: u32) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
     t.raw_set(1, server_id as i64)?;
     t.raw_set("itemid", server_id as i64)?;
@@ -37,13 +41,40 @@ fn push_item(lua: &Lua, server_id: u16, pos: Position, index: i32) -> LuaResult<
     t.raw_set("_idx", index)?;
 
     let game = g_game().lock().unwrap();
-    if let Some(tile) = game.map.get_tile(pos) {
+    if pos.x == 0xFFFF && owner_cid != 0 {
+        if pos.y & 0x40 != 0 {
+            let cid = (pos.y & 0x0F) as u8;
+            let child_idx = usize::from(pos.z);
+            if let Some(player) = game.get_player(owner_cid) {
+                if let Some((root, path, _)) = crate::net::game_protocol::resolve_container_storage(player, cid) {
+                    if let Some(container) = crate::net::game_protocol::container_item_ref(&game, owner_cid, &root, &path) {
+                        if let Some(child) = container.children.get(child_idx) {
+                            t.raw_set("type", child.count as i64)?;
+                            t.raw_set("_count", child.count as i64)?;
+                            if child.unique_id != 0 { t.raw_set("uid", child.unique_id as i64)?; }
+                            if child.action_id > 0 { t.raw_set("actionid", child.action_id as i64)?; }
+                        }
+                    }
+                }
+            }
+        } else {
+            let slot = usize::from(pos.y);
+            if let Some(player) = game.get_player(owner_cid) {
+                if let Some(item) = player.inventory_items.get(slot).and_then(|o| o.as_ref()) {
+                    t.raw_set("type", item.count as i64)?;
+                    t.raw_set("_count", item.count as i64)?;
+                }
+            }
+        }
+    } else if let Some(tile) = game.map.get_tile(pos) {
         let item = if index == -1 {
             tile.ground.as_ref()
         } else {
             tile.items.get(index as usize)
         };
         if let Some(item) = item {
+            t.raw_set("type", item.count as i64)?;
+            t.raw_set("_count", item.count as i64)?;
             t.raw_set("uid", item.unique_id as i64)?;
             if item.action_id > 0 {
                 t.raw_set("actionid", item.action_id as i64)?;
@@ -100,10 +131,10 @@ pub fn execute_action_use(
         };
 
         let player_tbl = push_player(lua, player_id)?;
-        let item_tbl = push_item(lua, item_server_id, item_pos, item_index)?;
+        let item_tbl = push_item_for(lua, item_server_id, item_pos, item_index, player_id)?;
         item_tbl.raw_set("_owner_cid", player_id)?;
         let from_pos_tbl = push_position(lua, item_pos)?;
-        let target_tbl = push_item(lua, item_server_id, item_pos, item_index)?;
+        let target_tbl = push_item_for(lua, item_server_id, item_pos, item_index, player_id)?;
         target_tbl.raw_set("_owner_cid", player_id)?;
         let to_pos_tbl = push_position(lua, item_pos)?;
 
@@ -165,7 +196,8 @@ pub fn execute_action_use_ex(
         };
 
         let player_tbl = push_player(lua, player_id)?;
-        let item_tbl = push_item(lua, item_server_id, from_pos, item_index)?;
+        let item_tbl = push_item_for(lua, item_server_id, from_pos, item_index, player_id)?;
+        item_tbl.raw_set("_owner_cid", player_id)?;
         let from_pos_tbl = push_position(lua, from_pos)?;
 
         let game = g_game().lock().unwrap();
