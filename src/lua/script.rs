@@ -782,29 +782,38 @@ pub fn init_npc_script_interface() {
     G_NPC_IFACE.set(Mutex::new(iface)).ok();
 }
 
-/// Load the script for a single NPC type by name and store the event IDs back
-/// into `g_npcs()`.  Called once per NPC type that has a `script` attribute.
+/// Load a per-NPC-instance script, mirroring C++ `NpcEventsHandler` which gives
+/// every NPC its own freshly-loaded copy of the script.  The NPC id is set as
+/// the active script NPC during the load so `getNpcParameter` resolves the
+/// instance's `<parameters>` while modules (shop, focus, …) parse them.
 ///
-/// Safe to call after `init_npc_script_interface`.
-pub fn load_npc_type_script(type_name: &str, script_file: &str) -> (i32, i32, i32, i32, i32, i32, i32) {
+/// Each load captures a distinct set of event closures (the script's globals
+/// are re-bound to a fresh `npcHandler` per load), so instance state does not
+/// bleed across NPCs even though one shared Lua state is used.
+pub fn load_npc_instance_script(npc_id: u32, script_file: &str) -> (i32, i32, i32, i32, i32, i32, i32) {
     let iface_lock = match G_NPC_IFACE.get() {
         Some(l) => l,
         None => return (-1, -1, -1, -1, -1, -1, -1),
     };
     let mut iface = iface_lock.lock().expect("NPC iface lock poisoned");
     let path = format!("data/npc/scripts/{}", script_file);
-    if let Err(e) = iface.load_file(&path) {
-        tracing::warn!("[NPC] Cannot load script for '{}' ({}): {}", type_name, script_file, e);
-        return (-1, -1, -1, -1, -1, -1, -1);
-    }
-    let say = iface.get_event("onCreatureSay");
-    let think = iface.get_event("onThink");
-    let appear = iface.get_event("onCreatureAppear");
-    let disappear = iface.get_event("onCreatureDisappear");
-    let close_ch = iface.get_event("onPlayerCloseChannel");
-    let end_trade = iface.get_event("onPlayerEndTrade");
-    let creature_move = iface.get_event("onCreatureMove");
-    (say, think, appear, disappear, close_ch, end_trade, creature_move)
+    set_current_npc(npc_id);
+    let load_result = iface.load_file(&path);
+    let events = if let Err(e) = load_result {
+        tracing::warn!("[NPC] Cannot load instance script ({}): {}", script_file, e);
+        (-1, -1, -1, -1, -1, -1, -1)
+    } else {
+        let say = iface.get_event("onCreatureSay");
+        let think = iface.get_event("onThink");
+        let appear = iface.get_event("onCreatureAppear");
+        let disappear = iface.get_event("onCreatureDisappear");
+        let close_ch = iface.get_event("onPlayerCloseChannel");
+        let end_trade = iface.get_event("onPlayerEndTrade");
+        let creature_move = iface.get_event("onCreatureMove");
+        (say, think, appear, disappear, close_ch, end_trade, creature_move)
+    };
+    set_current_npc(0);
+    events
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,30 +1031,11 @@ impl ScriptingManager {
             tracing::warn!("[ScriptingManager] Warning: some monster scripts failed to load");
         }
 
-        // 7. Initialize NPC script interface and load per-NPC scripts.
+        // 7. Initialize the NPC script interface (loads data/npc/lib/npc.lua).
+        // Per-NPC scripts are loaded per-instance at spawn time, mirroring C++
+        // `NpcEventsHandler`, so each NPC parses its own `<parameters>`.
         tracing::debug!(">> Loading npc scripts");
         init_npc_script_interface();
-        {
-            let type_names: Vec<(String, String)> = {
-                let npcs = crate::creatures::npc::g_npcs();
-                npcs.npc_types.iter()
-                    .filter(|(_, nt)| !nt.script_file.is_empty())
-                    .map(|(k, nt)| (k.clone(), nt.script_file.clone()))
-                    .collect()
-            };
-            // Load scripts once per type (NPC types are immutable after init).
-            // We store event IDs inside a thread-safe replacement of the OnceLock:
-            // Since g_npcs() returns &'static, we can't mutate it directly.
-            // Instead store results in a temporary map and pass to a one-time setter.
-            #[allow(clippy::type_complexity)]
-            let mut results: Vec<(String, i32, i32, i32, i32, i32, i32, i32)> = Vec::new();
-            for (type_name, script_file) in type_names {
-                let (say, think, appear, disappear, close_ch, end_trade, creature_move) =
-                    load_npc_type_script(&type_name, &script_file);
-                results.push((type_name, say, think, appear, disappear, close_ch, end_trade, creature_move));
-            }
-            crate::creatures::npc::apply_npc_script_events(results);
-        }
 
         Ok(())
     }

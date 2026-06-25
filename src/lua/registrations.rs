@@ -19,6 +19,21 @@ fn get_creature_id(t: &LuaTable) -> LuaResult<CreatureId> {
     t.raw_get::<u32>(1)
 }
 
+/// Build a MapItem (with nested container children) from a Lua item table as
+/// produced by Game.createItem / Container:addItem (`[1]`=server id, `_count`,
+/// `_children`).  Used to feed item trees into the inventory add path.
+fn table_to_map_item(t: &LuaTable) -> crate::map::tile::MapItem {
+    let server_id: u16 = t.raw_get(1).unwrap_or(0);
+    let count: u16 = t.raw_get::<u16>("_count").unwrap_or(1).max(1);
+    let mut mi = crate::map::tile::MapItem { server_id, count, ..Default::default() };
+    if let Ok(Some(children)) = t.raw_get::<Option<LuaTable>>("_children") {
+        for ch in children.sequence_values::<LuaTable>().flatten() {
+            mi.children.push(table_to_map_item(&ch));
+        }
+    }
+    mi
+}
+
 
 static NEXT_AREA_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 type AreaMap = std::sync::Mutex<std::collections::HashMap<u32, Vec<(i8, i8)>>>;
@@ -764,8 +779,8 @@ fn register_legacy_globals(lua: &Lua) -> LuaResult<()> {
         Ok(timer_id as i64)
     })?)?;
 
-    g.set("stopEvent", lua.create_function(|lua, id: i64| -> LuaResult<bool> {
-        let timer_id = id as u32;
+    g.set("stopEvent", lua.create_function(|lua, id: Option<i64>| -> LuaResult<bool> {
+        let timer_id = id.unwrap_or(0) as u32;
         let event = {
             let mut events = lua_timer_events().lock().unwrap();
             events.remove(&timer_id)
@@ -5628,7 +5643,6 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
         }
     })?)?;
     methods.set("addItemEx", lua.create_function(|_, args: LuaMultiValue| -> LuaResult<u32> {
-        use crate::creatures::player::{CONST_SLOT_FIRST, CONST_SLOT_LAST};
         const RETURNVALUE_NOERROR: u32 = 0;
         const RETURNVALUE_NOTENOUGHROOM: u32 = 8;
         let mut iter = args.into_iter();
@@ -5637,139 +5651,36 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
         let item_tbl = match iter.next() { Some(LuaValue::Table(t)) => t, _ => return Ok(1) };
         let server_id: u16 = item_tbl.raw_get::<u16>(1).unwrap_or(0);
         if server_id == 0 { return Ok(1); }
-        let pos_x: u16 = item_tbl.raw_get("_pos_x").unwrap_or(0);
-        let pos_y: u16 = item_tbl.raw_get("_pos_y").unwrap_or(0);
-        let pos_z: u8 = item_tbl.raw_get("_pos_z").unwrap_or(0);
-        let idx: i32 = item_tbl.raw_get("_idx").unwrap_or(-1);
-        let count: u16 = if pos_x == 0 && pos_y == 0 && pos_z == 0 {
-            item_tbl.raw_get::<u16>("_count").unwrap_or(1)
-        } else {
-            let game = g_game().lock().unwrap();
-            let pos = crate::map::Position { x: pos_x, y: pos_y, z: pos_z };
-            let mi = game.map.get_tile(pos).and_then(|t| {
-                if idx == -1 { t.ground.as_ref() } else { t.items.get(idx as usize) }
-            });
-            mi.map(|m| m.count).unwrap_or(1)
-        };
-        // If the item is a container with children, expand children into player inventory.
-        let children: Option<LuaTable> = item_tbl.raw_get("_children").ok();
-        if let Some(ref ch) = children {
-            if ch.raw_len() > 0 {
-                let items: Vec<(u16, u16)> = ch.clone().sequence_values::<LuaTable>().flatten()
-                    .map(|t| {
-                        let sid: u16 = t.raw_get(1).unwrap_or(0);
-                        let cnt: u16 = t.raw_get("_count").unwrap_or(1);
-                        (sid, cnt)
-                    })
-                    .filter(|(sid, _)| *sid != 0)
-                    .collect();
-                let mut any_placed = false;
-                for (child_id, child_count) in items {
-                    let child_stackable = crate::items::g_items().get_item_type(child_id as usize).stackable;
-                    let mut game = g_game().lock().unwrap();
-                    let Some(player) = game.get_player_mut(cid) else { continue; };
-                    let mut remaining = child_count as u32;
-                    if child_stackable {
-                        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
-                            if remaining == 0 { break; }
-                            if player.inventory[slot] == Some(child_id) {
-                                let cur = player.inventory_count[slot] as u32;
-                                if cur < 100 {
-                                    let add = remaining.min(100 - cur);
-                                    player.inventory_count[slot] = (cur + add) as u16;
-                                    let nc = player.inventory_count[slot];
-                                    crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, child_id, nc);
-                                    remaining -= add;
-                                    any_placed = true;
-                                }
-                            }
-                        }
-                        if remaining > 0 {
-                            if let Some(slot) = (CONST_SLOT_FIRST..=CONST_SLOT_LAST).find(|&s| player.inventory[s].is_none()) {
-                                let add = remaining.min(100) as u16;
-                                player.inventory[slot] = Some(child_id);
-                                player.inventory_count[slot] = add;
-                                crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, child_id, add);
-                                any_placed = true;
-                            }
-                        }
-                    } else {
-                        if let Some(slot) = (CONST_SLOT_FIRST..=CONST_SLOT_LAST).find(|&s| player.inventory[s].is_none()) {
-                            player.inventory[slot] = Some(child_id);
-                            player.inventory_count[slot] = child_count;
-                            crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, child_id, child_count);
-                            any_placed = true;
-                        }
-                    }
-                }
-                return Ok(if any_placed { RETURNVALUE_NOERROR } else { RETURNVALUE_NOTENOUGHROOM });
-            }
+        // Route through the queryDestination port: fitting equip slot, else the
+        // backpack container (with stacking).  No ground drop on overflow.
+        let item = table_to_map_item(&item_tbl);
+        match crate::net::game_protocol::lua_player_add_item(cid, item, false) {
+            Some(_) => Ok(RETURNVALUE_NOERROR),
+            None => Ok(RETURNVALUE_NOTENOUGHROOM),
         }
-        let stackable = crate::items::g_items().get_item_type(server_id as usize).stackable;
-        let mut game = g_game().lock().unwrap();
-        let Some(player) = game.get_player_mut(cid) else { return Ok(1); };
-        if stackable {
-            let mut remaining = count as u32;
-            for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
-                if remaining == 0 { break; }
-                if player.inventory[slot] == Some(server_id) {
-                    let cur = player.inventory_count[slot] as u32;
-                    if cur < 100 {
-                        let add = remaining.min(100 - cur);
-                        player.inventory_count[slot] = (cur + add) as u16;
-                        let nc = player.inventory_count[slot];
-                        crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, server_id, nc);
-                        remaining -= add;
-                    }
-                }
-            }
-            if remaining > 0 {
-                if let Some(slot) = (CONST_SLOT_FIRST..=CONST_SLOT_LAST).find(|&s| player.inventory[s].is_none()) {
-                    let add = remaining.min(100) as u16;
-                    player.inventory[slot] = Some(server_id);
-                    player.inventory_count[slot] = add;
-                    crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, server_id, add);
-                    remaining = remaining.saturating_sub(100);
-                }
-            }
-            if remaining > 0 { return Ok(RETURNVALUE_NOTENOUGHROOM); }
-        } else {
-            if let Some(slot) = (CONST_SLOT_FIRST..=CONST_SLOT_LAST).find(|&s| player.inventory[s].is_none()) {
-                player.inventory[slot] = Some(server_id);
-                player.inventory_count[slot] = count;
-                crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, server_id, count);
-            } else {
-                return Ok(RETURNVALUE_NOTENOUGHROOM);
-            }
-        }
-        Ok(RETURNVALUE_NOERROR)
     })?)?;
-    methods.set("removeItem", lua.create_function(|_, (this, item_id, count, _sub_type, _ignore_equipped): (LuaTable, u16, Option<u32>, Option<i32>, Option<bool>)| -> LuaResult<bool> {
+    methods.set("removeItem", lua.create_function(|_, (this, item_id, count, sub_type, _ignore_equipped): (LuaTable, u16, Option<u32>, Option<i32>, Option<bool>)| -> LuaResult<bool> {
         let cid = get_creature_id(&this)?;
         let count = count.unwrap_or(1);
-        let mut game = g_game().lock().unwrap();
-        if let Some(player) = game.get_player_mut(cid) {
-            let mut remaining = count;
-            for slot in crate::creatures::player::CONST_SLOT_FIRST..=crate::creatures::player::CONST_SLOT_LAST {
-                if remaining == 0 { break; }
-                if player.inventory[slot] == Some(item_id) {
-                    let available = player.inventory_count[slot] as u32;
-                    if available <= remaining {
-                        remaining -= available;
-                        player.inventory[slot] = None;
-                        player.inventory_count[slot] = 0;
-                        crate::net::game_protocol::send_clear_inventory_slot(cid, slot as u8);
-                    } else {
-                        player.inventory_count[slot] -= remaining as u16;
-                        let new_count = player.inventory_count[slot];
-                        crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, item_id, new_count);
-                        remaining = 0;
-                    }
-                }
+        let sub_type = sub_type.unwrap_or(-1);
+        let (ok, open_cids) = {
+            let mut game = g_game().lock().unwrap();
+            let Some(player) = game.get_player_mut(cid) else { return Ok(false) };
+            let ok = player.remove_item(item_id, count, sub_type);
+            if ok { player.update_inventory_weight(); }
+            let open_cids: Vec<u8> = player.open_containers.keys().copied().collect();
+            (ok, open_cids)
+        };
+        if ok {
+            crate::net::game_protocol::send_full_inventory(cid);
+            for ccid in open_cids {
+                crate::net::game_protocol::send_packet_to_player(cid, move |o: &mut crate::net::output_message::OutputMessage| {
+                    crate::net::game_protocol::write_close_container(o, ccid);
+                });
+                crate::net::game_protocol::resend_open_container_free(cid, ccid);
             }
-            return Ok(remaining == 0);
         }
-        Ok(false)
+        Ok(ok)
     })?)?;
     methods.set("getMoney", lua.create_function(|_, this: LuaTable| -> LuaResult<u64> {
         let cid = get_creature_id(&this)?;
@@ -5778,81 +5689,36 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
     })?)?;
     methods.set("addMoney", lua.create_function(|_, (this, money): (LuaTable, u64)| -> LuaResult<bool> {
         let cid = get_creature_id(&this)?;
-        let mut remaining = money;
-        let pos = {
-            let game = g_game().lock().unwrap();
-            game.get_player(cid).map(|p| p.base.position)
+        let open_cids = {
+            let mut game = g_game().lock().unwrap();
+            let Some(player) = game.get_player_mut(cid) else { return Ok(false) };
+            player.add_money_to_backpack(money);
+            player.update_inventory_weight();
+            player.open_containers.keys().copied().collect::<Vec<u8>>()
         };
-        let Some(pos) = pos else { return Ok(false); };
-        // Add crystal coins, then platinum, then gold
-        for (coin_id, worth) in [(2160u16, 10_000u64), (2152, 100), (2148, 1)] {
-            if remaining >= worth {
-                let qty = (remaining / worth).min(0xFFFF) as u16;
-                remaining -= worth * qty as u64;
-                let mut game = g_game().lock().unwrap();
-                if let Some(player) = game.get_player_mut(cid) {
-                    // Find existing stack or free slot
-                    let mut placed = false;
-                    for slot in crate::creatures::player::CONST_SLOT_FIRST..=crate::creatures::player::CONST_SLOT_LAST {
-                        if player.inventory[slot] == Some(coin_id) {
-                            let new_qty = player.inventory_count[slot].saturating_add(qty);
-                            player.inventory_count[slot] = new_qty;
-                            crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, coin_id, new_qty);
-                            placed = true;
-                            break;
-                        }
-                    }
-                    if !placed {
-                        if let Some(slot) = (crate::creatures::player::CONST_SLOT_FIRST..=crate::creatures::player::CONST_SLOT_LAST).find(|&s| player.inventory[s].is_none()) {
-                            player.inventory[slot] = Some(coin_id);
-                            player.inventory_count[slot] = qty;
-                            drop(game);
-                            crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, coin_id, qty);
-                        } else {
-                            // No inventory space — drop on tile
-                            let _ = player;
-                            let items_arc = game.items.clone();
-                            let item = crate::map::tile::MapItem { server_id: coin_id, count: qty, ..Default::default() };
-                            if let Some(tile) = game.map.get_tile_mut(pos) {
-                                tile.internal_add_item(item, &items_arc);
-                            }
-                        }
-                    }
-                }
-            }
+        crate::net::game_protocol::send_full_inventory(cid);
+        for ccid in open_cids {
+            crate::net::game_protocol::resend_open_container_free(cid, ccid);
         }
-        Ok(remaining == 0)
+        Ok(true)
     })?)?;
     methods.set("removeMoney", lua.create_function(|_, (this, money): (LuaTable, u64)| -> LuaResult<bool> {
         let cid = get_creature_id(&this)?;
-        let mut game = g_game().lock().unwrap();
-        let player = match game.get_player_mut(cid) { Some(p) => p, None => return Ok(false) };
-        if player.get_money() < money { return Ok(false); }
-        let mut remaining = money;
-        for (coin_id, worth) in [(2148u16, 1u64), (2152, 100), (2160, 10_000)] {
-            if remaining == 0 { break; }
-            for slot in crate::creatures::player::CONST_SLOT_FIRST..=crate::creatures::player::CONST_SLOT_LAST {
-                if remaining == 0 { break; }
-                if player.inventory[slot] == Some(coin_id) {
-                    let available = player.inventory_count[slot] as u64;
-                    let can_take = available.min(remaining / worth);
-                    if can_take > 0 {
-                        remaining -= can_take * worth;
-                        let new_count = available - can_take;
-                        if new_count == 0 {
-                            player.inventory[slot] = None;
-                            player.inventory_count[slot] = 0;
-                            crate::net::game_protocol::send_clear_inventory_slot(cid, slot as u8);
-                        } else {
-                            player.inventory_count[slot] = new_count as u16;
-                            let nc = new_count as u16;
-                            crate::net::game_protocol::send_inventory_item_to_player(cid, slot as u8, coin_id, nc);
-                        }
-                    }
-                }
+        let (ok, open_cids) = {
+            let mut game = g_game().lock().unwrap();
+            let player = match game.get_player_mut(cid) { Some(p) => p, None => return Ok(false) };
+            let ok = player.remove_money(money);
+            if ok { player.update_inventory_weight(); }
+            let open_cids: Vec<u8> = player.open_containers.keys().copied().collect();
+            (ok, open_cids)
+        };
+        if ok {
+            crate::net::game_protocol::send_full_inventory(cid);
+            for ccid in open_cids {
+                crate::net::game_protocol::resend_open_container_free(cid, ccid);
             }
         }
-        Ok(remaining == 0)
+        Ok(ok)
     })?)?;
     methods.set("showTextDialog", lua.create_function(|_, args: LuaMultiValue| -> LuaResult<()> {
         let mut iter = args.into_iter();
@@ -6349,7 +6215,23 @@ fn register_npc_class(lua: &Lua) -> LuaResult<()> {
                     Some(id as u32)
                 } else { None }
             }
-            _ => None,
+            Some(LuaValue::String(s)) => {
+                game.get_creature_by_name(&s.to_string_lossy())
+                    .filter(|c| c.as_npc().is_some())
+                    .map(|c| c.base().id)
+            }
+            Some(LuaValue::Table(t)) => {
+                t.raw_get::<u32>(1).ok().filter(|&id| {
+                    game.get_creature(id).and_then(|c| c.as_npc()).is_some()
+                })
+            }
+            // Npc() with no argument resolves to the current script NPC.
+            _ => {
+                let id = crate::lua::script::get_current_npc();
+                if id != 0 && game.get_creature(id).and_then(|c| c.as_npc()).is_some() {
+                    Some(id)
+                } else { None }
+            }
         };
         match cid {
             Some(id) => {
@@ -6367,6 +6249,19 @@ fn register_npc_class(lua: &Lua) -> LuaResult<()> {
     })?)?;
 
     methods.set("isNpc", lua.create_function(|_, _: LuaTable| Ok(true))?)?;
+    methods.set("getSpeechBubble", lua.create_function(|_, this: LuaTable| -> LuaResult<u8> {
+        let npc_id: u32 = this.raw_get(1)?;
+        let game = g_game().lock().unwrap();
+        Ok(game.get_creature(npc_id).and_then(|c| c.as_npc()).map(|n| n.speech_bubble).unwrap_or(0))
+    })?)?;
+    methods.set("setSpeechBubble", lua.create_function(|_, (this, bubble): (LuaTable, u8)| -> LuaResult<()> {
+        let npc_id: u32 = this.raw_get(1)?;
+        let mut game = g_game().lock().unwrap();
+        if let Some(n) = game.get_creature_mut(npc_id).and_then(|c| c.as_npc_mut()) {
+            n.speech_bubble = bubble;
+        }
+        Ok(())
+    })?)?;
     methods.set("setMasterPos", lua.create_function(|_, (_this, _pos, _radius): (LuaTable, LuaTable, Option<u32>)| -> LuaResult<bool> {
         Ok(true)
     })?)?;
@@ -6637,8 +6532,18 @@ fn register_npc_globals(lua: &Lua) -> LuaResult<()> {
         }
     })?)?;
 
-    // doNpcSetCreatureFocus(cid) — NPC faces the given creature.
-    lua.globals().set("doNpcSetCreatureFocus", lua.create_function(|_, _cid: LuaValue| -> LuaResult<()> {
+    // doNpcSetCreatureFocus(cid) — NPC focuses (and turns to face) the creature.
+    // Mirrors Npc::setCreatureFocus: cid 0 clears focus; otherwise sets focus and
+    // turns the NPC toward the creature.  While focused the NPC stops wandering.
+    lua.globals().set("doNpcSetCreatureFocus", lua.create_function(|_, cid_val: LuaValue| -> LuaResult<()> {
+        let cid = match cid_val {
+            LuaValue::Integer(n) => n as u32,
+            LuaValue::Table(t) => t.raw_get::<u32>(1).unwrap_or(0),
+            _ => 0,
+        };
+        let npc_id = get_current_npc();
+        if npc_id == 0 { return Ok(()); }
+        crate::net::game_protocol::npc_set_creature_focus(npc_id, cid);
         Ok(())
     })?)?;
 

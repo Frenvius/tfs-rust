@@ -1471,12 +1471,16 @@ fn npc_think(creature_id: u32) {
     use crate::creatures::Direction;
     use crate::net::game_protocol::broadcast_creature_move;
 
-    let (pos, walk_interval, walk_timer) = {
+    let (pos, walk_interval, walk_timer, focus_creature) = {
         let game = g_game().lock().unwrap();
         let Some(creature) = game.get_creature(creature_id) else { return };
         let Some(npc) = creature.as_npc() else { return };
-        (creature.position(), npc.walk_interval, npc.walk_timer)
+        (creature.position(), npc.walk_interval, npc.walk_timer, npc.focus_creature)
     };
+
+    // Fire the Lua onThink event each think tick (mirrors Npc::onThink), so the
+    // focus walk-away / idle logic stays responsive.
+    crate::creatures::npc::fire_npc_think(creature_id);
 
     if walk_interval == 0 {
         return;
@@ -1498,6 +1502,12 @@ fn npc_think(creature_id: u32) {
         if let Some(npc) = game.get_creature_mut(creature_id).and_then(|c| c.as_npc_mut()) {
             npc.walk_timer = 0;
         }
+    }
+
+    // Npc::getNextStep returns false while focused — the NPC holds still and
+    // faces the player it is talking to instead of wandering off.
+    if focus_creature != 0 {
+        return;
     }
 
     // Pick a random direction and attempt to walk one step.
@@ -1529,9 +1539,6 @@ fn npc_think(creature_id: u32) {
     crate::events::dispatch::execute_step_event(creature_id, new_pos, pos, 0);
 
     broadcast_creature_move(creature_id, pos, new_pos, old_stackpos);
-
-    // Fire Lua onThink event for this NPC.
-    crate::creatures::npc::fire_npc_think(creature_id);
 }
 
 fn check_spawns() {

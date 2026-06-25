@@ -522,25 +522,242 @@ impl Player {
     }
 
     pub fn get_money(&self) -> u64 {
+        // Mirrors Player::getMoney: walk every equip slot and recurse into
+        // containers, summing each item's worth (count * itemType.worth).
+        let items = crate::items::g_items();
+        fn item_worth(item: &crate::map::tile::MapItem, items: &crate::items::Items, total: &mut u64) {
+            let worth = items.get_item_type(item.server_id as usize).worth;
+            if worth > 0 {
+                *total += worth * (item.count.max(1) as u64);
+            }
+            for child in &item.children {
+                item_worth(child, items, total);
+            }
+        }
+
         let mut total = 0u64;
         for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
-            if let Some(sid) = self.inventory[slot] {
-                let count = self.inventory_count[slot] as u64;
-                total += match sid {
-                    2148 => count,
-                    2152 => count * 100,
-                    2160 => count * 10_000,
-                    _ => 0,
-                };
+            if let Some(item) = &self.inventory_items[slot] {
+                item_worth(item, items, &mut total);
+            } else if let Some(sid) = self.inventory[slot] {
+                let worth = items.get_item_type(sid as usize).worth;
+                if worth > 0 {
+                    total += worth * (self.inventory_count[slot] as u64);
+                }
             }
         }
         total
     }
 
-    pub fn count_items_of_type(&self, item_id: u16, _sub_type: i32) -> u32 {
+    /// Mirrors Game::removeMoney(player, amount): collect every coin across equip
+    /// slots and nested containers, ascending by stack worth, removing whole
+    /// stacks until the remainder fits in one, then removing the partial count
+    /// and refunding any change. Returns false (no mutation) if total < amount.
+    pub fn remove_money(&mut self, amount: u64) -> bool {
+        if amount == 0 { return true; }
+        let items = crate::items::g_items();
+
+        // Collect coin leaves in DFS order with their worth and count.
+        struct Coin { count: u64, worth: u64 }
+        fn collect(item: &crate::map::tile::MapItem, items: &crate::items::Items, out: &mut Vec<Coin>) {
+            let worth = items.get_item_type(item.server_id as usize).worth;
+            if worth > 0 && item.children.is_empty() {
+                out.push(Coin { count: item.count.max(1) as u64, worth });
+                return;
+            }
+            for c in &item.children {
+                collect(c, items, out);
+            }
+        }
+        let mut coins: Vec<Coin> = Vec::new();
+        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+            if let Some(item) = &self.inventory_items[slot] {
+                collect(item, items, &mut coins);
+            } else if let Some(sid) = self.inventory[slot] {
+                let worth = items.get_item_type(sid as usize).worth;
+                if worth > 0 {
+                    coins.push(Coin { count: self.inventory_count[slot].max(1) as u64, worth });
+                }
+            }
+        }
+
+        let total: u64 = coins.iter().map(|c| c.count * c.worth).sum();
+        if total < amount { return false; }
+
+        // Order matching C++ multimap<worth, item>: ascending by single-coin worth.
+        let mut order: Vec<usize> = (0..coins.len()).collect();
+        order.sort_by_key(|&i| coins[i].worth);
+
+        // Decide how many to remove from each coin leaf (DFS index -> remove count).
+        let mut remove: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        let mut money = amount;
+        let mut change = 0u64;
+        for &i in &order {
+            if money == 0 { break; }
+            let stack_worth = coins[i].count * coins[i].worth;
+            if stack_worth < money {
+                remove.insert(i, coins[i].count);
+                money -= stack_worth;
+            } else if stack_worth > money {
+                let remove_count = (money + coins[i].worth - 1) / coins[i].worth;
+                change = coins[i].worth * remove_count - money;
+                remove.insert(i, remove_count);
+                break;
+            } else {
+                remove.insert(i, coins[i].count);
+                break;
+            }
+        }
+
+        // Apply removals in the same DFS order via a counter, then prune empties.
+        fn apply(item: &mut crate::map::tile::MapItem, items: &crate::items::Items, counter: &mut usize, remove: &std::collections::HashMap<usize, u64>) {
+            let worth = items.get_item_type(item.server_id as usize).worth;
+            if worth > 0 && item.children.is_empty() {
+                if let Some(&rem) = remove.get(counter) {
+                    item.count = (item.count as u64).saturating_sub(rem) as u16;
+                }
+                *counter += 1;
+                return;
+            }
+            for c in item.children.iter_mut() {
+                apply(c, items, counter, remove);
+            }
+            item.children.retain(|c| {
+                let w = items.get_item_type(c.server_id as usize).worth;
+                !(w > 0 && c.children.is_empty() && c.count == 0)
+            });
+        }
+        let mut counter = 0usize;
+        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+            if let Some(item) = &mut self.inventory_items[slot] {
+                apply(item, items, &mut counter, &remove);
+            } else if self.inventory[slot].is_some() {
+                let sid = self.inventory[slot].unwrap();
+                if items.get_item_type(sid as usize).worth > 0 {
+                    if let Some(&rem) = remove.get(&counter) {
+                        let nc = (self.inventory_count[slot] as u64).saturating_sub(rem) as u16;
+                        self.inventory_count[slot] = nc;
+                        if nc == 0 { self.inventory[slot] = None; }
+                    }
+                    counter += 1;
+                }
+            }
+            // Clear an equip-slot top-level coin item that hit zero.
+            if let Some(item) = &self.inventory_items[slot] {
+                let w = items.get_item_type(item.server_id as usize).worth;
+                if w > 0 && item.children.is_empty() && item.count == 0 {
+                    self.inventory_items[slot] = None;
+                    self.inventory[slot] = None;
+                    self.inventory_count[slot] = 0;
+                }
+            }
+        }
+
+        if change > 0 {
+            self.add_money_to_backpack(change);
+        }
+        true
+    }
+
+    /// Remove up to `count` items of `item_id` (sub_type -1 = any) from equip
+    /// slots and nested containers.  Returns true only if the full count was
+    /// removed.  Mirrors Player::removeItemOfType walking the inventory tree.
+    pub fn remove_item(&mut self, item_id: u16, count: u32, sub_type: i32) -> bool {
+        if self.count_items_of_type(item_id, sub_type) < count {
+            return false;
+        }
+        fn remove_tree(item: &mut crate::map::tile::MapItem, item_id: u16, sub_type: i32, remaining: &mut u32) {
+            if *remaining == 0 { return; }
+            for child in item.children.iter_mut() {
+                remove_tree(child, item_id, sub_type, remaining);
+            }
+            item.children.retain_mut(|c| {
+                if *remaining == 0 { return true; }
+                if c.server_id == item_id && c.children.is_empty() && (sub_type == -1 || c.count as i32 == sub_type) {
+                    let take = (*remaining).min(c.count.max(1) as u32);
+                    c.count = (c.count as u32).saturating_sub(take) as u16;
+                    *remaining -= take;
+                    return c.count > 0;
+                }
+                true
+            });
+        }
+        let mut remaining = count;
+        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+            if remaining == 0 { break; }
+            if let Some(item) = &mut self.inventory_items[slot] {
+                // Top-level equipped item match.
+                if item.server_id == item_id && item.children.is_empty()
+                    && (sub_type == -1 || item.count as i32 == sub_type) {
+                    let take = remaining.min(item.count.max(1) as u32);
+                    let nc = (item.count as u32).saturating_sub(take) as u16;
+                    remaining -= take;
+                    if nc == 0 {
+                        self.inventory_items[slot] = None;
+                        self.inventory[slot] = None;
+                        self.inventory_count[slot] = 0;
+                    } else {
+                        item.count = nc;
+                        self.inventory_count[slot] = nc;
+                    }
+                    continue;
+                }
+                remove_tree(item, item_id, sub_type, &mut remaining);
+            } else if self.inventory[slot] == Some(item_id)
+                && (sub_type == -1 || self.inventory_count[slot] as i32 == sub_type) {
+                let take = remaining.min(self.inventory_count[slot].max(1) as u32);
+                let nc = (self.inventory_count[slot] as u32).saturating_sub(take) as u16;
+                remaining -= take;
+                self.inventory_count[slot] = nc;
+                if nc == 0 { self.inventory[slot] = None; }
+            }
+        }
+        remaining == 0
+    }
+
+    /// Add coin denominations (crystal/platinum/gold) into the equipped backpack
+    /// container, used to refund change in remove_money and by Player:addMoney.
+    pub(crate) fn add_money_to_backpack(&mut self, mut money: u64) {
+        for (coin_id, worth) in [(2160u16, 10_000u64), (2152, 100), (2148, 1)] {
+            if money < worth { continue; }
+            let mut qty = (money / worth) as u16;
+            money -= qty as u64 * worth;
+            if let Some(Some(bp)) = self.inventory_items.get_mut(CONST_SLOT_BACKPACK) {
+                // Merge into an existing stack first.
+                for child in bp.children.iter_mut() {
+                    if qty == 0 { break; }
+                    if child.server_id == coin_id && child.count < 100 {
+                        let add = qty.min(100 - child.count);
+                        child.count += add;
+                        qty -= add;
+                    }
+                }
+                while qty > 0 {
+                    let add = qty.min(100);
+                    bp.children.insert(0, crate::map::tile::MapItem { server_id: coin_id, count: add, ..crate::map::tile::MapItem::default() });
+                    qty -= add;
+                }
+            }
+        }
+    }
+
+    pub fn count_items_of_type(&self, item_id: u16, sub_type: i32) -> u32 {
+        // Mirrors Player::getItemTypeCount: count matching items across equip
+        // slots and their container contents.  sub_type -1 matches any.
+        fn count_tree(item: &crate::map::tile::MapItem, item_id: u16, sub_type: i32, count: &mut u32) {
+            if item.server_id == item_id && (sub_type == -1 || item.count as i32 == sub_type) {
+                *count += (item.count.max(1)) as u32;
+            }
+            for child in &item.children {
+                count_tree(child, item_id, sub_type, count);
+            }
+        }
+
         let mut count = 0u32;
         for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
-            if self.inventory[slot] == Some(item_id) {
+            if let Some(item) = &self.inventory_items[slot] {
+                count_tree(item, item_id, sub_type, &mut count);
+            } else if self.inventory[slot] == Some(item_id) {
                 count += self.inventory_count[slot] as u32;
             }
         }
@@ -637,6 +854,44 @@ impl Player {
         } else {
             (self.capacity as i32 - self.inventory_weight as i32).max(0) as u32
         }
+    }
+
+    /// Recalculate `inventory_weight` from all equipped items (including
+    /// container contents).  Mirrors `Player::updateInventoryWeight`.
+    pub fn update_inventory_weight(&mut self) {
+        if self.has_flag(PLAYER_FLAG_HAS_INFINITE_CAPACITY) {
+            return;
+        }
+        let items = crate::items::g_items();
+        self.inventory_weight = 0;
+        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+            if let Some(item) = &self.inventory_items[slot] {
+                self.inventory_weight += item_tree_weight(item, items);
+            } else if let Some(sid) = self.inventory[slot] {
+                let w = items.get_item_type(sid as usize).weight;
+                self.inventory_weight += w * (self.inventory_count[slot].max(1) as u32);
+            }
+        }
+    }
+
+    /// Check if the player can carry `item` (weight check).
+    /// Mirrors `Player::hasCapacity`.
+    pub fn has_capacity_for(&self, item: &crate::map::tile::MapItem, count: u32) -> bool {
+        if self.has_flag(PLAYER_FLAG_CANNOT_PICKUP_ITEM) {
+            return false;
+        }
+        if self.has_flag(PLAYER_FLAG_HAS_INFINITE_CAPACITY) {
+            return true;
+        }
+        let items = crate::items::g_items();
+        let it = items.get_item_type(item.server_id as usize);
+        let base_weight = it.weight;
+        let item_weight = if item.children.is_empty() {
+            if it.stackable { base_weight * count } else { base_weight }
+        } else {
+            item_tree_weight(item, items)
+        };
+        item_weight <= self.get_free_capacity()
     }
 
     pub fn has_flag(&self, flag: u64) -> bool {
@@ -1221,6 +1476,39 @@ impl Player {
         }
         None
     }
+
+    /// Collect container-ids of open tile containers that are too far from
+    /// `player_pos` (> 1 tile Chebyshev, or different floor).  Mirrors the
+    /// distance portion of `Player::autoCloseContainers`.
+    pub fn get_distant_tile_container_ids(&self, player_pos: Position) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (&cid, oc) in &self.open_containers {
+            if let ContainerParent::Tile(tile_pos, _) = &oc.parent {
+                let dx = (player_pos.x as i32 - tile_pos.x as i32).unsigned_abs();
+                let dy = (player_pos.y as i32 - tile_pos.y as i32).unsigned_abs();
+                let dz = player_pos.z != tile_pos.z;
+                if dx > 1 || dy > 1 || dz {
+                    out.push(cid);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Total weight of an item tree (item + all nested children), mirroring
+/// `Container::getWeight` (base weight + totalWeight of contents).
+pub fn item_tree_weight(item: &crate::map::tile::MapItem, items: &crate::items::Items) -> u32 {
+    let it = items.get_item_type(item.server_id as usize);
+    let mut w = if it.stackable {
+        it.weight * (item.count.max(1) as u32)
+    } else {
+        it.weight
+    };
+    for child in &item.children {
+        w += item_tree_weight(child, items);
+    }
+    w
 }
 
 pub fn resolve_container_server_id(game: &crate::game::Game, oc: &OpenContainer) -> u16 {

@@ -801,7 +801,7 @@ impl Game {
 
         let items_arc = self.items.clone();
         let (stackpos, count) = {
-            let count = item.count.min(255).max(1) as u8;
+            let count = item.count.clamp(1, 255) as u8;
             let Some(tile) = self.map.get_tile_mut(pos) else { return };
             let sp = tile.add_item_get_stackpos(item, &items_arc);
             (sp, count)

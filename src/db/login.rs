@@ -554,6 +554,7 @@ pub async fn load_player_by_name(char_name: &str) -> Option<Player> {
     // Aggregate equipped-item light so a player logging in with a lit light
     // source (e.g. a torch) emits light immediately.
     player.update_items_light();
+    player.update_inventory_weight();
 
     Some(player)
 }

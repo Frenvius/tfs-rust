@@ -104,9 +104,14 @@ impl Spawn {
             npc.base.position = nb.pos;
             npc.base.direction = nb.direction;
             let creature_id = npc.base.id;
+            let type_name = npc.type_name.clone();
             let pos = nb.pos;
             let placed = g_game().lock().unwrap().place_creature(Creature::Npc(npc));
             if placed {
+                // Load this NPC's own script copy (parses its parameters), then
+                // fire its self-appear so shop/quest modules set the bubble.
+                crate::creatures::npc::register_npc_instance(creature_id, &type_name);
+                crate::creatures::npc::fire_npc_creature_appear(creature_id, creature_id, "Npc");
                 crate::net::game_protocol::broadcast_creature_appear(creature_id, pos);
             }
         }

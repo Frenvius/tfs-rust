@@ -14,9 +14,9 @@ pub fn init_npcs(n: Npcs) {
     G_NPCS.set(n).unwrap_or_else(|_| panic!("npcs already initialized"));
 }
 
-/// Stores Lua event IDs keyed by NPC type name (lowercase).
-/// Populated once by `ScriptingManager` after all NPC scripts are loaded.
-static G_NPC_EVENTS: OnceLock<Mutex<HashMap<String, NpcEventIds>>> = OnceLock::new();
+/// Stores per-NPC-instance Lua event IDs keyed by creature id.  Mirrors C++
+/// `NpcEventsHandler`, one per spawned NPC, loaded at spawn time.
+static G_NPC_INSTANCE_EVENTS: OnceLock<Mutex<HashMap<CreatureId, NpcEventIds>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct NpcEventIds {
@@ -43,17 +43,34 @@ impl NpcEventIds {
     }
 }
 
-pub fn get_npc_event_ids(type_name: &str) -> Option<NpcEventIds> {
-    G_NPC_EVENTS.get()?.lock().ok()?.get(type_name).cloned()
+fn instance_events_map() -> &'static Mutex<HashMap<CreatureId, NpcEventIds>> {
+    G_NPC_INSTANCE_EVENTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Called by `ScriptingManager` after loading all NPC scripts to store event IDs.
-#[allow(clippy::type_complexity)]
-pub fn apply_npc_script_events(events: Vec<(String, i32, i32, i32, i32, i32, i32, i32)>) {
-    let map_lock = G_NPC_EVENTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = map_lock.lock().expect("G_NPC_EVENTS mutex poisoned");
-    for (type_name, say, think, appear, disappear, close_ch, end_trade, creature_move) in events {
-        map.insert(type_name, NpcEventIds::new(say, think, appear, disappear, close_ch, end_trade, creature_move));
+pub fn get_npc_instance_events(npc_id: CreatureId) -> Option<NpcEventIds> {
+    instance_events_map().lock().ok()?.get(&npc_id).cloned()
+}
+
+/// Load the per-instance script for a freshly spawned NPC and store its event
+/// IDs.  Looks up the NPC's `script` file by its type name.  Call after the NPC
+/// is placed in the game (so `get_current_npc` resolves to a live creature).
+pub fn register_npc_instance(npc_id: CreatureId, type_name: &str) {
+    let script_file = match g_npcs().get_npc_type(type_name) {
+        Some(nt) if !nt.script_file.is_empty() => nt.script_file.clone(),
+        _ => return,
+    };
+    let (say, think, appear, disappear, close_ch, end_trade, creature_move) =
+        crate::lua::script::load_npc_instance_script(npc_id, &script_file);
+    let ids = NpcEventIds::new(say, think, appear, disappear, close_ch, end_trade, creature_move);
+    instance_events_map()
+        .lock()
+        .expect("G_NPC_INSTANCE_EVENTS mutex poisoned")
+        .insert(npc_id, ids);
+}
+
+pub fn remove_npc_instance(npc_id: CreatureId) {
+    if let Ok(mut map) = instance_events_map().lock() {
+        map.remove(&npc_id);
     }
 }
 
@@ -68,6 +85,7 @@ pub struct NpcType {
     pub base_speed: u32,
     pub outfit: Outfit,
     pub walk_interval: u32,
+    pub speech_bubble: u8,
     pub script_file: String,
     pub parameters: HashMap<String, String>,
     pub creature_say_event: i32,
@@ -149,6 +167,10 @@ impl Npcs {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2000u32);
 
+        let speech_bubble = npc.attribute("speechbubble")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0u8);
+
         let script_file = npc.attribute("script").unwrap_or("").to_owned();
 
         let mut health_now = 100i32;
@@ -190,6 +212,7 @@ impl Npcs {
             base_speed: 100,
             outfit,
             walk_interval,
+            speech_bubble,
             script_file,
             parameters,
             creature_say_event: -1,
@@ -212,11 +235,13 @@ pub struct Npc {
     pub walk_interval: u32,
     pub walk_timer: u32,
     pub type_name: String,
+    pub speech_bubble: u8,
+    pub focus_creature: CreatureId,
 }
 
 impl Npc {
     pub fn new(base: CreatureBase, name: String, walk_interval: u32, type_name: String) -> Self {
-        Self { base, name, walk_interval, walk_timer: 0, type_name }
+        Self { base, name, walk_interval, walk_timer: 0, type_name, speech_bubble: 0, focus_creature: 0 }
     }
 
     pub fn get_name(&self) -> &str {
@@ -236,7 +261,9 @@ impl Npc {
         base.base_speed = nt.base_speed;
         base.current_outfit = nt.outfit;
         base.default_outfit = nt.outfit;
-        Some(Box::new(Npc::new(base, nt.name.clone(), nt.walk_interval, name.to_lowercase())))
+        let mut npc = Npc::new(base, nt.name.clone(), nt.walk_interval, name.to_lowercase());
+        npc.speech_bubble = nt.speech_bubble;
+        Some(Box::new(npc))
     }
 }
 
@@ -276,14 +303,7 @@ fn call_npc_event_inner(npc_id: CreatureId, event_id: i32, args_builder: impl Fn
 
 /// Fire `onCreatureSay(creature, type, text)` for the given NPC.
 pub fn fire_npc_creature_say(npc_id: CreatureId, player_id: CreatureId, speak_type: u8, text: &str) -> bool {
-    let type_name = {
-        let game = crate::game::g_game().lock().unwrap();
-        game.get_creature(npc_id)
-            .and_then(|c| c.as_npc())
-            .map(|n| n.type_name.clone())
-            .unwrap_or_default()
-    };
-    let events = match get_npc_event_ids(&type_name) {
+    let events = match get_npc_instance_events(npc_id) {
         Some(e) => e,
         None => return false,
     };
@@ -297,20 +317,68 @@ pub fn fire_npc_creature_say(npc_id: CreatureId, player_id: CreatureId, speak_ty
     call_npc_event_inner(npc_id, events.creature_say, move |lua, iface| {
         let Ok(func) = iface.push_function(events.creature_say) else { return false; };
         let Ok(player_tbl) = npc_push_creature_table(lua, player_id, "Player") else { return false; };
-        func.call::<()>((player_tbl, speak_type as i32, text_owned)).is_ok()
+        if let Err(e) = func.call::<()>((player_tbl, speak_type as i32, text_owned)) {
+            tracing::warn!("[NPC] onCreatureSay error: {}", e);
+            return false;
+        }
+        true
     })
+}
+
+/// Fire `onCreatureAppear(creature)` for the given NPC.
+pub fn fire_npc_creature_appear(npc_id: CreatureId, who_id: CreatureId, who_class: &str) {
+    let events = match get_npc_instance_events(npc_id) {
+        Some(e) => e,
+        None => return,
+    };
+    if events.creature_appear == -1 {
+        return;
+    }
+    if crate::lua::script::g_npc_iface_opt().is_none() {
+        return;
+    }
+    let class = who_class.to_owned();
+    call_npc_event_inner(npc_id, events.creature_appear, move |lua, iface| {
+        let Ok(func) = iface.push_function(events.creature_appear) else { return false; };
+        let Ok(tbl) = npc_push_creature_table(lua, who_id, &class) else { return false; };
+        if let Err(e) = func.call::<()>(tbl) {
+            tracing::warn!("[NPC] onCreatureAppear error: {}", e);
+        }
+        true
+    });
+}
+
+/// Invoke a stored NPC shop buy/sell callback, mirroring
+/// `NpcEventsHandler::onPlayerTrade`.  The callback is the Lua closure passed to
+/// `openShopWindow`; it is called as
+/// `cb(player, itemId, subType, amount, ignore, inBackpacks)` with the NPC set
+/// as the active script NPC.
+#[allow(clippy::too_many_arguments)]
+pub fn fire_npc_player_trade(npc_id: CreatureId, callback_id: i32, player_id: CreatureId, item_id: u16, sub_type: u8, amount: u8, ignore: bool, in_backpacks: bool) {
+    if callback_id == -1 {
+        return;
+    }
+    if crate::lua::script::g_npc_iface_opt().is_none() {
+        return;
+    }
+    call_npc_event_inner(npc_id, callback_id, move |lua, _iface| {
+        let func = {
+            let registry = crate::events::registry::g_script_registry().lock().unwrap();
+            registry.get_callback_function(lua, callback_id)
+        };
+        let Some(func) = func else { return false; };
+        let Ok(player_tbl) = npc_push_creature_table(lua, player_id, "Player") else { return false; };
+        if let Err(e) = func.call::<()>((player_tbl, item_id, sub_type, amount, ignore, in_backpacks)) {
+            tracing::warn!("[NPC] onPlayerTrade callback error: {}", e);
+            return false;
+        }
+        true
+    });
 }
 
 /// Fire `onThink()` for the given NPC.
 pub fn fire_npc_think(npc_id: CreatureId) {
-    let type_name = {
-        let game = crate::game::g_game().lock().unwrap();
-        game.get_creature(npc_id)
-            .and_then(|c| c.as_npc())
-            .map(|n| n.type_name.clone())
-            .unwrap_or_default()
-    };
-    let events = match get_npc_event_ids(&type_name) {
+    let events = match get_npc_instance_events(npc_id) {
         Some(e) => e,
         None => return,
     };

@@ -983,8 +983,21 @@ impl ProtocolGame {
                 dispatch(move || game_parse_throw(cid, from_pos, sprite_id, from_stackpos, to_pos, count));
             }
             0x79 => { let _id = msg.get_u16(); let _count = msg.get_byte(); }
-            0x7A => { let _id = msg.get_u16(); let _count = msg.get_byte(); let _amount = msg.get_byte(); let _ignorecap = msg.get_byte(); let _inbackpacks = msg.get_byte(); }
-            0x7B => { let _id = msg.get_u16(); let _count = msg.get_byte(); let _amount = msg.get_byte(); let _ignoreequipped = msg.get_byte(); }
+            0x7A => {
+                let sprite_id = msg.get_u16();
+                let count = msg.get_byte();
+                let amount = msg.get_byte();
+                let ignore_cap = msg.get_byte() != 0;
+                let in_backpacks = msg.get_byte() != 0;
+                dispatch(move || game_player_purchase(cid, sprite_id, count, amount, ignore_cap, in_backpacks));
+            }
+            0x7B => {
+                let sprite_id = msg.get_u16();
+                let count = msg.get_byte();
+                let amount = msg.get_byte();
+                let ignore_equipped = msg.get_byte() != 0;
+                dispatch(move || game_player_sale(cid, sprite_id, count, amount, ignore_equipped));
+            }
             0x7C => dispatch(move || game_handle_close_shop(cid)),
             0x7D => {
                 let pos = to_map_position(msg.get_position());
@@ -1059,14 +1072,26 @@ impl ProtocolGame {
             }
             0x8E => {}
             0x96 => {
-                let speak_type = msg.get_byte();
-                let channel_id = if speak_type == 7 || speak_type == 10 {
-                    Some(msg.get_u16())
-                } else { None };
-                let receiver_name = if speak_type == 6 || speak_type == 11 {
+                // Mirrors ProtocolGame::parseSay. In 10.98 the wire byte IS the
+                // SpeakClasses value (PRIVATE_TO=5/PRIVATE_RED_TO=16 carry a
+                // receiver; CHANNEL_Y=7/CHANNEL_R1=14 carry a channelId). The raw
+                // wire type is translated to the 8.60-internal scheme the rest of
+                // the server (and the Lua TALKTYPE_* constants) use.
+                let wire_type = msg.get_byte();
+                let is_1098 = crate::net::protocol_version::client_version().is_1098();
+                let (recv_type, chan_type): ([u8; 2], [u8; 2]) = if is_1098 {
+                    ([5, 16], [7, 14])
+                } else {
+                    ([6, 11], [7, 10])
+                };
+                let receiver_name = if recv_type.contains(&wire_type) {
                     Some(msg.get_string(None))
                 } else { None };
+                let channel_id = if chan_type.contains(&wire_type) {
+                    Some(msg.get_u16())
+                } else { None };
                 let text = msg.get_string(None);
+                let speak_type = crate::net::protocol_version::translate_speak_class_from_client(wire_type);
                 dispatch(move || game_handle_say(cid, speak_type, channel_id, receiver_name, text));
             }
             0x97 => dispatch(move || game_handle_request_channels(cid)),
@@ -1216,24 +1241,10 @@ fn game_handle_walk(creature_id: CreatureId, dir: Direction) {
                 return;
             }
         };
-        let naive = old_pos.offset_direction(dir);
-        let t_ms = crate::util::get_milliseconds_time();
-        if new_pos != naive {
-            tracing::info!(t_ms, ?old_pos, ?dir, ?naive, resolved = ?new_pos, "DBG walk ADJUSTED (height/floor logic)");
-        } else {
-            tracing::info!(t_ms, ?old_pos, ?dir, ?new_pos, "DBG walk");
-        }
-
         let idx = game.map.get_tile(old_pos)
             .map(|t| t.get_client_index_of_creature(creature_id))
             .unwrap_or(-1);
         stackpos = if idx >= 0 { idx as u8 } else { 0 };
-
-        if let Some(t) = game.map.get_tile(old_pos) {
-            let ncre = t.get_creature_count();
-            let creatures: Vec<u32> = t.get_creatures().to_vec();
-            tracing::info!(?old_pos, sent_stackpos = stackpos, has_ground = t.ground.is_some(), top = t.get_top_item_count(), down = t.get_down_item_count(), ncre, ?creatures, "DBG walk SRC stackpos");
-        }
 
         block_msg = match game.map.get_tile(new_pos) {
             None => Some(b"Sorry, not possible." as &[u8]),
@@ -1241,14 +1252,6 @@ fn game_handle_walk(creature_id: CreatureId, dir: Direction) {
             Some(t) if t.has_flag(TILESTATE_BLOCKSOLID) => Some(b"There is not enough room."),
             _ => None,
         };
-        if block_msg.is_some() {
-            if let Some(t) = game.map.get_tile(new_pos) {
-                let item_ids: Vec<u16> = t.ground.iter().chain(t.items.iter()).map(|i| i.server_id).collect();
-                tracing::info!(?old_pos, ?new_pos, ?dir, flags = format!("{:#x}", t.flags), has_ground = t.ground.is_some(), ?item_ids, "DBG walk BLOCKED");
-            } else {
-                tracing::info!(?old_pos, ?new_pos, ?dir, "DBG walk BLOCKED: no tile");
-            }
-        }
     }
 
     if let Some(msg) = block_msg {
@@ -1302,6 +1305,35 @@ fn game_handle_walk(creature_id: CreatureId, dir: Direction) {
     }
 
     broadcast_creature_move(creature_id, old_pos, new_pos, stackpos);
+
+    // Mirrors Player::autoCloseContainers: close any open tile containers that
+    // are now out of interaction range after the walk.
+    auto_close_distant_containers(creature_id, new_pos);
+}
+
+/// Close open tile-based containers that are too far from the player.
+/// Called after every walk step.  Mirrors the distance check in
+/// `Player::autoCloseContainers`.
+fn auto_close_distant_containers(creature_id: CreatureId, player_pos: Position) {
+    let to_close: Vec<u8> = {
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        player.get_distant_tile_container_ids(player_pos)
+    };
+    if to_close.is_empty() { return; }
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(creature_id) {
+            for &cid in &to_close {
+                player.close_container(cid);
+            }
+        }
+    }
+    for cid in to_close {
+        send_packet_to_player(creature_id, move |o: &mut OutputMessage| {
+            write_close_container(o, cid);
+        });
+    }
 }
 
 fn game_handle_turn(creature_id: CreatureId, dir: Direction) {
@@ -1455,6 +1487,56 @@ fn game_handle_close_npc_channel(creature_id: CreatureId) {
     let spectator_ids = game.get_spectators(pos, false, false);
     drop(game);
     let _ = (pos, spectator_ids);
+}
+
+fn game_player_purchase(creature_id: CreatureId, sprite_id: u16, count: u8, amount: u8, ignore_cap: bool, in_backpacks: bool) {
+    // Mirrors Game::playerPurchaseItem.
+    if amount == 0 || amount as u16 > 100 { return; }
+    let (npc_id, on_buy, item_id, sub_type, has_for_sale) = {
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        let Some(npc_id) = player.shop_owner_id else { return };
+        let on_buy = player.purchase_callback;
+        let it = game.items.get_item_id_by_client_id(sprite_id);
+        if it.id == 0 { return; }
+        let item_id = it.id;
+        let sub_type = if it.is_splash() || it.is_fluid_container() {
+            crate::util::client_fluid_to_server(count)
+        } else { count };
+        let has_for_sale = player.shop_item_list.iter().any(|s| {
+            s.item_id as u16 == item_id && (s.buy_price != 0 || s.sell_price != 0)
+                && (!it.is_fluid_container() || s.sub_type == sub_type as i32)
+        });
+        (npc_id, on_buy, item_id, sub_type, has_for_sale)
+    };
+    if !has_for_sale { return; }
+    crate::creatures::npc::fire_npc_player_trade(npc_id, on_buy, creature_id, item_id, sub_type, amount, ignore_cap, in_backpacks);
+    send_sale_item_list(creature_id, &shop_item_list_of(creature_id));
+}
+
+fn game_player_sale(creature_id: CreatureId, sprite_id: u16, count: u8, amount: u8, ignore_equipped: bool) {
+    // Mirrors Game::playerSellItem.
+    if amount == 0 || amount as u16 > 100 { return; }
+    let (npc_id, on_sell, item_id, sub_type) = {
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        let Some(npc_id) = player.shop_owner_id else { return };
+        let on_sell = player.sale_callback;
+        let it = game.items.get_item_id_by_client_id(sprite_id);
+        if it.id == 0 { return; }
+        let item_id = it.id;
+        let sub_type = if it.is_splash() || it.is_fluid_container() {
+            crate::util::client_fluid_to_server(count)
+        } else { count };
+        (npc_id, on_sell, item_id, sub_type)
+    };
+    crate::creatures::npc::fire_npc_player_trade(npc_id, on_sell, creature_id, item_id, sub_type, amount, ignore_equipped, false);
+    send_sale_item_list(creature_id, &shop_item_list_of(creature_id));
+}
+
+fn shop_item_list_of(creature_id: CreatureId) -> Vec<crate::creatures::player::ShopInfo> {
+    let game = g_game().lock().unwrap();
+    game.get_player(creature_id).map(|p| p.shop_item_list.clone()).unwrap_or_default()
 }
 
 fn game_handle_close_shop(creature_id: CreatureId) {
@@ -2000,12 +2082,19 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
 
     // TalkActions first, mirroring C++ Game::playerSaySpell ordering.
     let param = text_str.split_once(' ').map(|(_, p)| p).unwrap_or("");
-    match crate::events::dispatch::execute_talk_action(creature_id, &text_str, param, speak_type) {
-        Some(false) => return,
-        Some(true) | None => {}
+    if let Some(false) = crate::events::dispatch::execute_talk_action(creature_id, &text_str, param, speak_type) {
+        return;
     }
 
     if crate::events::dispatch::execute_spell_say(creature_id, &text_str) {
+        return;
+    }
+
+    // TALKTYPE_PRIVATE_PN (internal 4): the player is talking to an NPC through
+    // the NPC conversation channel — route to NPCs only, no public broadcast.
+    // Mirrors Game::playerSay -> playerSpeakToNpc.
+    if speak_type == 4 {
+        notify_nearby_npcs(creature_id, pos, speak_type, &text_str);
         return;
     }
 
@@ -2019,7 +2108,7 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
             broadcast_creature_say(creature_id, pos, &name, level as u16, speak_type, text_str.as_bytes());
             notify_nearby_npcs(creature_id, pos, speak_type, &text_str);
         }
-        6 | 11 => {
+        6 => {
             let recv_name = receiver_name.map(|n| String::from_utf8_lossy(&n).to_string()).unwrap_or_default();
             let game = g_game().lock().unwrap();
             if let Some(target) = game.get_player_by_name(&recv_name) {
@@ -2050,7 +2139,7 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
                 });
             }
         }
-        7 | 10 => {
+        7 | 8 | 15 => {
             let cid = channel_id.unwrap_or(0);
             let mut game = g_game().lock().unwrap();
             let spectators = game.map.get_spectators(pos, true, true, 0, 0, 0, 0);
@@ -2443,6 +2532,12 @@ fn game_handle_use_item(creature_id: CreatureId, pos: Position, sprite_id: u16, 
             drop(game);
             if is_depot && pos.x != 0xFFFF {
                 open_depot_free(creature_id, server_id, depot_id);
+            } else if pos.x == 0xFFFF && (pos.y & 0x40) != 0 {
+                // Container-encoded position: clicking an item inside an open
+                // container window.  parent_cid = pos.y & 0x0F, child index = pos.z.
+                let parent_cid = (pos.y & 0x0F) as u8;
+                let child_idx = pos.z as usize;
+                open_container_inside_container(creature_id, parent_cid, child_idx, server_id);
             } else if pos.x == 0xFFFF {
                 open_container_in_inventory_free(creature_id, pos.y as u8, server_id);
             } else {
@@ -2864,7 +2959,7 @@ fn refresh_move_endpoint_free(player_id: CreatureId, ep: &MoveEndpoint) {
     }
 }
 
-fn resend_open_container_free(player_id: CreatureId, cid: u8) {
+pub(crate) fn resend_open_container_free(player_id: CreatureId, cid: u8) {
     use crate::creatures::player::ContainerParent;
     let game = g_game().lock().unwrap();
     let Some(player) = game.get_player(player_id) else { return };
@@ -3046,6 +3141,16 @@ fn open_container_on_tile_free(player_id: CreatureId, pos: Position, tile_item_i
     let game = g_game().lock().unwrap();
     let Some(player) = game.get_player(player_id) else { return };
 
+    // Mirrors Actions::canUse — tile must be within 1,1 range and same floor.
+    let pp = player.base.position;
+    let dx = (pp.x as i32 - pos.x as i32).unsigned_abs();
+    let dy = (pp.y as i32 - pos.y as i32).unsigned_abs();
+    if dx > 1 || dy > 1 || pp.z != pos.z {
+        drop(game);
+        send_cancel_walk_to_player(player_id);
+        return;
+    }
+
     if let Some(existing_cid) = player.get_container_id_by_tile(pos, tile_item_index) {
         drop(game);
         let mut game = g_game().lock().unwrap();
@@ -3120,6 +3225,85 @@ fn open_depot_free(player_id: CreatureId, server_id: u16, depot_id: u32) {
     }
     send_packet_to_player(player_id, move |o: &mut OutputMessage| {
         write_container(o, cid, &chest, &items_ref, "Depot chest", capacity, false, &children);
+    });
+}
+
+/// Open a container that is a child of an already-open container (clicked inside
+/// a container window).  Mirrors C++ `Actions::internalUseItem` container branch
+/// where the item is obtained via `internalGetThing(player, containerPos)`.
+fn open_container_inside_container(player_id: CreatureId, parent_cid: u8, child_idx: usize, _server_id: u16) {
+    use crate::creatures::player::ContainerParent;
+    let items_g = crate::items::g_items();
+
+    let game = g_game().lock().unwrap();
+    let Some(player) = game.get_player(player_id) else { return };
+    if player.get_container_by_id(parent_cid).is_none() { return };
+
+    // Check if this exact child container is already open → toggle close.
+    let existing = player.open_containers.iter()
+        .find(|(_, oc)| matches!(&oc.parent, ContainerParent::Container(pcid, cidx) if *pcid == parent_cid && *cidx == child_idx))
+        .map(|(&cid, _)| cid);
+    if let Some(existing_cid) = existing {
+        drop(game);
+        {
+            let mut game = g_game().lock().unwrap();
+            if let Some(p) = game.get_player_mut(player_id) { p.close_container(existing_cid); }
+        }
+        send_packet_to_player(player_id, move |o: &mut OutputMessage| write_close_container(o, existing_cid));
+        return;
+    }
+
+    let Some(cid) = player.get_free_container_id() else {
+        drop(game);
+        send_status_message_to_player(player_id, "You cannot open any more containers.");
+        return;
+    };
+
+    // Resolve the parent container then get its child at child_idx.
+    let child_item: Option<crate::map::tile::MapItem> = (|| {
+        let (root, path, _) = resolve_container_storage(player, parent_cid)?;
+        match root {
+            StorageRoot::InvItem(slot) => {
+                let mut full = vec![slot];
+                full.extend_from_slice(&path);
+                resolve_container_ref(&player.inventory_items, &full)?
+                    .children.get(child_idx).cloned()
+            }
+            StorageRoot::TileItem(pos, idx) => {
+                let mut container = game.map.get_tile(pos)?
+                    .items.get(idx)?;
+                for &ci in &path {
+                    container = container.children.get(ci)?;
+                }
+                container.children.get(child_idx).cloned()
+            }
+            StorageRoot::Depot(depot_id) => {
+                let items = player.depot_items.get(&depot_id)?;
+                let mut node_children: &[crate::map::tile::MapItem] = items.as_slice();
+                for &ci in &path {
+                    let item = node_children.get(ci)?;
+                    node_children = &item.children;
+                }
+                node_children.get(child_idx).cloned()
+            }
+        }
+    })();
+
+    let Some(child_item) = child_item else { drop(game); return };
+    let it = items_g.get_item_type(child_item.server_id as usize);
+    let name = if child_item.name.is_empty() { it.name.clone() } else { child_item.name.clone() };
+    let capacity = it.max_items.min(255) as u8;
+    let children_clone = child_item.children.clone();
+    drop(game);
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(p) = game.get_player_mut(player_id) {
+            p.add_container(cid, ContainerParent::Container(parent_cid, child_idx));
+        }
+    }
+    send_packet_to_player(player_id, move |o: &mut OutputMessage| {
+        write_container(o, cid, &child_item, items_g, &name, capacity, true, &children_clone);
     });
 }
 
@@ -4174,108 +4358,295 @@ pub(crate) fn item_fits_equip_slot(slot: usize, slot_position: u16, weapon_type:
 /// empty equipment slot for wearables, otherwise the equipped backpack, else
 /// dropped on the tile when `can_drop`. Sends the matching client update.
 /// Returns the player position on success (item-ref anchor), or `None`.
+/// Port of Game::internalAddItem(player, item, INDEX_WHEREEVER).
+/// Routes the item through Player::queryDestination (equip slot → backpack
+/// container BFS with capacity + stacking) then places it.  Overflow items are
+/// dropped on the player's tile when `can_drop` is true.
+///
+/// Returns the player position on success, None when the item could not be
+/// placed at all.
 pub(crate) fn lua_player_add_item(
     cid: CreatureId,
     mut item: crate::map::tile::MapItem,
     can_drop: bool,
 ) -> Option<Position> {
-    use crate::creatures::player::{CONST_SLOT_BACKPACK, CONST_SLOT_FIRST, CONST_SLOT_LAST};
-    let mut game = g_game().lock().unwrap();
-    let items_arc = game.items.clone();
-    let it = items_arc.get_item_type(item.server_id as usize);
-    let slot_position = it.slot_position;
-    let weapon_type = it.weapon_type;
+    use crate::creatures::player::{CONST_SLOT_FIRST, CONST_SLOT_LAST};
+    let items_g = crate::items::g_items();
+    let it = items_g.get_item_type(item.server_id as usize);
     let stackable = it.stackable;
     let server_id = item.server_id;
+    let slot_position = it.slot_position;
+    let weapon_type = it.weapon_type;
 
-    enum Action {
-        Equip(u8, u16, u16),
-        Backpack(Option<u8>),
-        None,
+    let mut game = g_game().lock().unwrap();
+    let player = game.get_player_mut(cid)?;
+    let pos = player.base.position;
+
+    // Capacity check — mirrors Player::hasCapacity. If the item is already
+    // owned by this player (top parent == self), skip the check.
+    if !player.has_capacity_for(&item, item.count.max(1) as u32) {
+        drop(game);
+        return None;
     }
 
-    let pos;
-    let placed;
-    {
-        let Some(player) = game.get_player_mut(cid) else { return None };
-        pos = player.base.position;
-        let mut act = Action::None;
-        if !stackable {
-            for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
-                if player.inventory[slot].is_none()
-                    && item_fits_equip_slot(slot, slot_position, weapon_type)
-                {
-                    let cnt = item.count.max(1);
-                    player.inventory[slot] = Some(server_id);
-                    player.inventory_count[slot] = cnt;
-                    player.inventory_items[slot] = Some(std::mem::take(&mut item));
-                    act = Action::Equip(slot as u8, server_id, cnt);
+    // ── Player::queryDestination(INDEX_WHEREEVER, item) ──────────────
+    // Phase 1: for stackable items, scan equip slots for a matching stack < 100.
+    if stackable {
+        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+            if player.inventory[slot] == Some(server_id) && player.inventory_count[slot] < 100 {
+                let dest_count = player.inventory_count[slot];
+                let add = item.count.max(1).min(100 - dest_count);
+                player.inventory_count[slot] += add;
+                if let Some(ref mut di) = player.inventory_items[slot] {
+                    di.count += add;
+                }
+                player.update_inventory_weight();
+                drop(game);
+                send_inventory_item_to_player(cid, slot as u8, server_id, dest_count + add);
+                let remainder = item.count.max(1).saturating_sub(add);
+                if remainder > 0 {
+                    item.count = remainder;
+                    return lua_player_add_item_relock(cid, item, can_drop, pos);
+                }
+                return Some(pos);
+            }
+        }
+    }
+
+    // Phase 2: BFS into containers for a matching stack (stackable) or first
+    // free slot (non-stackable), respecting container capacity.
+    // We collect a path (equip-slot index, then child indices) to the target
+    // container, so we can mutate it after the search.
+    type ContainerPath = Vec<usize>;
+    struct BfsEntry { path: ContainerPath }
+
+    let mut queue: std::collections::VecDeque<BfsEntry> = std::collections::VecDeque::new();
+    for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+        if let Some(Some(inv_item)) = player.inventory_items.get(slot) {
+            let itype = items_g.get_item_type(inv_item.server_id as usize);
+            if itype.group == crate::items::ItemGroup::Container {
+                queue.push_back(BfsEntry { path: vec![slot] });
+            }
+        }
+    }
+
+    // Search: find a container that can accept the item.
+    let mut found_path: Option<ContainerPath> = None;
+    let mut found_merge_idx: Option<usize> = None; // child index to merge into
+
+    while let Some(entry) = queue.pop_front() {
+        // Resolve the container at this path.
+        let container = resolve_container_ref(&player.inventory_items, &entry.path);
+        let Some(container) = container else { continue };
+        let cap = items_g.get_item_type(container.server_id as usize).max_items as usize;
+
+        if stackable {
+            // Look for a matching stack < 100 in this container's children.
+            for (i, child) in container.children.iter().enumerate() {
+                if child.server_id == server_id && child.count < 100 {
+                    found_path = Some(entry.path.clone());
+                    found_merge_idx = Some(i);
                     break;
                 }
             }
-        }
-        if matches!(act, Action::None) {
-            if let Some(Some(bp)) = player.inventory_items.get_mut(CONST_SLOT_BACKPACK) {
-                if stackable {
-                    let mut remaining = item.count.max(1);
-                    for child in bp.children.iter_mut() {
-                        if remaining == 0 {
-                            break;
-                        }
-                        if child.server_id == server_id && child.count < 100 {
-                            let add = remaining.min(100 - child.count);
-                            child.count += add;
-                            remaining -= add;
-                        }
-                    }
-                    if remaining > 0 {
-                        item.count = remaining;
-                        bp.children.insert(0, std::mem::take(&mut item));
-                    }
-                } else {
-                    bp.children.insert(0, std::mem::take(&mut item));
-                }
-                let open = player.get_container_id_by_inventory(CONST_SLOT_BACKPACK as u8);
-                act = Action::Backpack(open);
+            if found_path.is_some() { break; }
+            // If there's room for a new stack, use it.
+            if container.children.len() < cap {
+                found_path = Some(entry.path.clone());
+                found_merge_idx = None;
+                break;
+            }
+        } else {
+            // Non-stackable: find first container with free capacity.
+            if container.children.len() < cap {
+                found_path = Some(entry.path.clone());
+                found_merge_idx = None;
+                break;
             }
         }
-        placed = act;
+
+        // Enqueue child containers for BFS.
+        for (i, child) in container.children.iter().enumerate() {
+            let ct = items_g.get_item_type(child.server_id as usize);
+            if ct.group == crate::items::ItemGroup::Container {
+                let mut child_path = entry.path.clone();
+                child_path.push(i);
+                queue.push_back(BfsEntry { path: child_path });
+            }
+        }
     }
 
-    match placed {
-        Action::Equip(slot, sid, cnt) => {
+    if let Some(path) = found_path {
+        // Place the item into the found container.
+        let container = resolve_container_mut(&mut player.inventory_items, &path);
+        let Some(container) = container else {
             drop(game);
-            send_inventory_item_to_player(cid, slot, sid, cnt);
-            Some(pos)
-        }
-        Action::Backpack(open) => {
-            drop(game);
-            if let Some(ccid) = open {
-                resend_open_container_free(cid, ccid);
+            return None;
+        };
+
+        let mut remainder = 0u16;
+        let inserted_at_front;
+        if let Some(merge_idx) = found_merge_idx {
+            // Merge into existing stack.
+            let dest = &mut container.children[merge_idx];
+            let add = item.count.max(1).min(100 - dest.count);
+            dest.count += add;
+            remainder = item.count.max(1).saturating_sub(add);
+            inserted_at_front = false;
+        } else {
+            // Insert as new item at front (push_front, matching C++ addThing).
+            let cap = items_g.get_item_type(container.server_id as usize).max_items as usize;
+            if container.children.len() < cap {
+                container.children.insert(0, std::mem::take(&mut item));
+                inserted_at_front = true;
+            } else {
+                remainder = item.count.max(1);
+                inserted_at_front = false;
             }
-            Some(pos)
         }
-        Action::None => {
-            if !can_drop {
-                return None;
+
+        // When we inserted at front (index 0), any open container tracked as a
+        // child of this container has its child_idx shifted +1.  C++ doesn't
+        // need this because it tracks Container* pointers, not indices.
+        if inserted_at_front {
+            // Find which open container cid(s) resolve to this exact container
+            // (the one at `path`).  Any child of those cids needs idx adjustment.
+            let target_cids: Vec<u8> = player.open_containers.iter()
+                .filter(|(_, oc)| {
+                    match resolve_container_storage_to_path(player, oc) {
+                        Some(p) => p == path,
+                        None => false,
+                    }
+                })
+                .map(|(&c, _)| c)
+                .collect();
+            for (_, oc) in player.open_containers.iter_mut() {
+                if let crate::creatures::player::ContainerParent::Container(parent_cid, ref mut child_idx) = oc.parent {
+                    if target_cids.contains(&parent_cid) {
+                        *child_idx += 1;
+                    }
+                }
             }
-            let items_arc2 = game.items.clone();
-            let count = item.count.max(1);
-            let Some(tile) = game.map.get_tile_mut(pos) else { return None };
-            let stackpos = tile.add_item_get_stackpos(item, &items_arc2);
-            let spectators = game.map.get_spectators(pos, true, true, 0, 0, 0, 0);
-            drop(game);
-            for spec_id in spectators {
-                let items_ref = items_arc2.clone();
-                send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
-                    output.add_byte(0x6A);
-                    output.add_position(pos.x, pos.y, pos.z);
-                    output.add_byte(stackpos);
-                    write_item(output, &items_ref, server_id, count.min(100) as u8);
-                });
-            }
-            Some(pos)
         }
+
+        player.update_inventory_weight();
+
+        // Re-sync all open container windows.
+        let open_cids: Vec<u8> = player.open_containers.keys().copied().collect();
+        drop(game);
+        send_full_inventory(cid);
+        for ccid in open_cids {
+            resend_open_container_free(cid, ccid);
+        }
+
+        if remainder > 0 {
+            item.count = remainder;
+            return lua_player_add_item_relock(cid, item, can_drop, pos);
+        }
+        return Some(pos);
+    }
+
+    // Phase 3: try an empty equip slot (non-stackable items only; stackable
+    // items that didn't find a merge target above try here too for a fresh
+    // stack in a fitting slot).
+    if !stackable {
+        for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+            if player.inventory[slot].is_none()
+                && item_fits_equip_slot(slot, slot_position, weapon_type)
+            {
+                let cnt = item.count.max(1);
+                player.inventory[slot] = Some(server_id);
+                player.inventory_count[slot] = cnt;
+                player.inventory_items[slot] = Some(std::mem::take(&mut item));
+                player.update_inventory_weight();
+                drop(game);
+                send_inventory_item_to_player(cid, slot as u8, server_id, cnt);
+                return Some(pos);
+            }
+        }
+    }
+
+    // Phase 4: no room — drop on ground if allowed.
+    drop(game);
+    if !can_drop {
+        return None;
+    }
+    drop_item_on_tile(cid, pos, item);
+    Some(pos)
+}
+
+/// Resolve an OpenContainer to an inventory-slot-based path (same as the path
+/// format used by `resolve_container_ref`).  Returns None for tile/depot roots.
+fn resolve_container_storage_to_path(
+    player: &crate::creatures::player::Player,
+    oc: &crate::creatures::player::OpenContainer,
+) -> Option<Vec<usize>> {
+    use crate::creatures::player::ContainerParent;
+    match &oc.parent {
+        ContainerParent::Inventory(slot) => Some(vec![*slot as usize]),
+        ContainerParent::Container(parent_cid, child_idx) => {
+            let parent_oc = player.get_container_by_id(*parent_cid)?;
+            let mut path = resolve_container_storage_to_path(player, parent_oc)?;
+            path.push(*child_idx);
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
+/// Helper: re-lock g_game and recurse for remainder items.
+fn lua_player_add_item_relock(
+    cid: CreatureId,
+    item: crate::map::tile::MapItem,
+    can_drop: bool,
+    pos: Position,
+) -> Option<Position> {
+    lua_player_add_item(cid, item, can_drop).or(Some(pos))
+}
+
+/// Helper: resolve an immutable reference to a container in the inventory tree
+/// via a path [slot, child_idx, child_idx, ...].
+fn resolve_container_ref<'a>(
+    inventory_items: &'a [Option<crate::map::tile::MapItem>],
+    path: &[usize],
+) -> Option<&'a crate::map::tile::MapItem> {
+    if path.is_empty() { return None; }
+    let mut current = inventory_items.get(path[0])?.as_ref()?;
+    for &idx in &path[1..] {
+        current = current.children.get(idx)?;
+    }
+    Some(current)
+}
+
+/// Helper: resolve a mutable reference to a container in the inventory tree.
+fn resolve_container_mut<'a>(
+    inventory_items: &'a mut [Option<crate::map::tile::MapItem>],
+    path: &[usize],
+) -> Option<&'a mut crate::map::tile::MapItem> {
+    if path.is_empty() { return None; }
+    let mut current = inventory_items.get_mut(path[0])?.as_mut()?;
+    for &idx in &path[1..] {
+        current = current.children.get_mut(idx)?;
+    }
+    Some(current)
+}
+
+/// Drop an item on the player's tile, broadcasting to spectators.
+fn drop_item_on_tile(_cid: CreatureId, pos: Position, item: crate::map::tile::MapItem) {
+    let server_id = item.server_id;
+    let count = item.count.max(1);
+    let mut game = g_game().lock().unwrap();
+    let Some(tile) = game.map.get_tile_mut(pos) else { return };
+    let stackpos = tile.add_item_get_stackpos(item, crate::items::g_items());
+    let spectators = game.map.get_spectators(pos, true, true, 0, 0, 0, 0);
+    drop(game);
+    for spec_id in spectators {
+        send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
+            output.add_byte(0x6A);
+            output.add_position(pos.x, pos.y, pos.z);
+            output.add_byte(stackpos);
+            write_item(output, crate::items::g_items(), server_id, count.min(100) as u8);
+        });
     }
 }
 
@@ -4348,19 +4719,6 @@ fn write_map_description(
         output.add_byte(0xFF);
     }
 
-    let buf = output.get_output_buffer();
-    let hex: String = buf.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-    std::fs::write("map_dump.hex", &hex).ok();
-    tracing::info!(len = buf.len(), "MAP_DUMP written to map_dump.hex");
-
-    let mut anim_count = 0u32;
-    let mut total = 0u32;
-    for sid in 0..30000u16 {
-        let it = items.get_item_type(sid as usize);
-        if it.client_id > 0 { total += 1; }
-        if it.is_animation { anim_count += 1; }
-    }
-    tracing::info!(anim_count, total, "ANIM_STATS");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4562,7 +4920,8 @@ fn write_creature_data(
 
     if is_1098 {
         output.add_byte(creature_type); // creatureType
-        output.add_byte(0x00); // speechBubble (SPEECHBUBBLE_NONE)
+        let speech_bubble = creature.as_npc().map(|n| n.speech_bubble).unwrap_or(0);
+        output.add_byte(speech_bubble);
         output.add_byte(0xFF); // MARK_UNMARKED
         output.add_u16(0x00);  // helpers
     }
@@ -5102,6 +5461,55 @@ fn write_add_creature_packet(
     }
 }
 
+/// Set an NPC's focus creature and turn it to face that creature, mirroring
+/// `Npc::setCreatureFocus` + `Npc::turnToCreature`.  A focus of 0 clears it.
+/// While focused the NPC stops wandering (see `npc_think` walk gate).
+pub fn npc_set_creature_focus(npc_id: CreatureId, target_id: CreatureId) {
+    let turn: Option<(Position, i32, Direction)> = {
+        let mut game = g_game().lock().unwrap();
+        let target_pos = if target_id != 0 {
+            game.get_creature(target_id).map(|c| c.position())
+        } else {
+            None
+        };
+        let npc_pos = game.get_creature(npc_id).map(|c| c.position());
+        let Some(npc_pos) = npc_pos else { return };
+
+        match (target_id, target_pos) {
+            (0, _) | (_, None) => {
+                if let Some(n) = game.get_creature_mut(npc_id).and_then(|c| c.as_npc_mut()) {
+                    n.focus_creature = 0;
+                }
+                None
+            }
+            (_, Some(tp)) => {
+                // turnToCreature: dx = npc.x - target.x, dy = npc.y - target.y.
+                let dx = npc_pos.x as i32 - tp.x as i32;
+                let dy = npc_pos.y as i32 - tp.y as i32;
+                let tan = if dx != 0 { dy as f32 / dx as f32 } else { 10.0 };
+                let dir = if tan.abs() < 1.0 {
+                    if dx > 0 { Direction::West } else { Direction::East }
+                } else if dy > 0 {
+                    Direction::North
+                } else {
+                    Direction::South
+                };
+                let stackpos = game.map.get_tile(npc_pos)
+                    .map(|t| t.get_creature_client_stackpos())
+                    .unwrap_or(0) as i32;
+                if let Some(n) = game.get_creature_mut(npc_id).and_then(|c| c.as_npc_mut()) {
+                    n.focus_creature = target_id;
+                    n.base.direction = dir;
+                }
+                Some((npc_pos, stackpos, dir))
+            }
+        }
+    };
+    if let Some((pos, stackpos, dir)) = turn {
+        broadcast_creature_turn(npc_id, pos, stackpos, dir);
+    }
+}
+
 pub fn broadcast_creature_turn(creature_id: CreatureId, pos: Position, stackpos: i32, dir: Direction) {
     let spectator_ids: Vec<CreatureId>;
     {
@@ -5445,8 +5853,6 @@ pub fn broadcast_tile_item_transform(pos: Position, stackpos: u8, new_server_id:
         let mut game = g_game().lock().unwrap();
         game.map.get_spectators(pos, true, true, 0, 0, 0, 0)
     };
-    let cid = items.get_item_type(new_server_id as usize).client_id;
-    tracing::info!(?pos, stackpos, new_server_id, client_id = cid, n_spec = spectator_ids.len(), "DBG transform 0x6B");
     if items.get_item_type(new_server_id as usize).client_id == 0 {
         return;
     }
@@ -5493,7 +5899,7 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
         return;
     }
 
-    let (item, item_idx, player_pos) = {
+    let (item, item_idx) = {
         let game = g_game().lock().unwrap();
         let Some(player) = game.get_player(creature_id) else { return };
         let ppos = player.base.position;
@@ -5510,13 +5916,19 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
         let it = game.items.get_item_type(item.server_id as usize);
         if it.client_id != sprite_id { return; }
         if !it.moveable { return; }
-        (item.clone(), idx_in_tile, ppos)
+        (item.clone(), idx_in_tile)
     };
 
     let server_id = item.server_id;
-    let client_id = {
+
+    // If this container was open on the tile, re-parent it to the inventory
+    // slot instead of closing it — mirrors C++ postAddNotification where the
+    // same Container* pointer stays in openContainers and onSendContainer
+    // refreshes the window.
+    let reparent_cid: Option<u8> = {
         let game = g_game().lock().unwrap();
-        game.items.get_item_type(server_id as usize).client_id
+        game.get_player(creature_id)
+            .and_then(|p| p.get_container_id_by_tile(from_pos, item_idx))
     };
 
     {
@@ -5524,9 +5936,10 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
         if let Some(player) = game.get_player_mut(creature_id) {
             player.inventory[slot] = Some(server_id);
             player.inventory_count[slot] = item.count.max(1);
-            // Preserve the full item (attributes + container tree) for the slot
-            // so its attributes persist on save.
             player.inventory_items[slot] = Some(item.clone());
+            if let Some(cid) = reparent_cid {
+                player.add_container(cid, crate::creatures::player::ContainerParent::Inventory(slot as u8));
+            }
         }
         if let Some(tile) = game.map.get_tile_mut(from_pos) {
             tile.remove_item_at(item_idx);
@@ -5544,6 +5957,11 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
         });
     }
 
+    // Refresh the open container window if it was re-parented.
+    if let Some(ccid) = reparent_cid {
+        resend_open_container_free(creature_id, ccid);
+    }
+
     // Fire onEquip movement event.
     crate::events::dispatch::execute_equip_event(
         creature_id,
@@ -5557,18 +5975,7 @@ fn handle_ground_to_inventory(creature_id: CreatureId, from_pos: Position, to_po
         false,
     );
 
-    // Tell the player their inventory changed.
-    let s = slot as u8;
-    let cid = client_id;
-    let item_count = item.count.max(1) as u8;
-    send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
-        output.add_byte(0x78);
-        output.add_byte(s);
-        output.add_u16(cid);
-        output.add_byte(item_count);
-    });
-
-    let _ = player_pos;
+    send_inventory_item_to_player(creature_id, slot as u8, server_id, item.count.max(1));
 }
 
 fn handle_inventory_to_ground(creature_id: CreatureId, from_pos: Position, to_pos: Position, _from_stackpos: u8) {
@@ -5597,18 +6004,62 @@ fn handle_inventory_to_ground(creature_id: CreatureId, from_pos: Position, to_po
         // Carry the full item (container children) onto the ground when present.
         let item = dropped_tree.clone()
             .unwrap_or_else(|| crate::map::tile::MapItem { server_id, ..crate::map::tile::MapItem::default() });
-        let cnt = item.count.min(255).max(1) as u8;
+        let cnt = item.count.clamp(1, 255) as u8;
         let sp = tile.add_item_get_stackpos(item, &items_arc);
         (sp, cnt)
+    };
+
+    // If this container was open in the inventory, re-parent it to the tile
+    // position it was dropped at.  Mirrors C++ postRemoveNotification: when the
+    // container is still in range (dropped within 1,1) → onSendContainer
+    // (refresh); when out of range → autoCloseContainers. Since the tile index
+    // is 0 for non-always-on-top items (inserted at front by internal_add_item),
+    // we compute it here.
+    let reparent_cid: Option<u8> = {
+        let game = g_game().lock().unwrap();
+        game.get_player(creature_id)
+            .and_then(|p| p.get_container_id_by_inventory(slot as u8))
+    };
+
+    // Find the tile item index of the dropped item (it was just inserted).
+    let tile_item_index: usize = {
+        let game = g_game().lock().unwrap();
+        game.map.get_tile(to_pos)
+            .and_then(|t| t.items.iter().position(|i| i.server_id == server_id))
+            .unwrap_or(0)
+    };
+
+    let in_range = {
+        let dx = (player_pos.x as i32 - to_pos.x as i32).unsigned_abs();
+        let dy = (player_pos.y as i32 - to_pos.y as i32).unsigned_abs();
+        dx <= 1 && dy <= 1 && player_pos.z == to_pos.z
     };
 
     {
         let mut game = g_game().lock().unwrap();
         if let Some(player) = game.get_player_mut(creature_id) {
             player.inventory[slot] = None;
+            player.inventory_count[slot] = 0;
             if slot < player.inventory_items.len() {
                 player.inventory_items[slot] = None;
             }
+            if let Some(cid) = reparent_cid {
+                if in_range {
+                    player.add_container(cid, crate::creatures::player::ContainerParent::Tile(to_pos, tile_item_index));
+                } else {
+                    player.close_container(cid);
+                }
+            }
+        }
+    }
+
+    if let Some(cid) = reparent_cid {
+        if in_range {
+            resend_open_container_free(creature_id, cid);
+        } else {
+            send_packet_to_player(creature_id, move |o: &mut OutputMessage| {
+                write_close_container(o, cid);
+            });
         }
     }
 
@@ -5857,7 +6308,7 @@ fn write_remove_container_item(output: &mut OutputMessage, cid: u8, slot: u8) {
     output.add_byte(slot);
 }
 
-fn write_close_container(output: &mut OutputMessage, cid: u8) {
+pub(crate) fn write_close_container(output: &mut OutputMessage, cid: u8) {
     output.add_byte(0x6F);
     output.add_byte(cid);
 }
@@ -5942,11 +6393,13 @@ fn write_close_trade(output: &mut OutputMessage) {
 
 /// Send 0x78 (set inventory slot) for a given slot and item.
 pub(crate) fn send_inventory_item_to_player(player_id: u32, slot: u8, server_id: u16, count: u16) {
-    let items_arc = g_game().lock().unwrap().items.clone();
+    // Use the global Items registry (not via g_game) so this is safe to call
+    // while the caller already holds the g_game lock — std::sync::Mutex is not
+    // re-entrant and re-locking would deadlock.
     send_packet_to_player(player_id, move |output: &mut OutputMessage| {
         output.add_byte(0x78);
         output.add_byte(slot);
-        write_item(output, &items_arc, server_id, count.min(100) as u8);
+        write_item(output, crate::items::g_items(), server_id, count.min(100) as u8);
     });
 }
 
@@ -5959,7 +6412,7 @@ pub(crate) fn send_clear_inventory_slot(player_id: u32, slot: u8) {
 }
 
 /// Re-send all equipment slots (0x78 filled / 0x79 empty) for a player.
-fn send_full_inventory(creature_id: CreatureId) {
+pub(crate) fn send_full_inventory(creature_id: CreatureId) {
     use crate::creatures::player::{CONST_SLOT_FIRST, CONST_SLOT_LAST};
     let slots: Vec<(u8, Option<(u16, u16)>)> = {
         let game = g_game().lock().unwrap();
@@ -5979,38 +6432,56 @@ fn send_full_inventory(creature_id: CreatureId) {
 // ── Shop packets ─────────────────────────────────────────────────────────────
 
 pub(crate) fn send_shop_to_player(player_id: u32, items: &[crate::creatures::player::ShopInfo]) {
-    let game = g_game().lock().unwrap();
-    let items_ref: Vec<_> = items.iter().map(|s| {
-        let it = game.items.get_item_id_by_client_id(0); // placeholder
-        let _ = it;
-        s.clone()
-    }).collect();
-    drop(game);
-    let items_owned = items_ref;
+    // 10.98 sendShop prefixes the NPC name and uses a u16 item count; 8.60 omits
+    // the name and uses a u8 count.  The per-item body is identical.
+    let is_1098 = client_version().is_1098();
+    let npc_name = {
+        let game = g_game().lock().unwrap();
+        game.get_player(player_id)
+            .and_then(|p| p.shop_owner_id)
+            .and_then(|nid| game.get_creature(nid).map(|c| c.get_name().to_owned()))
+            .unwrap_or_default()
+    };
+    let items_owned = items.to_vec();
     send_packet_to_player(player_id, move |output: &mut OutputMessage| {
         let game = g_game().lock().unwrap();
         output.add_byte(0x7A);
-        let to_send = items_owned.len().min(u8::MAX as usize) as u8;
-        output.add_byte(to_send);
-        for item in items_owned.iter().take(to_send as usize) {
-            let it = game.items.get_item_type(item.item_id as usize);
-            output.add_u16(it.client_id);
-            if it.is_fluid_container() || it.is_splash() {
-                output.add_byte(crate::util::server_fluid_to_client(item.sub_type as u8));
-            } else {
-                output.add_byte(0x00);
-            }
-            output.add_string(item.real_name.as_bytes());
-            output.add_u32(it.weight as u32);
-            output.add_u32(item.buy_price);
-            output.add_u32(item.sell_price);
+        if is_1098 {
+            output.add_string(npc_name.as_bytes());
+            let to_send = items_owned.len().min(u16::MAX as usize);
+            output.add_u16(to_send as u16);
+            send_shop_items(output, &game, &items_owned[..to_send]);
+        } else {
+            let to_send = items_owned.len().min(u8::MAX as usize);
+            output.add_byte(to_send as u8);
+            send_shop_items(output, &game, &items_owned[..to_send]);
         }
     });
 }
 
+fn send_shop_items(output: &mut OutputMessage, game: &crate::game::Game, items: &[crate::creatures::player::ShopInfo]) {
+    for item in items {
+        let it = game.items.get_item_type(item.item_id as usize);
+        output.add_u16(it.client_id);
+        if it.is_fluid_container() || it.is_splash() {
+            output.add_byte(crate::util::server_fluid_to_client(item.sub_type as u8));
+        } else {
+            output.add_byte(0x00);
+        }
+        output.add_string(item.real_name.as_bytes());
+        output.add_u32(it.weight);
+        output.add_u32(item.buy_price);
+        output.add_u32(item.sell_price);
+    }
+}
+
 pub(crate) fn send_sale_item_list(player_id: u32, shop_items: &[crate::creatures::player::ShopInfo]) {
+    let is_1098 = client_version().is_1098();
     let game = g_game().lock().unwrap();
-    let money = game.get_player(player_id).map(|p| p.get_money()).unwrap_or(0);
+    // 10.98 sends money + bank balance as u64; 8.60 sends carried money as u32.
+    let money = game.get_player(player_id)
+        .map(|p| if is_1098 { p.get_money() + p.get_bank_balance() } else { p.get_money() })
+        .unwrap_or(0);
     // Build sale map: item_id -> count_available
     let mut sale_map: std::collections::BTreeMap<u16, u32> = std::collections::BTreeMap::new();
     if let Some(player) = game.get_player(player_id) {
@@ -6030,7 +6501,11 @@ pub(crate) fn send_sale_item_list(player_id: u32, shop_items: &[crate::creatures
     let sale_entries: Vec<(u16, u32)> = sale_map.into_iter().collect();
     send_packet_to_player(player_id, move |output: &mut OutputMessage| {
         output.add_byte(0x7B);
-        output.add_u32(money as u32);
+        if is_1098 {
+            output.add_u64(money);
+        } else {
+            output.add_u32(money as u32);
+        }
         let to_send = sale_entries.len().min(u8::MAX as usize) as u8;
         output.add_byte(to_send);
         let game = g_game().lock().unwrap();

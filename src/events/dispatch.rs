@@ -1094,7 +1094,6 @@ pub fn execute_step_event(
     if events.is_empty() {
         return;
     }
-    tracing::info!(?tile_pos, ?etype, n_events = events.len(), thread = ?std::thread::current().id(), "DBG step_event");
 
     let lua = g_lua();
     for (script_id, from_lua, item_server_id) in events {
@@ -1123,9 +1122,7 @@ pub fn execute_step_event(
             let pos_tbl = push_position(lua, tile_pos)?;
             let from_pos_tbl = push_position(lua, from_pos)?;
 
-            tracing::info!(script_id, item_server_id, "DBG step_event: calling Lua onStep");
             let r = func.call::<bool>((creature_tbl, item_val, pos_tbl, from_pos_tbl));
-            tracing::info!(script_id, ok = r.is_ok(), "DBG step_event: Lua onStep returned");
             match r {
                 Ok(_) => Ok(()),
                 Err(e) => { tracing::error!("Lua onStep error: {e}"); Ok(()) }

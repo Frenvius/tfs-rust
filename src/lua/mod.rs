@@ -6,5 +6,5 @@ pub use script::{
     LuaTimerEventDesc, LuaVariant, LuaVariantType, ScriptEnvironment, ScriptEnvFrame,
     ScriptingManager, Scripts, EVENT_ID_LOADING, EVENT_ID_USER,
     get_current_npc, set_current_npc,
-    g_npc_iface, g_npc_iface_opt, init_npc_script_interface, load_npc_type_script,
+    g_npc_iface, g_npc_iface_opt, init_npc_script_interface, load_npc_instance_script,
 };
