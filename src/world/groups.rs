@@ -56,10 +56,25 @@ impl Groups {
     }
 }
 
-/// Returns the `access` flag for a group_id, matching groups.xml.
-/// Only gamemaster (4) and community manager (5) are access groups; god (6) is
-/// NOT, matching upstream. Mirrors C++ `Player::isAccessPlayer` (group->access).
+static GROUPS: std::sync::OnceLock<Groups> = std::sync::OnceLock::new();
+
+pub fn init_groups(groups: Groups) {
+    let _ = GROUPS.set(groups);
+}
+
+pub fn g_groups() -> Option<&'static Groups> {
+    GROUPS.get()
+}
+
+/// Returns the `access` flag for a group_id from the loaded groups.xml.
+/// Mirrors C++ `Player::isAccessPlayer` (group->access). Falls back to the
+/// 8.60 default (gamemaster/community manager only) when groups aren't loaded.
 pub fn access_for_group_id(group_id: u32) -> bool {
+    if let Some(groups) = g_groups() {
+        if let Some(g) = groups.get_group(group_id as u16) {
+            return g.access;
+        }
+    }
     matches!(group_id, 4 | 5)
 }
 
@@ -67,6 +82,11 @@ pub fn access_for_group_id(group_id: u32) -> bool {
 /// Used as fallback when groups.xml has not been loaded yet.
 pub fn flags_for_group_id(group_id: u32) -> u64 {
     use crate::creatures::player::*;
+    if let Some(groups) = g_groups() {
+        if let Some(g) = groups.get_group(group_id as u16) {
+            return g.flags;
+        }
+    }
     match group_id {
         1 => 0,
         2 => PLAYER_FLAG_TALK_ORANGE_HELP_CHANNEL | PLAYER_FLAG_CANNOT_BE_MUTED,

@@ -1992,18 +1992,25 @@ fn game_handle_say(creature_id: CreatureId, speak_type: u8, channel_id: Option<u
     let text_str = String::from_utf8_lossy(&text).to_string();
     if text_str.is_empty() { return; }
 
-    let (pos, name, level) = {
+    let (pos, name, level, is_access) = {
         let game = g_game().lock().unwrap();
         let Some(player) = game.get_player(creature_id) else { return };
-        (player.base.position, player.name.clone(), player.level)
+        (player.base.position, player.name.clone(), player.level, player.is_access_player())
     };
+
+    // TalkActions first, mirroring C++ Game::playerSaySpell ordering.
+    let param = text_str.split_once(' ').map(|(_, p)| p).unwrap_or("");
+    match crate::events::dispatch::execute_talk_action(creature_id, &text_str, param, speak_type) {
+        Some(false) => return,
+        Some(true) | None => {}
+    }
 
     if crate::events::dispatch::execute_spell_say(creature_id, &text_str) {
         return;
     }
 
-    let param = text_str.split_once(' ').map(|(_, p)| p).unwrap_or("");
-    if crate::events::dispatch::execute_talk_action(creature_id, &text_str, param, speak_type) {
+    // '/' commands from access players are never echoed.
+    if text_str.starts_with('/') && is_access {
         return;
     }
 
@@ -4109,6 +4116,136 @@ fn add_item_to_player(
     false
 }
 
+/// True if `item` (by slot_position/weapon_type) can be worn in equipment
+/// `slot`, mirroring the empty-slot cases of C++ `Player::queryAdd`
+/// (non-classic equipment slots).
+pub(crate) fn item_fits_equip_slot(slot: usize, slot_position: u16, weapon_type: u8) -> bool {
+    use crate::creatures::player::*;
+    use crate::items::*;
+    match slot {
+        CONST_SLOT_HEAD => slot_position & SLOTP_HEAD != 0,
+        CONST_SLOT_NECKLACE => slot_position & SLOTP_NECKLACE != 0,
+        CONST_SLOT_BACKPACK => slot_position & SLOTP_BACKPACK != 0,
+        CONST_SLOT_ARMOR => slot_position & SLOTP_ARMOR != 0,
+        CONST_SLOT_LEGS => slot_position & SLOTP_LEGS != 0,
+        CONST_SLOT_FEET => slot_position & SLOTP_FEET != 0,
+        CONST_SLOT_RING => slot_position & SLOTP_RING != 0,
+        CONST_SLOT_AMMO => slot_position & SLOTP_AMMO != 0,
+        CONST_SLOT_RIGHT => weapon_type == 4,
+        CONST_SLOT_LEFT => weapon_type != 0 && weapon_type != 4,
+        _ => false,
+    }
+}
+
+/// Add `item` to a player following C++ `Player::queryDestination`: a fitting
+/// empty equipment slot for wearables, otherwise the equipped backpack, else
+/// dropped on the tile when `can_drop`. Sends the matching client update.
+/// Returns the player position on success (item-ref anchor), or `None`.
+pub(crate) fn lua_player_add_item(
+    cid: CreatureId,
+    mut item: crate::map::tile::MapItem,
+    can_drop: bool,
+) -> Option<Position> {
+    use crate::creatures::player::{CONST_SLOT_BACKPACK, CONST_SLOT_FIRST, CONST_SLOT_LAST};
+    let mut game = g_game().lock().unwrap();
+    let items_arc = game.items.clone();
+    let it = items_arc.get_item_type(item.server_id as usize);
+    let slot_position = it.slot_position;
+    let weapon_type = it.weapon_type;
+    let stackable = it.stackable;
+    let server_id = item.server_id;
+
+    enum Action {
+        Equip(u8, u16, u16),
+        Backpack(Option<u8>),
+        None,
+    }
+
+    let pos;
+    let placed;
+    {
+        let Some(player) = game.get_player_mut(cid) else { return None };
+        pos = player.base.position;
+        let mut act = Action::None;
+        if !stackable {
+            for slot in CONST_SLOT_FIRST..=CONST_SLOT_LAST {
+                if player.inventory[slot].is_none()
+                    && item_fits_equip_slot(slot, slot_position, weapon_type)
+                {
+                    let cnt = item.count.max(1);
+                    player.inventory[slot] = Some(server_id);
+                    player.inventory_count[slot] = cnt;
+                    player.inventory_items[slot] = Some(std::mem::take(&mut item));
+                    act = Action::Equip(slot as u8, server_id, cnt);
+                    break;
+                }
+            }
+        }
+        if matches!(act, Action::None) {
+            if let Some(Some(bp)) = player.inventory_items.get_mut(CONST_SLOT_BACKPACK) {
+                if stackable {
+                    let mut remaining = item.count.max(1);
+                    for child in bp.children.iter_mut() {
+                        if remaining == 0 {
+                            break;
+                        }
+                        if child.server_id == server_id && child.count < 100 {
+                            let add = remaining.min(100 - child.count);
+                            child.count += add;
+                            remaining -= add;
+                        }
+                    }
+                    if remaining > 0 {
+                        item.count = remaining;
+                        bp.children.insert(0, std::mem::take(&mut item));
+                    }
+                } else {
+                    bp.children.insert(0, std::mem::take(&mut item));
+                }
+                let open = player.get_container_id_by_inventory(CONST_SLOT_BACKPACK as u8);
+                act = Action::Backpack(open);
+            }
+        }
+        placed = act;
+    }
+
+    match placed {
+        Action::Equip(slot, sid, cnt) => {
+            drop(game);
+            send_inventory_item_to_player(cid, slot, sid, cnt);
+            Some(pos)
+        }
+        Action::Backpack(open) => {
+            drop(game);
+            if let Some(ccid) = open {
+                resend_open_container_free(cid, ccid);
+            }
+            Some(pos)
+        }
+        Action::None => {
+            if !can_drop {
+                return None;
+            }
+            let items_arc2 = game.items.clone();
+            let count = item.count.max(1);
+            let Some(tile) = game.map.get_tile_mut(pos) else { return None };
+            let stackpos = tile.add_item_get_stackpos(item, &items_arc2);
+            let spectators = game.map.get_spectators(pos, true, true, 0, 0, 0, 0);
+            drop(game);
+            for spec_id in spectators {
+                let items_ref = items_arc2.clone();
+                send_packet_to_player(spec_id, move |output: &mut OutputMessage| {
+                    output.add_byte(0x6A);
+                    output.add_position(pos.x, pos.y, pos.z);
+                    output.add_byte(stackpos);
+                    write_item(output, &items_ref, server_id, count.min(100) as u8);
+                });
+            }
+            Some(pos)
+        }
+    }
+}
+
 /// Send a trade offer window (0x7D own / 0x7E counter) listing the item and,
 /// if it is a container, its full contents. Mirrors `sendTradeItemRequest`.
 fn send_trade_offer(target_id: CreatureId, trader_name: &str, item: &crate::map::tile::MapItem, ack: bool) {
@@ -5772,19 +5909,11 @@ fn write_close_trade(output: &mut OutputMessage) {
 
 /// Send 0x78 (set inventory slot) for a given slot and item.
 pub(crate) fn send_inventory_item_to_player(player_id: u32, slot: u8, server_id: u16, count: u16) {
-    let game = g_game().lock().unwrap();
-    let client_id = game.items.get_item_type(server_id as usize).client_id;
-    let it_stackable = game.items.get_item_type(server_id as usize).stackable;
-    drop(game);
+    let items_arc = g_game().lock().unwrap().items.clone();
     send_packet_to_player(player_id, move |output: &mut OutputMessage| {
         output.add_byte(0x78);
         output.add_byte(slot);
-        output.add_u16(client_id);
-        if it_stackable {
-            output.add_byte(count.min(100) as u8);
-        } else {
-            output.add_byte(1);
-        }
+        write_item(output, &items_arc, server_id, count.min(100) as u8);
     });
 }
 

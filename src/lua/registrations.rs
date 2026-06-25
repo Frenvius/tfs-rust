@@ -5585,107 +5585,47 @@ fn register_player_class(lua: &Lua) -> LuaResult<()> {
         Ok(())
     })?)?;
     methods.set("addItem", lua.create_function(|lua, args: LuaMultiValue| -> LuaResult<LuaValue> {
-        use crate::creatures::player::{CONST_SLOT_FIRST, CONST_SLOT_LAST, CONST_SLOT_WHEREEVER};
         let mut iter = args.into_iter();
         let this = match iter.next() { Some(LuaValue::Table(t)) => t, _ => return Ok(LuaValue::Nil) };
         let item_id_raw = iter.next().unwrap_or(LuaValue::Nil);
         let count_raw = iter.next().unwrap_or(LuaValue::Integer(1));
         let can_drop = match iter.next() { Some(LuaValue::Boolean(b)) => b, _ => true };
         let sub_type_raw = iter.next().unwrap_or(LuaValue::Integer(1));
-        let slot_raw = iter.next().unwrap_or(LuaValue::Integer(0));
         let cid = get_creature_id(&this)?;
-        let mut game = g_game().lock().unwrap();
+        let items = crate::items::g_items();
         let item_id: u16 = match &item_id_raw {
             LuaValue::Integer(n) => *n as u16,
-            LuaValue::String(s) => game.items.get_item_id_by_name(&s.to_string_lossy()).unwrap_or(0),
+            LuaValue::Number(n) => *n as u16,
+            LuaValue::String(s) => items.get_item_id_by_name(&s.to_string_lossy()).unwrap_or(0),
             _ => return Ok(LuaValue::Nil),
         };
         if item_id == 0 { return Ok(LuaValue::Nil); }
-        let it = game.items.get_item_type(item_id as usize);
+        let it = items.get_item_type(item_id as usize);
         let stackable = it.stackable;
         let has_sub = it.has_sub_type();
         let is_container = it.kind == crate::items::ItemKind::Container;
-        let mut count = match count_raw { LuaValue::Integer(n) => n as i32, LuaValue::Number(n) => n as i32, _ => 1 };
+        let count = match count_raw { LuaValue::Integer(n) => n as i32, LuaValue::Number(n) => n as i32, _ => 1 };
         let sub_type = match sub_type_raw { LuaValue::Integer(n) => n as i32, LuaValue::Number(n) => n as i32, _ => 1 };
-        if count < 1 { count = 1; }
-        let slot_pref: usize = match slot_raw { LuaValue::Integer(n) => n as usize, _ => CONST_SLOT_WHEREEVER };
-        // For stackable items, add to existing stack or free slot
-        if stackable || has_sub {
-            let cap = 100i32;
-            let qty = if has_sub && !stackable { sub_type } else { count.min(cap) };
-            // Try to add to existing stack
-            let player = match game.get_player_mut(cid) { Some(p) => p, None => return Ok(LuaValue::Nil) };
-            let target_slot = if (CONST_SLOT_FIRST..=CONST_SLOT_LAST).contains(&slot_pref)
-                && (player.inventory[slot_pref] == Some(item_id) || player.inventory[slot_pref].is_none()) {
-                Some(slot_pref)
-            } else {
-                (CONST_SLOT_FIRST..=CONST_SLOT_LAST).find(|&s| {
-                    player.inventory[s] == Some(item_id) && (player.inventory_count[s] as i32) < cap
-                }).or_else(|| (CONST_SLOT_FIRST..=CONST_SLOT_LAST).find(|&s| player.inventory[s].is_none()))
-            };
-            if let Some(sl) = target_slot {
-                if player.inventory[sl] == Some(item_id) {
-                    let new_count = (player.inventory_count[sl] as i32 + qty).min(cap) as u16;
-                    player.inventory_count[sl] = new_count;
-                } else {
-                    player.inventory[sl] = Some(item_id);
-                    player.inventory_count[sl] = qty.max(1) as u16;
-                }
-                let pos = player.base.position;
-                drop(game);
-                crate::net::game_protocol::send_inventory_item_to_player(cid, sl as u8, item_id, qty as u16);
-                let t = push_item_ref(lua, item_id as u16, pos, sl as i32)?;
-                if is_container {
-                    if let Ok(mt) = lua.named_registry_value::<LuaTable>("Container") {
-                        let _ = t.set_metatable(Some(mt));
-                    }
-                }
-                return Ok(LuaValue::Table(t));
-            }
+        let qty: u16 = if stackable {
+            count.clamp(1, 100) as u16
+        } else if has_sub {
+            sub_type.max(0) as u16
         } else {
-            // Non-stackable: find free slot
-            let player = match game.get_player_mut(cid) { Some(p) => p, None => return Ok(LuaValue::Nil) };
-            let target_slot = if (CONST_SLOT_FIRST..=CONST_SLOT_LAST).contains(&slot_pref) && player.inventory[slot_pref].is_none() {
-                Some(slot_pref)
-            } else {
-                (CONST_SLOT_FIRST..=CONST_SLOT_LAST).find(|&s| player.inventory[s].is_none())
-            };
-            if let Some(sl) = target_slot {
-                player.inventory[sl] = Some(item_id);
-                player.inventory_count[sl] = 1;
-                let pos = player.base.position;
-                drop(game);
-                crate::net::game_protocol::send_inventory_item_to_player(cid, sl as u8, item_id, 1);
-                let t = push_item_ref(lua, item_id as u16, pos, sl as i32)?;
+            count.max(1) as u16
+        };
+        let item = crate::map::tile::MapItem { server_id: item_id, count: qty, ..Default::default() };
+        match crate::net::game_protocol::lua_player_add_item(cid, item, can_drop) {
+            Some(pos) => {
+                let t = push_item_ref(lua, item_id, pos, -1)?;
                 if is_container {
                     if let Ok(mt) = lua.named_registry_value::<LuaTable>("Container") {
                         let _ = t.set_metatable(Some(mt));
                     }
                 }
-                return Ok(LuaValue::Table(t));
+                Ok(LuaValue::Table(t))
             }
+            None => Ok(LuaValue::Nil),
         }
-        // No space in inventory — drop on map if allowed
-        if can_drop {
-            let pos = game.get_player(cid).map(|p| p.base.position);
-            if let Some(pos) = pos {
-                let items_arc = game.items.clone();
-                let item = crate::map::tile::MapItem { server_id: item_id, count: count.max(1) as u16, ..Default::default() };
-                if let Some(tile) = game.map.get_tile_mut(pos) {
-                    let idx = tile.items.len() as i32;
-                    tile.internal_add_item(item, &items_arc);
-                    drop(game);
-                    let t = push_item_ref(lua, item_id, pos, idx)?;
-                    if is_container {
-                        if let Ok(mt) = lua.named_registry_value::<LuaTable>("Container") {
-                            let _ = t.set_metatable(Some(mt));
-                        }
-                    }
-                    return Ok(LuaValue::Table(t));
-                }
-            }
-        }
-        Ok(LuaValue::Nil)
     })?)?;
     methods.set("addItemEx", lua.create_function(|_, args: LuaMultiValue| -> LuaResult<u32> {
         use crate::creatures::player::{CONST_SLOT_FIRST, CONST_SLOT_LAST};
@@ -7641,9 +7581,6 @@ fn register_item_type_class(lua: &Lua) -> LuaResult<()> {
             }
             _ => 0,
         };
-        if item_id == 0 {
-            return Ok(LuaValue::Nil);
-        }
         let t = lua.create_table()?;
         t.raw_set(1, item_id)?;
         if let Ok(mt) = lua.named_registry_value::<LuaTable>("ItemType") {

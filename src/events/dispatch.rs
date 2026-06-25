@@ -1000,17 +1000,22 @@ pub fn fire_prepare_death_events(
     true
 }
 
+/// Runs a matching talk action. Returns `None` if `words` matched no scripted
+/// talk action (caller should continue normal say handling), or `Some(result)`
+/// where `result` is the Lua `onSay` return — mirroring C++
+/// `TalkActions::playerSaySpell`: `Some(true)` => TALKACTION_CONTINUE,
+/// `Some(false)` => TALKACTION_BREAK (consume, suppress echo).
 pub fn execute_talk_action(
     player_id: CreatureId,
     words: &str,
     param: &str,
     talk_type: u8,
-) -> bool {
+) -> Option<bool> {
     let (script_id, from_lua) = {
         let registry = g_script_registry().lock().unwrap();
         match registry.talk_actions.get_talk_action(words) {
             Some(ta) if ta.scripted => (ta.script_id, ta.from_lua),
-            _ => return false,
+            _ => return None,
         }
     };
 
@@ -1018,7 +1023,7 @@ pub fn execute_talk_action(
 
     if !ScriptEnvironment::reserve() {
         tracing::error!("TalkAction::executeSay - Call stack overflow");
-        return false;
+        return Some(false);
     }
     ScriptEnvironment::set_script_id(script_id, "TalkAction Interface");
 
@@ -1048,7 +1053,7 @@ pub fn execute_talk_action(
 
     ScriptEnvironment::reset();
 
-    result.unwrap_or(false)
+    Some(result.unwrap_or(false))
 }
 
 /// Fire `onStepIn` or `onStepOut` events for a creature moving to/from `tile_pos`.

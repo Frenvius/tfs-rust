@@ -178,6 +178,15 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
         crate::world::vocation::init_vocations(crate::world::vocation::Vocations::default());
     }
 
+    // Load groups.
+    let groups_path = first_existing(&["data/XML/groups.xml", "data/groups.xml"]);
+    if let Some(groups_path) = groups_path {
+        match crate::world::groups::Groups::load_from_xml(groups_path) {
+            Ok(groups) => crate::world::groups::init_groups(groups),
+            Err(e) => tracing::warn!("Groups::load_from_xml failed: {e}"),
+        }
+    }
+
     // Load quests.
     let quests_path = first_existing(&["data/XML/quests.xml", "data/quests.xml"]);
     if let Some(quests_path) = quests_path {
