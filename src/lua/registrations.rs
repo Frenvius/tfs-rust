@@ -3518,7 +3518,8 @@ fn register_item_class(lua: &Lua) -> LuaResult<()> {
     methods.set("getAttribute", lua.create_function(|lua, (this, key): (LuaTable, LuaValue)| -> LuaResult<LuaValue> {
         let game = g_game().lock().unwrap();
         let item = get_item_from_lua(&this, &game);
-        let Some(item) = item else { return Ok(LuaValue::Nil); };
+        let default_item = crate::map::tile::MapItem::default();
+        let item = item.unwrap_or(&default_item);
         let attr_name = match &key {
             LuaValue::String(s) => s.to_string_lossy().to_lowercase(),
             LuaValue::Integer(n) => return item_get_attr_by_id(lua, item, *n as u32),
