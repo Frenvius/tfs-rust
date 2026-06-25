@@ -3326,7 +3326,8 @@ fn register_item_class(lua: &Lua) -> LuaResult<()> {
         }
         Ok(t)
     })?)?;
-    methods.set("remove", lua.create_function(|_, (this, _count_opt): (LuaTable, Option<i32>)| -> LuaResult<bool> {
+    methods.set("remove", lua.create_function(|_, (this, count_opt): (LuaTable, Option<i32>)| -> LuaResult<bool> {
+        let count = count_opt.unwrap_or(-1);
         // Handle inventory slot items (from getSlotItem).
         let owner_id: u32 = this.raw_get::<u32>("_owner_id").unwrap_or(0);
         if owner_id != 0 {
@@ -3346,20 +3347,30 @@ fn register_item_class(lua: &Lua) -> LuaResult<()> {
             }
         }
 
-        // Handle tile items (from map).
         let pos_x: Option<u16> = this.raw_get("_pos_x").ok();
         let pos_y: Option<u16> = this.raw_get("_pos_y").ok();
         let pos_z: Option<u8> = this.raw_get("_pos_z").ok();
         let idx: Option<i32> = this.raw_get("_idx").ok();
 
-        if let (Some(x), Some(y), Some(z), Some(idx)) = (pos_x, pos_y, pos_z, idx) {
-            let pos = Position { x, y, z };
-            let mut game = g_game().lock().unwrap();
-            if let Some(tile) = game.map.get_tile_mut(pos) {
-                if idx == -1 {
-                    tile.ground = None;
-                } else {
-                    tile.remove_item_at(idx as usize);
+        if let (Some(x), Some(y), Some(z)) = (pos_x, pos_y, pos_z) {
+            // Inventory / open-container item: x==0xFFFF.
+            if x == 0xFFFF {
+                let owner_cid: u32 = this.raw_get::<u32>("_owner_cid").unwrap_or(0);
+                if owner_cid != 0 {
+                    crate::net::game_protocol::lua_remove_inventory_item(owner_cid, Position { x, y, z }, count);
+                }
+                return Ok(true);
+            }
+            // Map tile item.
+            if let Some(idx) = idx {
+                let pos = Position { x, y, z };
+                let mut game = g_game().lock().unwrap();
+                if let Some(tile) = game.map.get_tile_mut(pos) {
+                    if idx == -1 {
+                        tile.ground = None;
+                    } else {
+                        tile.remove_item_at(idx as usize);
+                    }
                 }
             }
         }
@@ -4448,7 +4459,7 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
 
     methods.set("say", lua.create_function(|_, (this, text, speak_type, _ghost, _spectators, _pos): (LuaTable, String, Option<u8>, Option<bool>, Option<LuaValue>, Option<LuaTable>)| -> LuaResult<bool> {
         let cid = get_creature_id(&this)?;
-        let s2c_type = speak_type.unwrap_or(0x01);
+        let s2c_type = crate::net::protocol_version::translate_speak_class_to_client(speak_type.unwrap_or(0x01));
         let game = g_game().lock().unwrap();
         let (name, pos) = match game.get_creature(cid) {
             Some(c) => {
@@ -4603,7 +4614,7 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
         Ok(LuaValue::Nil)
     })?)?;
 
-    methods.set("getCondition", lua.create_function(|lua, (this, cond_type, cond_id, sub_id): (LuaTable, u32, Option<u32>, Option<u32>)| -> LuaResult<LuaValue> {
+    methods.set("getCondition", lua.create_function(|lua, (this, cond_type, cond_id, sub_id): (LuaTable, u32, Option<i32>, Option<u32>)| -> LuaResult<LuaValue> {
         let cid = get_creature_id(&this)?;
         let game = g_game().lock().unwrap();
         if let Some(creature) = game.get_creature(cid) {
@@ -4611,7 +4622,7 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
             let sub_id = sub_id.unwrap_or(0);
             for condition in &creature.base().conditions {
                 if condition.get_type() as u32 == cond_type
-                    && (cond_id == 0 || condition.get_id() as u32 == cond_id)
+                    && condition.get_id() as i32 == cond_id
                     && (sub_id == 0 || condition.get_sub_id() == sub_id) {
                     let t = lua.create_table()?;
                     t.set("type", condition.get_type() as u32)?;

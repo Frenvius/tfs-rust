@@ -1518,6 +1518,32 @@ fn game_parse_look_at(creature_id: CreatureId, pos: Position, _sprite_id: u16, s
         Some(p) => p.base.position,
         None => return,
     };
+
+    // Inventory / open-container look: x==0xFFFF marks a non-map location.
+    if pos.x == 0xFFFF {
+        let Some(player) = game.get_player(creature_id) else { return };
+        let server_id = if pos.y & 0x40 != 0 {
+            // open container: cid = y & 0x0F, child index = z
+            let cid = (pos.y & 0x0F) as u8;
+            player.get_container_by_id(cid)
+                .and_then(|_| resolve_container_storage(player, cid))
+                .and_then(|(root, path, _)| container_item_ref(&game, creature_id, &root, &path))
+                .and_then(|c| c.children.get(usize::from(pos.z)).map(|it| it.server_id))
+        } else {
+            // equipment slot = y
+            let slot = usize::from(pos.y);
+            player.inventory_items.get(slot).and_then(|o| o.as_ref()).map(|it| it.server_id)
+                .or_else(|| player.inventory.get(slot).copied().flatten())
+        };
+        let Some(server_id) = server_id else { return };
+        let count = 1u32;
+        drop(game);
+        crate::events::g_events().lock().unwrap().event_player_on_look(
+            creature_id, crate::events::LookThingType::Item(server_id, count), pos, stackpos, -1,
+        );
+        return;
+    }
+
     let tile = match game.map.get_tile(pos) {
         Some(t) => t,
         None => return,
@@ -3419,8 +3445,16 @@ fn resolve_player_item_for_use(
     let player = game.get_player(creature_id)?;
 
     if pos.x == 0xFFFF {
-        let slot = usize::from(pos.y);
-        let server_id = player.get_inventory_item(slot)?;
+        let server_id = if pos.y & 0x40 != 0 {
+            // item inside an open container: cid = y & 0x0F, child index = z
+            let cid = (pos.y & 0x0F) as u8;
+            let (root, path, _) = resolve_container_storage(player, cid)?;
+            let container = container_item_ref(&game, creature_id, &root, &path)?;
+            container.children.get(usize::from(pos.z))?.server_id
+        } else {
+            let slot = usize::from(pos.y);
+            player.get_inventory_item(slot)?
+        };
         let item_type = game.items.get_item_type(usize::from(server_id));
         if item_type.useable != expect_useable || item_type.client_id != sprite_id {
             return None;
@@ -3712,6 +3746,52 @@ fn container_children_mut<'a>(
         cur = cur.children.get_mut(i)?;
     }
     Some(&mut cur.children)
+}
+
+/// Remove (or decrement) an item the Lua layer holds by an inventory/container
+/// encoded position (x==0xFFFF). Returns true when handled. Refreshes the
+/// affected equipment slot or open container for the owner.
+pub(crate) fn lua_remove_inventory_item(owner_cid: u32, pos: Position, count: i32) -> bool {
+    if pos.x != 0xFFFF {
+        return false;
+    }
+    if pos.y & 0x40 != 0 {
+        let cid = (pos.y & 0x0F) as u8;
+        let child_idx = usize::from(pos.z);
+        {
+            let mut game = g_game().lock().unwrap();
+            let resolved = game.get_player(owner_cid).and_then(|p| resolve_container_storage(p, cid));
+            if let Some((root, path, _)) = resolved {
+                if let Some(children) = container_children_mut(&mut game, owner_cid, &root, &path) {
+                    if let Some(it) = children.get_mut(child_idx) {
+                        if count > 0 && (it.count as i32) > count {
+                            it.count -= count as u16;
+                        } else {
+                            children.remove(child_idx);
+                        }
+                    }
+                }
+            }
+        }
+        resend_open_container_free(owner_cid, cid);
+        true
+    } else {
+        let slot = usize::from(pos.y);
+        {
+            let mut game = g_game().lock().unwrap();
+            if let Some(player) = game.get_player_mut(owner_cid) {
+                if slot < player.inventory.len() {
+                    player.inventory[slot] = None;
+                    player.inventory_count[slot] = 0;
+                    if slot < player.inventory_items.len() {
+                        player.inventory_items[slot] = None;
+                    }
+                }
+            }
+        }
+        send_clear_inventory_slot(owner_cid, slot as u8);
+        true
+    }
 }
 
 /// Shared access to the container item identified by `(root, path)`.
