@@ -645,6 +645,140 @@ impl Floor {
     }
 }
 
+use crate::creatures::Direction;
+
+const MAP_NORMALWALKCOST: u16 = 10;
+const MAP_DIAGONALWALKCOST: u16 = 25;
+const MAX_PATHFIND_NODES: usize = 512;
+
+#[allow(clippy::too_many_arguments)]
+pub fn find_path(
+    map: &Map,
+    start: Position,
+    target: Position,
+    min_target_dist: i32,
+    max_target_dist: i32,
+    full_path_search: bool,
+    _clear_sight: bool,
+    max_search_dist: i32,
+) -> Option<Vec<Direction>> {
+    if start.z != target.z { return None; }
+
+    let dx = (start.x as i32 - target.x as i32).unsigned_abs();
+    let dy = (start.y as i32 - target.y as i32).unsigned_abs();
+    if max_target_dist <= 1 && dx <= 1 && dy <= 1 {
+        return Some(vec![]);
+    }
+
+    let max_dx = if max_search_dist != 0 { max_search_dist } else { MAX_VIEWPORT_X + 1 };
+    let max_dy = if max_search_dist != 0 { max_search_dist } else { MAX_VIEWPORT_Y + 1 };
+    if dx as i32 > max_dx || dy as i32 > max_dy { return None; }
+
+    use std::collections::{BinaryHeap, HashMap};
+    use std::cmp::Reverse;
+
+    #[derive(Clone)]
+    struct Node { g: u16, f: u16, parent: Option<(u16, u16)> }
+
+    let mut open: BinaryHeap<Reverse<(u16, u16, u16)>> = BinaryHeap::new();
+    let mut best: HashMap<(u16, u16), Node> = HashMap::new();
+    let mut closed: std::collections::HashSet<(u16, u16)> = std::collections::HashSet::new();
+
+    let heuristic = |x: u16, y: u16| -> u16 {
+        let dx = (x as i32 - target.x as i32).unsigned_abs() as u16;
+        let dy = (y as i32 - target.y as i32).unsigned_abs() as u16;
+        dx.max(dy) * MAP_NORMALWALKCOST
+    };
+
+    let h0 = heuristic(start.x, start.y);
+    open.push(Reverse((h0, start.x, start.y)));
+    best.insert((start.x, start.y), Node { g: 0, f: h0, parent: None });
+
+    let neighbors: [(i32, i32); 8] = [(-1, 0), (0, 1), (1, 0), (0, -1), (-1, -1), (1, -1), (1, 1), (-1, 1)];
+
+    let mut found: Option<(u16, u16)> = None;
+    let mut best_match: i32 = 0;
+    let limit = if full_path_search { MAX_PATHFIND_NODES } else { (MAX_VIEWPORT_X as usize) * (MAX_VIEWPORT_Y as usize) };
+    let mut iterations = 0usize;
+
+    while let Some(Reverse((_, cx, cy))) = open.pop() {
+        let key = (cx, cy);
+        if closed.contains(&key) { continue; }
+        closed.insert(key);
+        iterations += 1;
+        if iterations >= limit { break; }
+
+        let pos = Position { x: cx, y: cy, z: start.z };
+        let pdx = (pos.x as i32 - target.x as i32).abs();
+        let pdy = (pos.y as i32 - target.y as i32).abs();
+        let dist = pdx.max(pdy);
+        if dist >= min_target_dist && dist <= max_target_dist {
+            let m = max_target_dist - dist;
+            if m > best_match || found.is_none() {
+                best_match = m;
+                found = Some(key);
+                if best_match == 0 { break; }
+            }
+        }
+
+        let cur_g = best[&key].g;
+        for &(ndx, ndy) in &neighbors {
+            let nx = cx as i32 + ndx;
+            let ny = cy as i32 + ndy;
+            if nx < 0 || ny < 0 || nx > 0xFFFF || ny > 0xFFFF { continue; }
+            let (nx, ny) = (nx as u16, ny as u16);
+            let nkey = (nx, ny);
+            if closed.contains(&nkey) { continue; }
+
+            let npos = Position { x: nx, y: ny, z: start.z };
+            let tile = match map.get_tile(npos) {
+                Some(t) => t,
+                None => continue,
+            };
+            if tile.ground.is_none() { continue; }
+            if tile.has_flag(crate::map::tile::TILESTATE_BLOCKSOLID) && !tile.creature_ids.is_empty() {
+                continue;
+            }
+            if tile.has_flag(crate::map::tile::TILESTATE_BLOCKSOLID) { continue; }
+
+            let walk_cost = if ndx.abs() == ndy.abs() { MAP_DIAGONALWALKCOST } else { MAP_NORMALWALKCOST };
+            let creature_cost = if !tile.creature_ids.is_empty() { MAP_NORMALWALKCOST * 3 } else { 0 };
+            let ng = cur_g + walk_cost + creature_cost;
+            let nh = heuristic(nx, ny);
+            let nf = ng + nh;
+
+            if let Some(existing) = best.get(&nkey) {
+                if existing.f <= nf { continue; }
+            }
+
+            best.insert(nkey, Node { g: ng, f: nf, parent: Some(key) });
+            open.push(Reverse((nf, nx, ny)));
+        }
+    }
+
+    let end = found?;
+    let mut dirs = Vec::new();
+    let mut cur = end;
+    while let Some(parent) = best.get(&cur).and_then(|n| n.parent) {
+        let ddx = parent.0 as i32 - cur.0 as i32;
+        let ddy = parent.1 as i32 - cur.1 as i32;
+        let d = match (ddx, ddy) {
+            (1, 1)   => Direction::NorthWest,
+            (-1, 1)  => Direction::NorthEast,
+            (1, -1)  => Direction::SouthWest,
+            (-1, -1) => Direction::SouthEast,
+            (1, 0)   => Direction::West,
+            (-1, 0)  => Direction::East,
+            (0, 1)   => Direction::North,
+            (0, -1)  => Direction::South,
+            _ => break,
+        };
+        dirs.push(d);
+        cur = parent;
+    }
+    Some(dirs)
+}
+
 #[derive(Debug, Default)]
 struct QTreeLeafNode {
     floors: [Option<Floor>; MAP_MAX_LAYERS],

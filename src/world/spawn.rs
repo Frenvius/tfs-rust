@@ -27,7 +27,6 @@ pub struct Spawn {
     pub spawned_map: BTreeMap<u32, CreatureId>,
     pub spawn_map: BTreeMap<u32, SpawnBlock>,
     pub npc_blocks: Vec<NpcBlock>,
-    check_spawn_event: u32,
 }
 
 impl Spawn {
@@ -39,7 +38,6 @@ impl Spawn {
             spawned_map: BTreeMap::new(),
             spawn_map: BTreeMap::new(),
             npc_blocks: Vec::new(),
-            check_spawn_event: 0,
         }
     }
 
@@ -90,8 +88,6 @@ impl Spawn {
                     .place_creature(Creature::Monster(monster));
 
                 if placed {
-                    // Broadcast after the lock is released (no-op pre-login, but
-                    // keeps the appear path consistent with runtime respawns).
                     crate::net::game_protocol::broadcast_creature_appear(creature_id, pos);
                     self.spawned_map.insert(spawn_id, creature_id);
                     break;
@@ -108,37 +104,11 @@ impl Spawn {
             let pos = nb.pos;
             let placed = g_game().lock().unwrap().place_creature(Creature::Npc(npc));
             if placed {
-                // Load this NPC's own script copy (parses its parameters), then
-                // fire its self-appear so shop/quest modules set the bubble.
                 crate::creatures::npc::register_npc_instance(creature_id, &type_name);
                 crate::creatures::npc::fire_npc_creature_appear(creature_id, creature_id, "Npc");
                 crate::net::game_protocol::broadcast_creature_appear(creature_id, pos);
             }
         }
-    }
-
-    pub fn start_spawn_check(&mut self) {
-    }
-
-    pub fn stop_event(&mut self) {
-        if self.check_spawn_event != 0 {
-            self.check_spawn_event = 0;
-        }
-    }
-
-    pub fn cleanup(&mut self) {
-        self.stop_event();
-    }
-
-    pub fn find_player(_pos: Position) -> bool {
-        false
-    }
-
-    pub fn spawn_monster(&mut self, _spawn_id: u32, _startup: bool) -> bool {
-        false
-    }
-
-    pub fn check_spawn(&mut self) {
     }
 }
 
@@ -251,9 +221,6 @@ impl Spawns {
     }
 
     pub fn clear(&mut self) {
-        for spawn in &mut self.spawn_list {
-            spawn.stop_event();
-        }
         self.spawn_list.clear();
         self.loaded = false;
         self.started = false;
@@ -266,6 +233,90 @@ impl Spawns {
 
     pub fn is_loaded(&self) -> bool {
         self.loaded
+    }
+
+    pub fn check_spawns(&mut self, game: &mut crate::game::Game) -> Vec<(crate::creatures::CreatureId, Position)> {
+        use crate::creatures::{Creature, monster::Monster};
+        use crate::util::otsys_time;
+
+        struct SpawnWork {
+            spawn_idx: usize,
+            spawn_id: u32,
+            names: Vec<(String, u16)>,
+            pos: Position,
+            direction: Direction,
+            interval: u32,
+        }
+
+        let now = otsys_time();
+
+        let mut spawned_out: Vec<(CreatureId, Position)> = Vec::new();
+        let mut work_items: Vec<SpawnWork> = Vec::new();
+        for (si, spawn) in self.spawn_list.iter().enumerate() {
+            for (&spawn_id, sb) in &spawn.spawn_map {
+                if spawn.spawned_map.contains_key(&spawn_id) {
+                    continue;
+                }
+                let interval_ms = sb.interval.max(MINSPAWN_INTERVAL as u32);
+                if (now - sb.last_spawn) < interval_ms as i64 {
+                    continue;
+                }
+                work_items.push(SpawnWork {
+                    spawn_idx: si,
+                    spawn_id,
+                    names: sb.monster_names.clone(),
+                    pos: sb.pos,
+                    direction: sb.direction,
+                    interval: interval_ms,
+                });
+            }
+        }
+
+        for w in &work_items {
+            let specs = game.map.get_spectators(w.pos, false, true, 0, 0, 0, 0);
+            let has_nearby_player = specs.iter().any(|&id| {
+                game.get_creature(id)
+                    .and_then(|c| c.as_player())
+                    .map(|p| !p.has_flag(crate::creatures::player::PLAYER_FLAG_IGNORED_BY_MONSTERS))
+                    .unwrap_or(false)
+            });
+
+            if has_nearby_player {
+                if let Some(spawn) = self.spawn_list.get_mut(w.spawn_idx) {
+                    if let Some(sb) = spawn.spawn_map.get_mut(&w.spawn_id) {
+                        sb.last_spawn = now - w.interval as i64 + MINSPAWN_INTERVAL as i64;
+                    }
+                }
+                continue;
+            }
+
+            for (name, _weight) in &w.names {
+                let Some(mut monster) = Monster::create_monster(name) else { continue };
+                monster.base.position = w.pos;
+                monster.spawn_pos = w.pos;
+                monster.base.direction = w.direction;
+                let monster_id = monster.base.id;
+
+                let placed = game.place_creature(Creature::Monster(monster));
+
+                if placed {
+                    if let Some(spawn) = self.spawn_list.get_mut(w.spawn_idx) {
+                        spawn.spawned_map.insert(w.spawn_id, monster_id);
+                        if let Some(sb) = spawn.spawn_map.get_mut(&w.spawn_id) {
+                            sb.last_spawn = now;
+                        }
+                    }
+                    spawned_out.push((monster_id, w.pos));
+                    break;
+                }
+            }
+        }
+
+        for spawn in &mut self.spawn_list {
+            spawn.spawned_map.retain(|_, cid| game.get_creature(*cid).is_some());
+        }
+
+        spawned_out
     }
 }
 

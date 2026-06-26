@@ -472,6 +472,22 @@ pub fn send_icons_to_player(creature_id: CreatureId) {
     });
 }
 
+pub fn send_spell_cooldown_to_player(creature_id: CreatureId, spell_id: u8, time_ms: u32) {
+    send_packet_to_player(creature_id, |output: &mut OutputMessage| {
+        output.add_byte(0xA4);
+        output.add_byte(spell_id);
+        output.add_u32(time_ms);
+    });
+}
+
+pub fn send_spell_group_cooldown_to_player(creature_id: CreatureId, group_id: u8, time_ms: u32) {
+    send_packet_to_player(creature_id, |output: &mut OutputMessage| {
+        output.add_byte(0xA5);
+        output.add_byte(group_id);
+        output.add_u32(time_ms);
+    });
+}
+
 pub fn broadcast_effect_to_spectators(pos: Position, build_fn: impl Fn(&mut OutputMessage)) {
     let spectator_ids: Vec<CreatureId>;
     {
@@ -1122,9 +1138,16 @@ impl ProtocolGame {
                 dispatch(move || game_parse_text_window(cid, window_text_id, text));
             }
             0x8A => {
-                let _door_id = msg.get_byte();
-                let _window_text_id = msg.get_u32();
-                let _text = msg.get_string(None);
+                let door_id = msg.get_byte();
+                let window_text_id = msg.get_u32();
+                let text = msg.get_string(None);
+                dispatch(move || game_parse_house_window(cid, door_id, window_text_id, text));
+            }
+            0x8B => {
+                let pos = to_map_position(msg.get_position());
+                let sprite_id = msg.get_u16();
+                let stackpos = msg.get_byte();
+                dispatch(move || game_parse_wrap_item(cid, pos, sprite_id, stackpos));
             }
             0x8C => {
                 let pos = to_map_position(msg.get_position());
@@ -1203,8 +1226,15 @@ impl ProtocolGame {
                 let container_id = msg.get_byte();
                 dispatch(move || game_parse_update_container(cid, container_id));
             }
-            0xCB => { msg.skip_bytes(5); }
-            0xCC => { msg.skip_bytes(3); }
+            0xCB => {
+                let pos = to_map_position(msg.get_position());
+                dispatch(move || game_parse_browse_field(cid, pos));
+            }
+            0xCC => {
+                let container_id = msg.get_byte();
+                let index = msg.get_u16();
+                dispatch(move || game_parse_seek_in_container(cid, container_id, index));
+            }
             0xD2 => dispatch(move || game_handle_request_outfit(cid)),
             0xD3 => {
                 let look_type = msg.get_u16();
@@ -1215,19 +1245,28 @@ impl ProtocolGame {
                 let look_addons = msg.get_byte();
                 dispatch(move || game_parse_set_outfit(cid, look_type, look_head, look_body, look_legs, look_feet, look_addons));
             }
-            0xD4 => { msg.skip_bytes(1); }
+            0xD4 => {
+                let mount = msg.get_byte() != 0;
+                dispatch(move || game_parse_toggle_mount(cid, mount));
+            }
             0xDC => {
                 let name = msg.get_string(None);
                 dispatch(move || game_parse_add_vip(cid, name));
             }
             0xDD => { let guid = msg.get_u32(); dispatch(move || game_parse_remove_vip(cid, guid)); }
             0xDE => {
-                let _guid = msg.get_u32();
-                let _ = msg.get_string(None);
-                let _icon = msg.get_u32();
-                let _notify = msg.get_byte();
+                let guid = msg.get_u32();
+                let description = msg.get_string(None);
+                let icon = msg.get_u32().min(10);
+                let notify = msg.get_byte() != 0;
+                dispatch(move || game_parse_edit_vip(cid, guid, description, icon, notify));
             }
-            0xE6 => { let _msg = msg.get_string(None); }
+            0xE6 => {
+                let category = msg.get_byte();
+                let message = msg.get_string(None);
+                let pos = if category == 3 { Some(to_map_position(msg.get_position())) } else { None };
+                dispatch(move || game_parse_bug_report(cid, category, message, pos));
+            }
             0xE7 => {}
             0xE8 => {
                 let _line = msg.get_string(None);
@@ -1237,10 +1276,39 @@ impl ProtocolGame {
             }
             0xF0 => dispatch(move || game_handle_quest_log(cid)),
             0xF1 => { let quest_id = msg.get_u16(); dispatch(move || game_parse_quest_line(cid, quest_id)); }
-            0xF2 => { let _ = msg.get_string(None); let _ = msg.get_string(None); let _ = msg.get_string(None); let _ = msg.get_string(None); }
+            0xF2 => {
+                let report_type = msg.get_byte();
+                let report_reason = msg.get_byte();
+                let target_name = msg.get_string(None);
+                let comment = msg.get_string(None);
+                let mut translation: Vec<u8> = Vec::new();
+                if report_type == 0 {
+                    translation = msg.get_string(None);
+                } else if report_type == 1 {
+                    translation = msg.get_string(None);
+                    let _ = msg.get_u32();
+                }
+                dispatch(move || game_parse_rule_violation(cid, report_type, report_reason, target_name, comment, translation));
+            }
             0xF3 => {}
-            0xF4..=0xF8 => {}
-            0xF9 => { let _ = msg.get_u32(); let _ = msg.get_byte(); let _ = msg.get_byte(); }
+            0xF4 => dispatch(move || game_parse_market_leave(cid)),
+            0xF5 => { let browse_id = msg.get_u16(); dispatch(move || game_parse_market_browse(cid, browse_id)); }
+            0xF6 => {
+                let offer_type = msg.get_byte();
+                let sprite_id = msg.get_u16();
+                let amount = msg.get_u16();
+                let price = msg.get_u32();
+                let anonymous = msg.get_byte() != 0;
+                dispatch(move || game_parse_market_create_offer(cid, offer_type, sprite_id, amount, price, anonymous));
+            }
+            0xF7 => { let ts = msg.get_u32(); let counter = msg.get_u16(); dispatch(move || game_parse_market_cancel(cid, ts, counter)); }
+            0xF8 => { let ts = msg.get_u32(); let counter = msg.get_u16(); let amount = msg.get_u16(); dispatch(move || game_parse_market_accept(cid, ts, counter, amount)); }
+            0xF9 => {
+                let modal_id = msg.get_u32();
+                let button = msg.get_byte();
+                let choice = msg.get_byte();
+                dispatch(move || game_parse_modal_window_answer(cid, modal_id, button, choice));
+            }
             _ => debug!(opcode, "unhandled opcode"),
         }
     }
@@ -1406,6 +1474,28 @@ fn game_handle_walk(creature_id: CreatureId, dir: Direction) {
 
     crate::events::dispatch::execute_step_event(creature_id, old_pos, new_pos, 1);
     crate::events::dispatch::execute_step_event(creature_id, new_pos, old_pos, 0);
+
+    {
+        let game = g_game().lock().unwrap();
+        let field_info = game.map.get_tile(new_pos).and_then(|tile| {
+            tile.items.iter().find_map(|item| {
+                let it = game.items.get_item_type(item.server_id as usize);
+                if it.kind == crate::items::ItemKind::MagicField {
+                    Some(crate::combat::combat::MagicField {
+                        item_id: item.server_id,
+                        owner_id: item.owner_id,
+                        create_time: 0,
+                    })
+                } else {
+                    None
+                }
+            })
+        });
+        drop(game);
+        if let Some(field) = field_info {
+            field.on_step_in_field(creature_id);
+        }
+    }
 
     {
         let game = g_game().lock().unwrap();
@@ -3307,8 +3397,8 @@ fn game_parse_throw(creature_id: CreatureId, from_pos: Position, sprite_id: u16,
             .map(|t| t.has_flag(crate::map::tile::TILESTATE_MAILBOX))
             .unwrap_or(false);
         let delivered = has_mailbox
-            && crate::items::special::mailbox::Mailbox::can_send(item.server_id)
-            && mailbox_deliver(&mut game, &item);
+            && crate::items::special::mailbox::can_send(item.server_id)
+            && crate::items::special::mailbox::deliver(&mut game, &item);
 
         // Remove from source keeping the [down|top] partition (down_item_count)
         // consistent, and capture the real client stackpos it occupied.
@@ -3472,143 +3562,8 @@ pub(crate) fn resend_open_container_free(player_id: CreatureId, cid: u8) {
 }
 
 fn game_handle_use_bed(creature_id: CreatureId, pos: Position, server_id: u16) {
-    use crate::map::tile::TileKind;
-
-    let info = {
-        let game = g_game().lock().unwrap();
-        let Some(tile) = game.map.get_tile(pos) else { return };
-        let house_id = match tile.kind {
-            TileKind::House { house_id } => Some(house_id),
-            _ => None,
-        };
-        let is_pz = tile.has_flag(TILESTATE_PROTECTIONZONE);
-        let sleeper_guid = tile
-            .find_item_index_by_server_id(server_id)
-            .map(|idx| tile.items[idx].sleeper_guid)
-            .unwrap_or(0);
-
-        let it = game.items.get_item_type(usize::from(server_id));
-        let transform_to_free = it.transform_to_free;
-        let transform_male = it.transform_to_on_use[1];
-        let transform_female = it.transform_to_on_use[0];
-        let partner_dir = it.bed_partner_dir;
-
-        let Some(player) = game.get_player(creature_id) else { return };
-        let p_guid = player.guid;
-        let p_account = player.account_number;
-        let p_sex = player.sex;
-        let premium = player.is_premium();
-        let can_edit = player.group_flags & crate::creatures::player::PLAYER_FLAG_CAN_EDIT_HOUSES != 0;
-        let p_name = player.name.clone();
-
-        let owned_by_account = g_config().get_boolean(BooleanConfig::HouseOwnedByAccount);
-        let (house_owner, my_access) = match house_id.and_then(|hid| game.map.houses.get_house(hid)) {
-            Some(h) => (
-                h.get_owner(),
-                h.access_level_for(p_guid, p_account, can_edit, owned_by_account, &p_name, "", ""),
-            ),
-            None => (0, crate::map::houses::AccessHouseLevel::NotInvited),
-        };
-
-        BedUseInfo {
-            house_id, is_pz, sleeper_guid, transform_to_free, transform_male, transform_female,
-            partner_dir, p_guid, p_sex, premium, house_owner, my_access,
-        }
-    };
-
-    let has_house = info.house_id.is_some();
-    let can_use = if !has_house || !info.premium || !info.is_pz {
-        false
-    } else if info.sleeper_guid == 0 {
-        true
-    } else {
-        info.my_access == crate::map::houses::AccessHouseLevel::Owner
-    };
-
-    if !can_use {
-        let msg = if !has_house {
-            "You can not use this bed."
-        } else if !info.premium {
-            "You need a premium account."
-        } else {
-            "You cannot use this object."
-        };
-        send_status_message_to_player(creature_id, msg);
-        return;
-    }
-
-    if info.sleeper_guid != 0 {
-        if info.transform_to_free != 0 && info.house_owner == info.p_guid {
-            bed_wake_up_free(pos, server_id);
-        }
-        let mut game = g_game().lock().unwrap();
-        let ppos = game.get_player(creature_id).map(|p| p.base.position).unwrap_or(pos);
-        game.add_magic_effect(ppos, crate::game::CONST_ME_POFF);
-        return;
-    }
-
-    bed_sleep_free(creature_id, pos, server_id, &info);
-}
-
-fn bed_sleep_free(creature_id: CreatureId, pos: Position, server_id: u16, info: &BedUseInfo) {
-    use crate::creatures::player::PlayerSex;
-    let now = (crate::util::otsys_time() / 1000) as u32;
-    let partner_pos = next_position(info.partner_dir, pos);
-
-    {
-        let mut game = g_game().lock().unwrap();
-        let pname = game.get_player(creature_id).map(|p| p.name.clone()).unwrap_or_default();
-        let desc = format!("{} is sleeping there.", pname);
-        let guid = info.p_guid;
-
-        let partner_sid = game.map.get_tile(partner_pos).and_then(|t| {
-            t.items.iter()
-                .find(|it| game.items.get_item_type(usize::from(it.server_id)).kind == crate::items::ItemKind::Bed)
-                .map(|it| it.server_id)
-        });
-
-        game.set_item_sleeper(pos, server_id, guid, now, desc.clone());
-        if let Some(psid) = partner_sid {
-            game.set_item_sleeper(partner_pos, psid, guid, now, desc);
-        }
-        game.set_bed_sleeper(guid, pos);
-        if let Some(p) = game.get_player_mut(creature_id) {
-            p.bed_item_id = Some(server_id);
-        }
-
-        let old_pos = game.get_player(creature_id).map(|p| p.base.position).unwrap_or(pos);
-        if old_pos != pos {
-            game.move_creature_position(creature_id, old_pos, pos);
-        }
-        game.add_magic_effect(pos, crate::game::CONST_ME_SLEEP);
-
-        let sex_transform = match info.p_sex {
-            PlayerSex::Male => info.transform_male,
-            PlayerSex::Female => info.transform_female,
-        };
-        let new_id = if sex_transform != 0 { sex_transform } else { info.transform_to_free };
-        game.transform_tile_item(pos, server_id, new_id);
-
-        if let Some(psid) = partner_sid {
-            let pit = game.items.get_item_type(usize::from(psid));
-            let p_sex_t = match info.p_sex {
-                PlayerSex::Male => pit.transform_to_on_use[1],
-                PlayerSex::Female => pit.transform_to_on_use[0],
-            };
-            let p_free = pit.transform_to_free;
-            let p_new = if p_sex_t != 0 { p_sex_t } else { p_free };
-            game.transform_tile_item(partner_pos, psid, p_new);
-        }
-    }
-
-    crate::runtime::g_scheduler().add_event(crate::runtime::scheduler::SchedulerTask::new(
-        crate::runtime::scheduler::SCHEDULER_MINTICKS,
-        move || kick_player_by_id(creature_id),
-    ));
-}
-
-fn bed_wake_up_free(pos: Position, server_id: u16) {
-    g_game().lock().unwrap().wake_bed_at(pos, server_id);
+    let mut game = g_game().lock().unwrap();
+    crate::items::special::bed::handle_use_bed(&mut game, creature_id, pos, server_id);
 }
 
 fn open_container_on_tile_free(player_id: CreatureId, pos: Position, tile_item_index: usize, server_id: u16) {
@@ -3663,44 +3618,7 @@ fn open_container_on_tile_free(player_id: CreatureId, pos: Position, tile_item_i
 }
 
 fn open_depot_free(player_id: CreatureId, server_id: u16, depot_id: u32) {
-    use crate::creatures::player::ContainerParent;
-    let game = g_game().lock().unwrap();
-    let Some(player) = game.get_player(player_id) else { return };
-
-    let existing = player.open_containers.iter()
-        .find(|(_, oc)| matches!(oc.parent, ContainerParent::Depot(d) if d == depot_id))
-        .map(|(&cid, _)| cid);
-    if let Some(existing_cid) = existing {
-        drop(game);
-        let mut game = g_game().lock().unwrap();
-        if let Some(p) = game.get_player_mut(player_id) { p.close_container(existing_cid); }
-        drop(game);
-        send_packet_to_player(player_id, move |o: &mut OutputMessage| write_close_container(o, existing_cid));
-        return;
-    }
-
-    let Some(cid) = player.get_free_container_id() else {
-        drop(game);
-        send_status_message_to_player(player_id, "You cannot open any more containers.");
-        return;
-    };
-    let item_type = game.items.get_item_type(usize::from(server_id));
-    let capacity = item_type.max_items.clamp(1, 255) as u8;
-    let children: Vec<crate::map::tile::MapItem> = player.depot_items.get(&depot_id).cloned().unwrap_or_default();
-    let chest = crate::map::tile::MapItem { server_id, ..crate::map::tile::MapItem::default() };
-    let items_ref = game.items.clone();
-    drop(game);
-
-    {
-        let mut game = g_game().lock().unwrap();
-        if let Some(p) = game.get_player_mut(player_id) {
-            p.add_container(cid, ContainerParent::Depot(depot_id));
-            p.set_last_depot_id(depot_id as i16);
-        }
-    }
-    send_packet_to_player(player_id, move |o: &mut OutputMessage| {
-        write_container(o, cid, &chest, &items_ref, "Depot chest", capacity, false, &children);
-    });
+    crate::items::special::depot::open_depot(player_id, server_id, depot_id);
 }
 
 /// Open a container that is a child of an already-open container (clicked inside
@@ -4603,8 +4521,8 @@ fn insert_move_item(
                 .map(|t| t.has_flag(crate::map::tile::TILESTATE_MAILBOX))
                 .unwrap_or(false);
             if has_mailbox
-                && crate::items::special::mailbox::Mailbox::can_send(item.server_id)
-                && mailbox_deliver(game, &item)
+                && crate::items::special::mailbox::can_send(item.server_id)
+                && crate::items::special::mailbox::deliver(game, &item)
             {
                 return true;
             }
@@ -4618,93 +4536,6 @@ fn insert_move_item(
             }
         }
     }
-}
-
-/// Parse a mailbox item's receiver. Port of `Mailbox::getReceiver`:
-/// parcels (containers) are scanned for an `ITEM_LABEL` child whose text holds
-/// the name; letters carry the text directly (line 1 = name, line 2 = town).
-fn mailbox_get_receiver(
-    game: &crate::game::Game,
-    item: &crate::map::tile::MapItem,
-) -> Option<(String, u32)> {
-    const ITEM_LABEL: u16 = 2599;
-    let is_container = game.items.get_item_type(usize::from(item.server_id)).group
-        == crate::items::ItemGroup::Container;
-    if is_container {
-        for child in &item.children {
-            if child.server_id == ITEM_LABEL {
-                if let Some(r) = mailbox_get_receiver(game, child) {
-                    return Some(r);
-                }
-            }
-        }
-        return None;
-    }
-
-    if item.text.trim().is_empty() {
-        return None;
-    }
-    let mut lines = item.text.lines();
-    let name = lines.next().unwrap_or("").trim().to_string();
-    let town_name = lines.next().unwrap_or("").trim();
-    let depot_id = game
-        .map
-        .towns
-        .values()
-        .find(|t| t.name.eq_ignore_ascii_case(town_name))
-        .map(|t| t.id)?;
-    Some((name, depot_id))
-}
-
-/// Deliver a parcel/letter into the receiver's depot. Port of `Mailbox::sendItem`
-/// for the online-receiver path: transform the item to `id+1` (stamped) and push
-/// it into the receiver's depot, then `onReceiveMail`. Offline receivers are not
-/// handled here (would require a synchronous DB load/save in the move path).
-fn mailbox_deliver(game: &mut crate::game::Game, item: &crate::map::tile::MapItem) -> bool {
-    let Some((name, depot_id)) = mailbox_get_receiver(game, item) else { return false };
-    if name.is_empty() || depot_id == 0 {
-        return false;
-    }
-    let Some(cid) = game.get_player_id_by_name(&name) else { return false };
-
-    let mut delivered = item.clone();
-    delivered.server_id = item.server_id.saturating_add(1);
-    match game.get_player_mut(cid) {
-        Some(p) => p.depot_items.entry(depot_id).or_default().insert(0, delivered),
-        None => return false,
-    }
-
-    if player_is_near_depot_box(game, cid) {
-        game.send_text_message(
-            cid,
-            crate::world::raids::MESSAGE_EVENT_ADVANCE,
-            "New mail has arrived.".to_string(),
-        );
-    }
-    true
-}
-
-/// Port of `Player::isNearDepotBox`: a depot tile within 1 step of the player.
-fn player_is_near_depot_box(game: &crate::game::Game, creature_id: CreatureId) -> bool {
-    let Some(pos) = game.get_player(creature_id).map(|p| p.base.position) else { return false };
-    for cx in -1i32..=1 {
-        for cy in -1i32..=1 {
-            let p = Position {
-                x: pos.x.wrapping_add(cx as u16),
-                y: pos.y.wrapping_add(cy as u16),
-                z: pos.z,
-            };
-            if game
-                .map
-                .get_tile(p)
-                .map(|t| t.has_flag(crate::map::tile::TILESTATE_DEPOT))
-                .unwrap_or(false)
-            {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 // ── Secure-trade support ────────────────────────────────────────────────────
@@ -6185,21 +6016,6 @@ fn broadcast_creature_teleport(creature_id: CreatureId, old_pos: Position, old_s
 
 // ── Movement helpers ──────────────────────────────────────────────────────────
 
-struct BedUseInfo {
-    house_id: Option<u32>,
-    is_pz: bool,
-    sleeper_guid: u32,
-    transform_to_free: u16,
-    transform_male: u16,
-    transform_female: u16,
-    partner_dir: u8,
-    p_guid: u32,
-    p_sex: crate::creatures::player::PlayerSex,
-    premium: bool,
-    house_owner: u32,
-    my_access: crate::map::houses::AccessHouseLevel,
-}
-
 /// Offset a position by a direction (no floor-change resolution). Port of
 /// `getNextPosition(Direction, Position&)` from tools.cpp.
 pub(crate) fn next_position(dir: u8, pos: Position) -> Position {
@@ -6733,7 +6549,7 @@ fn write_inventory_item(output: &mut OutputMessage, slot: u8, item: Option<&crat
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_container(output: &mut OutputMessage, cid: u8, container_item: &crate::map::tile::MapItem, items: &Items, name: &str, capacity: u8, has_parent: bool, contents: &[crate::map::tile::MapItem]) {
+pub(crate) fn write_container(output: &mut OutputMessage, cid: u8, container_item: &crate::map::tile::MapItem, items: &Items, name: &str, capacity: u8, has_parent: bool, contents: &[crate::map::tile::MapItem]) {
     output.add_byte(0x6E);
     output.add_byte(cid);
     write_item(output, items, container_item.server_id, container_item.count.min(255) as u8);
@@ -7100,3 +6916,221 @@ fn write_close_private(output: &mut OutputMessage, channel_id: u16) {
     output.add_u16(channel_id);
 }
 
+fn game_parse_house_window(creature_id: CreatureId, _door_id: u8, window_text_id: u32, text: Vec<u8>) {
+    let mut game = g_game().lock().unwrap();
+    let (edit_house_id, internal_list_id, internal_window_text_id) = {
+        let Some(player) = game.get_player(creature_id) else { return };
+        (player.edit_house_id, player.edit_house_list_id, player.edit_house_window_text_id)
+    };
+
+    if let Some(house_id) = edit_house_id {
+        if internal_window_text_id == window_text_id {
+            let text_str = String::from_utf8_lossy(&text).to_string();
+            if let Some(house) = game.map.houses.get_house_mut(house_id) {
+                house.set_access_list(internal_list_id, &text_str);
+            }
+        }
+    }
+
+    if let Some(player) = game.get_player_mut(creature_id) {
+        player.edit_house_id = None;
+    }
+}
+
+fn game_parse_wrap_item(creature_id: CreatureId, pos: Position, sprite_id: u16, stackpos: u8) {
+    if pos.x == 0xFFFF { return; }
+
+    let (_player_pos, wrap_target) = {
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        let player_pos = player.base.position;
+        let dx = (pos.x as i32 - player_pos.x as i32).unsigned_abs();
+        let dy = (pos.y as i32 - player_pos.y as i32).unsigned_abs();
+        if dx > 1 || dy > 1 || pos.z != player_pos.z { return; }
+
+        let tile = match game.map.get_tile(pos) {
+            Some(t) => t,
+            None => return,
+        };
+        let idx = stackpos as usize;
+        if idx == 0 { return; }
+        let item_idx = idx - if tile.ground.is_some() { 1 } else { 0 };
+        if item_idx >= tile.items.len() { return; }
+
+        let item = &tile.items[item_idx];
+        let it = game.items.get_item_type(item.server_id as usize);
+        if it.client_id != sprite_id { return; }
+        let wrap_id = it.wrap_id;
+        if wrap_id == 0 { return; }
+        (player_pos, (item_idx, wrap_id))
+    };
+
+    let mut game = g_game().lock().unwrap();
+    if let Some(tile) = game.map.get_tile_mut(pos) {
+        let (item_idx, wrap_id) = wrap_target;
+        if item_idx < tile.items.len() {
+            tile.items[item_idx].server_id = wrap_id;
+        }
+    }
+}
+
+fn game_parse_browse_field(creature_id: CreatureId, pos: Position) {
+    let game = g_game().lock().unwrap();
+    let Some(player) = game.get_player(creature_id) else { return };
+    let player_pos = player.base.position;
+    if player_pos.z != pos.z { return; }
+    let dx = (pos.x as i32 - player_pos.x as i32).unsigned_abs();
+    let dy = (pos.y as i32 - player_pos.y as i32).unsigned_abs();
+    if dx > 1 || dy > 1 { return; }
+
+    let tile = match game.map.get_tile(pos) {
+        Some(t) => t,
+        None => return,
+    };
+
+    let items_for_browse: Vec<(u16, u8)> = tile.items.iter()
+        .map(|i| (i.server_id, i.count.max(1) as u8))
+        .collect();
+    drop(game);
+
+    let items_arc = crate::game::g_game().lock().unwrap().items.clone();
+    let container_id = 0x0Fu8.wrapping_sub(((pos.x % 3) * 3 + (pos.y % 3)) as u8);
+    send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
+        output.add_byte(0x6E);
+        output.add_byte(container_id);
+        let browse_type_cid = items_arc.get_item_type(2854).client_id;
+        output.add_u16(browse_type_cid);
+        output.add_string(b"Browse Field");
+        output.add_byte(0);
+        output.add_byte(0);
+        output.add_byte(items_for_browse.len().min(255) as u8);
+        for (sid, count) in items_for_browse.iter().take(255) {
+            write_item(output, &items_arc, *sid, *count);
+        }
+    });
+}
+
+fn game_parse_seek_in_container(_creature_id: CreatureId, _container_id: u8, _index: u16) {
+    // Container pagination not implemented (containers don't have pagination in our model)
+}
+
+fn game_parse_toggle_mount(creature_id: CreatureId, mount: bool) {
+    use crate::world::mounts::g_mounts;
+    let mounts = g_mounts();
+    let mut game = g_game().lock().unwrap();
+    let Some(player) = game.get_player_mut(creature_id) else { return };
+
+    let current_mount = player.current_mount;
+    if mount {
+        if current_mount == 0 { return; }
+        let mi = match mounts.iter().find(|m| m.id == current_mount as u8) {
+            Some(m) => m,
+            None => return,
+        };
+        let speed_delta = mi.speed;
+        player.base.default_outfit.look_mount = mi.client_id;
+        player.base.current_outfit.look_mount = mi.client_id;
+        player.base.var_speed += speed_delta;
+        let pos = player.base.position;
+        let outfit = player.base.current_outfit;
+        let speed = player.get_step_speed() as u32;
+        drop(game);
+        broadcast_creature_outfit(creature_id, pos, outfit);
+        broadcast_change_speed(creature_id, pos, speed);
+    } else {
+        if player.base.default_outfit.look_mount == 0 { return; }
+        let old_speed = mounts.iter().find(|m| m.id == current_mount as u8).map(|m| m.speed).unwrap_or(0);
+        player.base.default_outfit.look_mount = 0;
+        player.base.current_outfit.look_mount = 0;
+        player.base.var_speed -= old_speed;
+        let pos = player.base.position;
+        let outfit = player.base.current_outfit;
+        let speed = player.get_step_speed() as u32;
+        drop(game);
+        broadcast_creature_outfit(creature_id, pos, outfit);
+        broadcast_change_speed(creature_id, pos, speed);
+    }
+}
+
+fn game_parse_edit_vip(_creature_id: CreatureId, _guid: u32, _description: Vec<u8>, _icon: u32, _notify: bool) {
+}
+
+fn game_parse_bug_report(creature_id: CreatureId, _category: u8, message: Vec<u8>, _pos: Option<Position>) {
+    tracing::info!("[BugReport] Player {} reported: {}", creature_id, String::from_utf8_lossy(&message));
+}
+
+fn game_parse_rule_violation(creature_id: CreatureId, _report_type: u8, _reason: u8, _target: Vec<u8>, comment: Vec<u8>, _translation: Vec<u8>) {
+    tracing::info!("[RuleViolation] Player {} reported: {}", creature_id, String::from_utf8_lossy(&comment));
+}
+
+fn game_parse_modal_window_answer(creature_id: CreatureId, modal_id: u32, button: u8, choice: u8) {
+    let mut game = g_game().lock().unwrap();
+    let Some(player) = game.get_player_mut(creature_id) else { return };
+
+    if !player.modal_windows_open.remove(&modal_id) {
+        return;
+    }
+
+    if modal_id == u32::MAX && button == 1 {
+        let valid_skills: &[u8] = &[2, 3, 4, 5, 7];
+        if valid_skills.contains(&choice) {
+            player.offline_training_skill = Some(choice);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn send_modal_window(creature_id: CreatureId, id: u32, title: &str, message: &str,
+    buttons: &[(String, u8)], choices: &[(String, u8)],
+    default_escape: u8, default_enter: u8, priority: bool) {
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(creature_id) {
+            player.modal_windows_open.insert(id);
+        }
+    }
+
+    let title = title.to_string();
+    let message = message.to_string();
+    let buttons = buttons.to_vec();
+    let choices = choices.to_vec();
+    send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
+        output.add_byte(0xFA);
+        output.add_u32(id);
+        output.add_string(title.as_bytes());
+        output.add_string(message.as_bytes());
+        output.add_byte(buttons.len().min(255) as u8);
+        for (text, id) in &buttons {
+            output.add_string(text.as_bytes());
+            output.add_byte(*id);
+        }
+        output.add_byte(choices.len().min(255) as u8);
+        for (text, id) in &choices {
+            output.add_string(text.as_bytes());
+            output.add_byte(*id);
+        }
+        output.add_byte(default_escape);
+        output.add_byte(default_enter);
+        output.add_byte(if priority { 0x01 } else { 0x00 });
+    });
+}
+
+fn game_parse_market_leave(creature_id: CreatureId) {
+    let mut game = g_game().lock().unwrap();
+    if let Some(player) = game.get_player_mut(creature_id) {
+        player.in_market = false;
+    }
+}
+
+fn game_parse_market_browse(creature_id: CreatureId, _browse_id: u16) {
+    send_status_message_to_player(creature_id, "The market is not available.");
+}
+
+fn game_parse_market_create_offer(_cid: CreatureId, _t: u8, _sprite: u16, _amount: u16, _price: u32, _anon: bool) {
+}
+
+fn game_parse_market_cancel(_cid: CreatureId, _ts: u32, _counter: u16) {
+}
+
+fn game_parse_market_accept(_cid: CreatureId, _ts: u32, _counter: u16, _amount: u16) {
+}

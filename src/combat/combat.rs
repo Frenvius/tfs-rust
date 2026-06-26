@@ -1103,29 +1103,23 @@ impl Combat {
         self.maxb = maxb;
     }
 
-    // ── Static combat permission/effects helpers ────────────────────────────
-
-    pub fn post_combat_effects_static(
-        _caster_id: Option<crate::creatures::CreatureId>,
-        _pos: Position,
-        _params: &CombatParams,
-    ) {
-    }
+    // ── Unported combat helpers (C++ has real logic — port when area combat is wired) ──
 
     pub fn post_combat_effects(
         &self,
-        caster_id: Option<crate::creatures::CreatureId>,
-        pos: Position,
+        _caster_id: Option<crate::creatures::CreatureId>,
+        _pos: Position,
     ) {
-        Self::post_combat_effects_static(caster_id, pos, &self.params);
+        // C++ emits distance effect from caster to pos. Used by area combat path.
     }
 
-    pub fn add_distance_effect(
+    pub fn add_distance_effect_static(
         _caster_id: Option<crate::creatures::CreatureId>,
         _from_pos: Position,
         _to_pos: Position,
         _effect: u8,
     ) {
+        // C++ resolves CONST_ANI_WEAPONTYPE to weapon type, then calls g_game.addDistanceEffect.
     }
 
     pub fn get_combat_damage(
@@ -1133,6 +1127,7 @@ impl Combat {
         _caster_id: Option<crate::creatures::CreatureId>,
         _target_id: Option<crate::creatures::CreatureId>,
     ) -> CombatDamage {
+        // C++ dispatches per formula_type (DAMAGE/LEVELMAGIC/SKILL). Returns computed min/max damage.
         CombatDamage::new(self.params.combat_type)
     }
 
@@ -1141,9 +1136,20 @@ impl Combat {
         _tile_pos: Position,
         _params: &CombatParams,
     ) {
+        // C++ spawns field items (fire/poison/energy/magic-wall) and fires tile callback.
     }
 
-    // ── Combat dispatch (require Game integration) ──────────────────────────
+    pub fn do_area_combat(
+        _caster_id: Option<crate::creatures::CreatureId>,
+        _position: Position,
+        _area: Option<&AreaCombat>,
+        _damage: &mut CombatDamage,
+        _params: &CombatParams,
+    ) {
+        // C++ full AoE pipeline: compute tiles, critical, spectators, per-tile effects + damage.
+    }
+
+    // ── Combat dispatch ──────────────────────────────────────────────────────
 
     /// Apply combat to a specific target creature.
     /// Mirrors C++ `Combat::doTargetCombat` verbatim.
@@ -1349,14 +1355,6 @@ impl Combat {
         }
     }
 
-    pub fn do_area_combat(
-        _caster_id: Option<crate::creatures::CreatureId>,
-        _position: Position,
-        _area: Option<&AreaCombat>,
-        _damage: &mut CombatDamage,
-        _params: &CombatParams,
-    ) {
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1387,14 +1385,74 @@ impl MagicField {
         items.get_item_type(self.item_id as usize).replaceable
     }
 
-    pub fn get_combat_type(&self, _items: &crate::items::Items) -> CombatType {
-        CombatType::None
+    pub fn get_combat_type(&self) -> CombatType {
+        match self.item_id {
+            1487..=1489 | 1492..=1494 | 1500 | 1501 => CombatType::FireDamage,
+            1490 | 1496 | 1503 => CombatType::EarthDamage,
+            1491 | 1495 | 1504 => CombatType::EnergyDamage,
+            _ => CombatType::None,
+        }
     }
 
-    pub fn get_damage(&self, _items: &crate::items::Items) -> i32 {
-        0
+    pub fn is_blocking(&self) -> bool {
+        matches!(self.item_id, 1497 | 1498 | 1499 | 2721 | 11098 | 11099 | 20669 | 20670)
     }
 
-    pub fn on_step_in_field(&self, _creature_id: crate::creatures::CreatureId) {
+    pub fn on_step_in_field(&self, creature_id: crate::creatures::CreatureId) {
+        use crate::combat::condition::*;
+        use crate::game::g_game;
+
+        if self.is_blocking() {
+            return;
+        }
+
+        if matches!(self.item_id, 1500 | 1501 | 1503 | 1504) {
+            let game = g_game().lock().unwrap();
+            if game.get_player(creature_id).is_some() {
+                return;
+            }
+        }
+
+        let combat_type = self.get_combat_type();
+        if combat_type == CombatType::None {
+            return;
+        }
+
+        let condition_type = Combat::damage_to_condition_type(combat_type);
+        if condition_type == ConditionType::None {
+            return;
+        }
+
+        let (tick_interval, damage_per_tick) = match combat_type {
+            CombatType::FireDamage => (9000, -20),
+            CombatType::EarthDamage => (5000, -5),
+            CombatType::EnergyDamage => (10000, -25),
+            _ => return,
+        };
+
+        let mut cond = ConditionDamage::new(
+            ConditionId::Default,
+            condition_type,
+            false,
+            0,
+            true,
+        );
+        cond.period_damage = damage_per_tick;
+        cond.tick_interval = tick_interval;
+        cond.base.ticks = -1;
+        cond.field = true;
+        if self.owner_id != 0 {
+            cond.base.owner = self.owner_id;
+        }
+
+        let mut game = g_game().lock().unwrap();
+        if let Some(creature) = game.get_creature_mut(creature_id) {
+            let base_speed = creature.base().base_speed as i32;
+            add_condition_to_creature(
+                &mut creature.base_mut().conditions,
+                Box::new(cond),
+                base_speed,
+            );
+        }
     }
 }

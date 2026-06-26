@@ -25,6 +25,7 @@ pub fn init_script_registry() {
         lua_callbacks: HashMap::new(),
         next_script_id: 10000,
         spells: HashMap::new(),
+        weapons: HashMap::new(),
     };
     G_SCRIPT_REGISTRY
         .set(Mutex::new(registry))
@@ -72,6 +73,8 @@ pub struct ScriptRegistry {
     pub next_script_id: i32,
     /// Keyed by lowercase words (e.g. "exura").
     pub spells: HashMap<String, SpellEntry>,
+    /// Weapon callbacks keyed by item server_id → script_id.
+    pub weapons: HashMap<u16, i32>,
 }
 
 impl ScriptRegistry {

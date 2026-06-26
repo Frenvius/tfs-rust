@@ -304,6 +304,12 @@ pub struct Player {
     pub write_item_pos: Option<crate::map::Position>,
     pub write_item_stack_pos: u8,
     pub edit_house_id: Option<u32>,
+    pub edit_house_list_id: u32,
+    pub edit_house_window_text_id: u32,
+    pub modal_windows_open: std::collections::HashSet<u32>,
+    pub offline_training_skill: Option<u8>,
+    pub current_mount: u32,
+    pub in_market: bool,
     pub shop_owner_id: Option<u32>,
     pub party_id: Option<u32>,
     pub trade_partner_id: Option<CreatureId>,
@@ -421,6 +427,12 @@ impl Player {
             write_item_pos: None,
             write_item_stack_pos: 0,
             edit_house_id: None,
+            edit_house_list_id: 0,
+            edit_house_window_text_id: 0,
+            modal_windows_open: std::collections::HashSet::new(),
+            offline_training_skill: None,
+            current_mount: 0,
+            in_market: false,
             shop_owner_id: None,
             party_id: None,
             trade_partner_id: None,
@@ -1602,5 +1614,508 @@ mod tests {
         player.update_base_speed(220);
 
         assert_eq!(player.base.base_speed, PLAYER_MAX_SPEED as u32);
+    }
+}
+
+// ── Player attacking (moved from game/tick.rs) ──────────────────────────────
+
+use crate::game::g_game;
+use crate::net::game_protocol::send_packet_to_player;
+use crate::net::output_message::OutputMessage;
+
+pub fn get_max_weapon_damage(level: u32, attack_skill: i32, attack_value: i32, attack_factor: f32) -> i32 {
+    ((level as f32 / 5.0)
+        + ((((attack_skill as f32 / 4.0 + 1.0) * (attack_value as f32 / 3.0)) * 1.03)
+            / attack_factor))
+        .round() as i32
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn player_do_attacking(creature_id: u32, target_id: u32, attacker_pos: crate::map::Position, target_pos: crate::map::Position) {
+    use crate::combat::{Combat, CombatDamage, CombatOrigin, CombatParams, CombatType};
+    use crate::combat::condition::ConditionType;
+    use crate::util::{normal_random, otsys_time};
+    // 3. Player::doAttacking
+    let now = otsys_time() as u64;
+
+    let (last_attack, attack_speed, has_pacified, weapon_id, weapon_attack, weapon_skill, weapon_skill_idx, level, attack_factor, add_attack_skill, element_type, element_damage) = {
+        use crate::items::g_items;
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        let has_pacified = player.base.conditions.iter().any(|c| c.get_type() == ConditionType::Pacified);
+        let level = player.level;
+        let attack_factor = player.get_attack_factor();
+        let attack_speed = player.get_attack_speed();
+        let add_attack_skill = player.add_attack_skill_point;
+        let last_attack = player.last_attack;
+        let weapon_id = player.get_weapon();
+        let (weapon_attack, weapon_skill, weapon_skill_idx, element_type, element_damage) = if let Some(id) = weapon_id {
+            let it = g_items().get_item_type(id as usize);
+            let atk = it.attack.max(0);
+            let wt = it.weapon_type;
+            let skill_idx: usize = match wt {
+                1 => SKILL_SWORD,
+                2 => SKILL_CLUB,
+                3 => SKILL_AXE,
+                5 => SKILL_DISTANCE,
+                _ => SKILL_FIST,
+            };
+            (atk as i32, player.get_skill_level(skill_idx) as i32, skill_idx, it.element_type, it.element_damage)
+        } else {
+            (7, player.get_skill_level(SKILL_FIST) as i32, SKILL_FIST, 0u8, 0u16)
+        };
+        (last_attack, attack_speed, has_pacified, weapon_id, weapon_attack, weapon_skill, weapon_skill_idx, level, attack_factor, add_attack_skill, element_type, element_damage)
+    };
+
+    if has_pacified {
+        return;
+    }
+
+    // Initialize lastAttack to allow first swing.
+    let last_attack = if last_attack == 0 {
+        let la = now.saturating_sub(attack_speed as u64 + 1);
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(creature_id) {
+            player.last_attack = la;
+        }
+        la
+    } else {
+        last_attack
+    };
+
+    if now.saturating_sub(last_attack) < attack_speed as u64 {
+        return;
+    }
+
+    // 4. Weapon/fist attack — melee range check (Chebyshev distance ≤ 1 for melee).
+    let weapon_type = weapon_id
+        .map(|id| crate::items::g_items().get_item_type(id as usize).weapon_type)
+        .unwrap_or(0);
+    let is_distance = weapon_type == 5;
+    if !is_distance {
+        let dx = (attacker_pos.x as i32 - target_pos.x as i32).unsigned_abs();
+        let dy = (attacker_pos.y as i32 - target_pos.y as i32).unsigned_abs();
+        if dx > 1 || dy > 1 {
+            return;
+        }
+    }
+
+    if let Some(wid) = weapon_id {
+        let script_id = {
+            let registry = crate::events::registry::g_script_registry().lock().unwrap();
+            registry.weapons.get(&wid).copied()
+        };
+        if let Some(sid) = script_id {
+            let used = crate::events::dispatch::execute_weapon_callback(
+                sid, creature_id, target_id, wid,
+            );
+            if used {
+                let mut game = g_game().lock().unwrap();
+                if let Some(player) = game.get_player_mut(creature_id) {
+                    player.last_attack = now;
+                }
+                return;
+            }
+        }
+    }
+
+    let attack_value = if weapon_attack > 0 { weapon_attack } else { 7 };
+    let (max_damage, melee_multiplier) = {
+        use crate::world::vocation::g_vocations;
+        let mm = g_vocations()
+            .get_vocation(
+                g_game().lock().unwrap()
+                    .get_player(creature_id)
+                    .map(|p| p.vocation_id)
+                    .unwrap_or(0)
+            )
+            .map(|v| v.melee_damage_multiplier)
+            .unwrap_or(1.0);
+        ((get_max_weapon_damage(level, weapon_skill, attack_value, attack_factor) as f64 * mm as f64) as i32, mm)
+    };
+
+    // Element (secondary) damage from weapon abilities.
+    let secondary_type = CombatType::from_element_index(element_type);
+    let secondary_value = if element_type != 0 && element_damage > 0 {
+        let elem_max = (get_max_weapon_damage(level, weapon_skill, element_damage as i32, attack_factor) as f64
+            * melee_multiplier as f64) as i32;
+        -normal_random(0, elem_max)
+    } else {
+        0
+    };
+
+    let params = CombatParams {
+        combat_type: CombatType::PhysicalDamage,
+        blocked_by_armor: true,
+        blocked_by_shield: true,
+        ..CombatParams::default()
+    };
+
+    let mut damage = CombatDamage {
+        origin: if is_distance { CombatOrigin::Ranged } else { CombatOrigin::Melee },
+        primary_type: CombatType::PhysicalDamage,
+        primary_value: -normal_random(0, max_damage),
+        secondary_type,
+        secondary_value,
+        ..CombatDamage::default()
+    };
+
+    Combat::do_target_combat(Some(creature_id), target_id, &mut damage, &params);
+
+    // 5. Block-hit callbacks — mirrors C++ Creature::blockHit callbacks.
+    {
+        use crate::combat::BlockType;
+        use crate::items::{g_items, description::WEAPON_SHIELD};
+        use crate::creatures::player::{CONST_SLOT_LEFT, CONST_SLOT_RIGHT};
+
+        let block_type = damage.block_type;
+
+        // attacker: onAttackedCreatureBlockHit — updates add_attack_skill_point + blood_hit_count.
+        {
+            let mut game = g_game().lock().unwrap();
+            if let Some(player) = game.get_player_mut(creature_id) {
+                player.last_attack = now;
+                match block_type {
+                    BlockType::None => {
+                        player.add_attack_skill_point = true;
+                        player.blood_hit_count = 30;
+                        player.shield_block_count = 30; // reset own shield counter on clean hit
+                    }
+                    BlockType::Defense | BlockType::Armor => {
+                        if player.blood_hit_count > 0 {
+                            player.add_attack_skill_point = true;
+                            player.blood_hit_count -= 1;
+                        } else {
+                            player.add_attack_skill_point = false;
+                        }
+                    }
+                    _ => {
+                        player.add_attack_skill_point = false;
+                    }
+                }
+            }
+        }
+
+        // target: onBlockHit — shield skill advance when a player with a shield gets hit.
+        if block_type != BlockType::None {
+            let (shield_block_count, has_shield) = {
+                let game = g_game().lock().unwrap();
+                if let Some(p) = game.get_player(target_id) {
+                    let items = g_items();
+                    let has_shield = [CONST_SLOT_LEFT, CONST_SLOT_RIGHT].iter().any(|&slot| {
+                        p.inventory[slot].map(|sid| items.get_item_type(sid as usize).weapon_type == WEAPON_SHIELD).unwrap_or(false)
+                    });
+                    (p.shield_block_count, has_shield)
+                } else {
+                    (0, false)
+                }
+            };
+            if shield_block_count > 0 {
+                let shield_leveled = {
+                    let mut game = g_game().lock().unwrap();
+                    if let Some(player) = game.get_player_mut(target_id) {
+                        player.shield_block_count -= 1;
+                        if has_shield {
+                            player.add_skill_advance(crate::creatures::player::SKILL_SHIELD, 1)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if shield_leveled {
+                    send_packet_to_player(target_id, move |output: &mut OutputMessage| {
+                        let msg = "You advanced in shielding.";
+                        output.add_byte(0xB4);
+                        output.add_byte(crate::net::protocol_version::translate_message_class_to_client(0x13));
+                        output.add_string(msg.as_bytes());
+                    });
+                    let new_shield_level = {
+                        let game = g_game().lock().unwrap();
+                        game.get_player(target_id)
+                            .map(|p| p.skills[crate::creatures::player::SKILL_SHIELD].level as u32)
+                            .unwrap_or(0u32)
+                    };
+                    crate::runtime::g_dispatcher().add_task(
+                        crate::runtime::dispatcher::Task::new(move || {
+                            crate::events::dispatch::execute_creature_event_advance(
+                                target_id,
+                                crate::creatures::player::SKILL_SHIELD as u8,
+                                new_shield_level.saturating_sub(1),
+                                new_shield_level,
+                            );
+                        }),
+                    );
+                    let game = g_game().lock().unwrap();
+                    if let Some(player) = game.get_player(target_id) {
+                        let skills_data: Vec<(u8, u8)> = (0..7)
+                            .map(|i| (player.get_skill_level(i).min(255) as u8, player.get_skill_percent(i)))
+                            .collect();
+                        drop(game);
+                        send_packet_to_player(target_id, move |output: &mut OutputMessage| {
+                            output.add_byte(0xA1);
+                            for (level, percent) in &skills_data {
+                                output.add_byte(*level);
+                                output.add_byte(*percent);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let skill_to_advance = weapon_skill_idx;
+    if add_attack_skill {
+        let leveled = {
+            let mut game = g_game().lock().unwrap();
+            game.get_player_mut(creature_id)
+                .map(|p| p.add_skill_advance(skill_to_advance, 1))
+                .unwrap_or(false)
+        };
+        if leveled {
+            let skill_name = match skill_to_advance {
+                crate::creatures::player::SKILL_FIST => "fist fighting",
+                crate::creatures::player::SKILL_CLUB => "club fighting",
+                crate::creatures::player::SKILL_SWORD => "sword fighting",
+                crate::creatures::player::SKILL_AXE => "axe fighting",
+                crate::creatures::player::SKILL_DISTANCE => "distance fighting",
+                _ => "fist fighting",
+            };
+            send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
+                let msg = format!("You advanced in {skill_name}.");
+                output.add_byte(0xB4);
+                output.add_byte(crate::net::protocol_version::translate_message_class_to_client(0x13));
+                output.add_string(msg.as_bytes());
+            });
+            let new_level = {
+                let game = g_game().lock().unwrap();
+                game.get_player(creature_id)
+                    .map(|p| p.skills[skill_to_advance].level as u32)
+                    .unwrap_or(0u32)
+            };
+            let skill_u8 = skill_to_advance as u8;
+            crate::runtime::g_dispatcher().add_task(
+                crate::runtime::dispatcher::Task::new(move || {
+                    crate::events::dispatch::execute_creature_event_advance(
+                        creature_id,
+                        skill_u8,
+                        new_level.saturating_sub(1),
+                        new_level,
+                    );
+                }),
+            );
+        }
+        // Always resend skills to update percent bar.
+        {
+            let game = g_game().lock().unwrap();
+            if let Some(player) = game.get_player(creature_id) {
+                let skills_data: Vec<(u8, u8)> = (0..7)
+                    .map(|i| (player.get_skill_level(i).min(255) as u8, player.get_skill_percent(i)))
+                    .collect();
+                drop(game);
+                send_packet_to_player(creature_id, move |output: &mut OutputMessage| {
+                    output.add_byte(0xA1);
+                    for (level, percent) in &skills_data {
+                        output.add_byte(*level);
+                        output.add_byte(*percent);
+                    }
+                });
+            }
+        }
+    }
+}
+
+// ── Player think tick (moved from game/tick.rs) ─────────────────────────────
+
+pub fn player_on_think(creature_id: u32) {
+    use crate::game::{g_game, EVENT_CREATURE_THINK_INTERVAL};
+    use crate::config::{g_config, IntegerConfig};
+    use crate::creatures::Skull;
+    use crate::map::tile::TILESTATE_NOLOGOUT;
+    use crate::net::game_protocol::send_packet_to_player;
+    use crate::net::output_message::OutputMessage;
+    use crate::util::get_milliseconds_time;
+    use crate::world::vocation::g_vocations;
+    let (last_ping, last_pong, pz_locked, vocation_id, skull, skull_ticks, idle_time, is_access) = {
+        let game = g_game().lock().unwrap();
+        let Some(player) = game.get_player(creature_id) else { return };
+        (
+            player.last_ping,
+            player.last_pong,
+            player.pz_locked,
+            player.vocation_id,
+            player.base.skull,
+            player.skull_ticks,
+            player.idle_time,
+            player.is_access_player(),
+        )
+    };
+
+    let now = get_milliseconds_time();
+
+    // Send ping to client every 5 seconds (C++ Player::sendPing).
+    if (now - last_ping) >= 5000 {
+        {
+            let mut game = g_game().lock().unwrap();
+            if let Some(player) = game.get_player_mut(creature_id) {
+                player.last_ping = now;
+            }
+        }
+        send_packet_to_player(creature_id, |output: &mut OutputMessage| {
+            output.add_byte(0x1E);
+        });
+    }
+
+    // Message buffer decay — mirrors C++ Player::onThink → addMessageBuffer.
+    // Every 1500ms, decrement the message spam counter (unless CannotBeMuted).
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(player) = game.get_player_mut(creature_id) {
+            player.message_buffer_ticks += crate::creatures::EVENT_CREATURE_THINK_INTERVAL as u32;
+            if player.message_buffer_ticks >= 1500 {
+                player.message_buffer_ticks = 0;
+                if player.message_buffer_count > 0
+                    && crate::config::g_config().get_number(crate::config::IntegerConfig::MaxMessageBuffer) != 0
+                    && !player.has_flag(crate::creatures::player::PLAYER_FLAG_CANNOT_BE_MUTED)
+                {
+                    player.message_buffer_count -= 1;
+                }
+            }
+        }
+    }
+
+    let no_pong_time = now - last_pong;
+
+    // Cancel attack on player target after 7s of no pong (C++ Player::sendPing).
+    if no_pong_time >= 7000 {
+        let attacking_player = {
+            let game = g_game().lock().unwrap();
+            let Some(player) = game.get_player(creature_id) else { return };
+            if let Some(target_id) = player.base.attacked_creature_id {
+                game.get_creature(target_id)
+                    .map(|c| c.is_player())
+                    .unwrap_or(false)
+            } else {
+                false
+            }
+        };
+        if attacking_player {
+            let mut game = g_game().lock().unwrap();
+            if let Some(player) = game.get_player_mut(creature_id) {
+                player.base.attacked_creature_id = None;
+            }
+            send_packet_to_player(creature_id, |output: &mut OutputMessage| {
+                output.add_byte(0xA3);
+                output.add_u32(0);
+            });
+        }
+    }
+
+    // Kick if no pong for vocation-specific time (at least 60s when pzLocked).
+    let no_pong_kick_time = {
+        let base = g_vocations()
+            .get_vocation(vocation_id)
+            .map(|v| v.no_pong_kick_time as i64)
+            .unwrap_or(60_000);
+        if pz_locked && base < 60_000 { 60_000 } else { base }
+    };
+
+    if no_pong_time >= no_pong_kick_time {
+        let can_kick = {
+            let game = g_game().lock().unwrap();
+            if let Some(player) = game.get_player(creature_id) {
+                let pos = player.base.position;
+                if let Some(tile) = game.map.get_tile(pos) {
+                    !tile.has_flag(TILESTATE_NOLOGOUT)
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        };
+        if can_kick {
+            {
+                let mut game = g_game().lock().unwrap();
+                game.remove_creature_check(creature_id);
+                game.remove_player(creature_id);
+            }
+            crate::net::game_protocol::unregister_player_connection(creature_id);
+        }
+        return;
+    }
+
+    // Idle time — only tracked for non-access players not on NOLOGOUT tiles.
+    if !is_access {
+        let kick_after_minutes = g_config().get_number(IntegerConfig::KickAfterMinutes) as i64;
+        let idle_threshold = kick_after_minutes * 60_000;
+        let warn_threshold = idle_threshold;
+        let new_idle = idle_time as i64 + EVENT_CREATURE_THINK_INTERVAL as i64;
+
+        let on_nologout = {
+            let game = g_game().lock().unwrap();
+            game.get_player(creature_id)
+                .and_then(|p| game.map.get_tile(p.base.position))
+                .map(|t| t.has_flag(TILESTATE_NOLOGOUT))
+                .unwrap_or(false)
+        };
+
+        if !on_nologout {
+            {
+                let mut game = g_game().lock().unwrap();
+                if let Some(player) = game.get_player_mut(creature_id) {
+                    player.idle_time = new_idle.min(i32::MAX as i64) as i32;
+                }
+            }
+
+            if new_idle > idle_threshold + 60_000 {
+                // Kick for inactivity.
+                let mut game = g_game().lock().unwrap();
+                game.remove_creature_check(creature_id);
+                game.remove_player(creature_id);
+                drop(game);
+                crate::net::game_protocol::unregister_player_connection(creature_id);
+                return;
+            } else if new_idle == warn_threshold {
+                send_packet_to_player(creature_id, |output: &mut OutputMessage| {
+                    let msg = format!(
+                        "There was no variation in your behaviour for {} minutes. You will be disconnected in one minute if there is no change in your actions until then.",
+                        kick_after_minutes
+                    );
+                    output.add_byte(0xB4);
+                    output.add_byte(crate::net::protocol_version::translate_message_class_to_client(0x13));
+                    output.add_string(msg.as_bytes());
+                });
+            }
+        }
+    }
+
+    // Skull ticks — decrement and clear red/black skull when expired.
+    if skull == Skull::Red || skull == Skull::Black {
+        let new_skull_ticks = skull_ticks - EVENT_CREATURE_THINK_INTERVAL as i64 / 1000;
+        {
+            let mut game = g_game().lock().unwrap();
+            if let Some(player) = game.get_player_mut(creature_id) {
+                player.skull_ticks = new_skull_ticks.max(0);
+            }
+        }
+        if new_skull_ticks <= 0 {
+            let has_infight = {
+                let game = g_game().lock().unwrap();
+                game.get_player(creature_id)
+                    .map(|p| p.base.conditions.iter().any(|c| {
+                        c.get_type() == crate::combat::condition::ConditionType::InFight
+                    }))
+                    .unwrap_or(false)
+            };
+            if !has_infight {
+                let mut game = g_game().lock().unwrap();
+                if let Some(player) = game.get_player_mut(creature_id) {
+                    player.base.skull = Skull::None;
+                }
+            }
+        }
     }
 }

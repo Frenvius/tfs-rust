@@ -110,28 +110,14 @@ impl ChatChannel {
     }
 
     pub fn send_to_all(&self, _message: &str, _speak_class: u8) {
-        // Broadcast handled externally via get_user_ids().
+        // C++ iterates users, calls sendChannelMessage on each. Used for guild MOTD, system broadcasts.
     }
 
-    pub fn execute_can_join_event(&self, _player_id: CreatureId) -> bool {
-        if self.can_join_event == -1 {
-            return true;
-        }
+    fn execute_on_join_event(&self, _player_id: CreatureId) -> bool {
         true
     }
 
-    pub fn execute_on_join_event(&self, _player_id: CreatureId) -> bool {
-        if self.on_join_event == -1 {
-            return true;
-        }
-        true
-    }
-
-    pub fn execute_on_leave_event(&self, _player_id: CreatureId) -> bool {
-        if self.on_leave_event == -1 {
-            return true;
-        }
-        true
+    fn execute_on_leave_event(&self, _player_id: CreatureId) {
     }
 
     pub fn execute_on_speak_event(
@@ -140,9 +126,6 @@ impl ChatChannel {
         _speak_class: &mut u8,
         _message: &str,
     ) -> bool {
-        if self.on_speak_event == -1 {
-            return true;
-        }
         true
     }
 }

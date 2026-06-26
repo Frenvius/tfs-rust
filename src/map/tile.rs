@@ -116,6 +116,21 @@ impl Tile {
         self.flags & flag != 0
     }
 
+    pub fn get_zone(&self) -> crate::creatures::ZoneType {
+        use crate::creatures::ZoneType;
+        if self.has_flag(TILESTATE_PROTECTIONZONE) {
+            ZoneType::Protection
+        } else if self.has_flag(TILESTATE_NOPVPZONE) {
+            ZoneType::NoPvp
+        } else if self.has_flag(TILESTATE_PVPZONE) {
+            ZoneType::Pvp
+        } else if self.has_flag(TILESTATE_NOLOGOUT) {
+            ZoneType::NoLogout
+        } else {
+            ZoneType::Normal
+        }
+    }
+
     pub fn set_flag(&mut self, flag: u32) {
         self.flags |= flag;
     }

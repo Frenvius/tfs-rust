@@ -79,6 +79,14 @@ pub enum ConditionEffect {
     SendSkills,
     SendIcons,
     ChangeSoul(i32),
+    ConditionDamage {
+        owner: u32,
+        damage: i32,
+        combat_type: crate::combat::CombatType,
+        field: bool,
+    },
+    SendSpellCooldown { spell_id: u32, ticks: i32 },
+    SendSpellGroupCooldown { group_id: u8, ticks: i32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +464,54 @@ impl Condition for ConditionGeneric {
             _ => icons,
         }
     }
+    fn on_start(&mut self, _creature_base_speed: i32) -> Vec<ConditionEffect> {
+        let mut effects = vec![ConditionEffect::SendIcons];
+        if self.base.sub_id != 0 && self.base.ticks > 0 {
+            match self.base.condition_type {
+                ConditionType::SpellCooldown => {
+                    effects.push(ConditionEffect::SendSpellCooldown {
+                        spell_id: self.base.sub_id,
+                        ticks: self.base.ticks,
+                    });
+                }
+                ConditionType::SpellGroupCooldown => {
+                    effects.push(ConditionEffect::SendSpellGroupCooldown {
+                        group_id: self.base.sub_id as u8,
+                        ticks: self.base.ticks,
+                    });
+                }
+                _ => {}
+            }
+        }
+        effects
+    }
+
+    fn on_add(&mut self, other: &dyn Condition, _creature_base_speed: i32) -> Vec<ConditionEffect> {
+        if !self.update_condition(other) {
+            return vec![];
+        }
+        self.set_ticks(other.get_ticks());
+        let mut effects = Vec::new();
+        if self.base.sub_id != 0 && self.base.ticks > 0 {
+            match self.base.condition_type {
+                ConditionType::SpellCooldown => {
+                    effects.push(ConditionEffect::SendSpellCooldown {
+                        spell_id: self.base.sub_id,
+                        ticks: self.base.ticks,
+                    });
+                }
+                ConditionType::SpellGroupCooldown => {
+                    effects.push(ConditionEffect::SendSpellGroupCooldown {
+                        group_id: self.base.sub_id as u8,
+                        ticks: self.base.ticks,
+                    });
+                }
+                _ => {}
+            }
+        }
+        effects
+    }
+
     fn base_mut(&mut self) -> &mut ConditionBase { &mut self.base }
 }
 
@@ -482,6 +538,7 @@ pub struct ConditionDamage {
     pub force_update: bool,
     pub delayed: bool,
     pub field: bool,
+    pub pending_effects: Vec<ConditionEffect>,
 }
 
 impl ConditionDamage {
@@ -505,7 +562,19 @@ impl ConditionDamage {
             force_update: false,
             delayed: false,
             field: false,
+            pending_effects: Vec::new(),
         }
+    }
+
+    fn do_damage_effects(&mut self, damage: i32) -> bool {
+        let combat_type = crate::combat::Combat::condition_to_damage_type(self.base.condition_type);
+        self.pending_effects.push(ConditionEffect::ConditionDamage {
+            owner: self.base.owner,
+            damage,
+            combat_type,
+            field: self.field,
+        });
+        true
     }
 
     pub fn get_total_damage_value(&self) -> i32 {
@@ -641,6 +710,47 @@ impl Condition for ConditionDamage {
     fn get_total_damage(&self) -> i32 {
         self.get_total_damage_value()
     }
+
+    fn execute_condition(&mut self, interval: i32) -> bool {
+        if self.period_damage != 0 {
+            self.period_damage_tick += interval;
+            if self.period_damage_tick >= self.tick_interval {
+                self.period_damage_tick = 0;
+                return self.do_damage_effects(self.period_damage);
+            }
+        } else if !self.damage_list.is_empty() {
+            let b_remove = self.base.ticks != -1;
+            let front = self.damage_list.front_mut().unwrap();
+            front.time_left -= interval;
+            if front.time_left <= 0 {
+                let damage = front.value;
+                if b_remove {
+                    self.damage_list.pop_front();
+                } else {
+                    let front = self.damage_list.front_mut().unwrap();
+                    front.time_left = front.interval;
+                }
+                self.do_damage_effects(damage);
+            }
+            if !b_remove {
+                if self.base.ticks > 0 {
+                    self.base.end_time += interval as i64;
+                }
+                return true;
+            }
+        }
+        if self.base.ticks == -1 {
+            return true;
+        }
+        let new_ticks = (self.base.ticks - interval).max(0);
+        self.base.ticks = new_ticks;
+        self.base.end_time >= crate::util::otsys_time()
+    }
+
+    fn on_tick(&mut self, _interval: i32) -> Vec<ConditionEffect> {
+        self.pending_effects.drain(..).collect()
+    }
+
     fn base_mut(&mut self) -> &mut ConditionBase { &mut self.base }
 }
 

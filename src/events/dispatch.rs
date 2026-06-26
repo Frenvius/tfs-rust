@@ -1289,6 +1289,49 @@ pub fn execute_talk_action(
     Some(result.unwrap_or(false))
 }
 
+pub fn execute_weapon_callback(
+    script_id: i32,
+    player_id: CreatureId,
+    target_id: CreatureId,
+    weapon_item_id: u16,
+) -> bool {
+    let lua = g_lua();
+    ScriptEnvironment::reset();
+
+    let result: bool = (|| -> LuaResult<bool> {
+        let registry = g_script_registry().lock().unwrap();
+        let func = match registry.get_callback_function(lua, script_id) {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        drop(registry);
+
+        let (player_pos, target_pos) = {
+            let game = g_game().lock().unwrap();
+            let ppos = game.get_creature(player_id).map(|c| c.position()).unwrap_or_default();
+            let tpos = game.get_creature(target_id).map(|c| c.position()).unwrap_or_default();
+            (ppos, tpos)
+        };
+
+        let player_tbl = push_creature(lua, player_id)?;
+        let target_tbl = push_creature(lua, target_id)?;
+        let item_tbl = push_item(lua, weapon_item_id, player_pos, -1)?;
+        let from_pos = push_position(lua, player_pos)?;
+        let target_pos_tbl = push_position(lua, target_pos)?;
+
+        match func.call::<bool>((player_tbl, target_tbl, item_tbl, from_pos, target_pos_tbl)) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                tracing::error!("Lua weapon callback error: {e}");
+                Ok(false)
+            }
+        }
+    })().unwrap_or(false);
+
+    ScriptEnvironment::reset();
+    result
+}
+
 /// Fire `onStepIn` or `onStepOut` events for a creature moving to/from `tile_pos`.
 /// `event_type`: 0 = StepIn, 1 = StepOut.
 /// Mirrors `MoveEvents::onCreatureMove`.

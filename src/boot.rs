@@ -163,12 +163,7 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     game.set_game_state(GameState::Startup);
     init_game(game);
 
-    // Load script systems (events, spells, actions, etc.).
-    println!(">> Loading lua scripts");
-    crate::lua::ScriptingManager::load_script_systems().map_err(|e| anyhow!("{e}"))?;
-
-    // Load vocations from data/XML/, mirroring the C++ data/XML/*.xml layout;
-    // fall back to data/ root for either layout.
+    // Load vocations BEFORE scripts — Lua spells reference g_vocations() at load time.
     let voc_path = first_existing(&["data/XML/vocations.xml", "data/vocations.xml"]);
     if let Some(voc_path) = voc_path {
         let vocations = crate::world::vocation::Vocations::load_from_xml(voc_path)
@@ -177,6 +172,10 @@ async fn async_run(options: Options) -> Result<ExitStatus> {
     } else {
         crate::world::vocation::init_vocations(crate::world::vocation::Vocations::default());
     }
+
+    // Load script systems (events, spells, actions, etc.).
+    println!(">> Loading lua scripts");
+    crate::lua::ScriptingManager::load_script_systems().map_err(|e| anyhow!("{e}"))?;
 
     // Load groups.
     let groups_path = first_existing(&["data/XML/groups.xml", "data/groups.xml"]);

@@ -163,13 +163,17 @@ impl Door {
     }
 
     pub fn can_use(&self, _player_id: u32) -> bool {
+        // C++ checks house access level >= subowner, then falls back to access list.
+        // Partial: is_player_allowed exists but doesn't check subowner bypass.
         true
     }
 
     pub fn on_removed(&mut self) {
+        // C++ unlinks this door from its parent house via house->removeDoor(this).
     }
 
     pub fn read_attr(&mut self, _attr: u8, _prop_stream: &[u8]) -> bool {
+        // C++ deserializes ATTR_HOUSEDOORID from binary prop stream.
         false
     }
 }
@@ -209,6 +213,7 @@ impl HouseTransferItem {
     }
 
     pub fn on_trade_event(&self, _event: u8, _buyer_id: u32) -> bool {
+        // C++ ON_TRADE_TRANSFER → executeTransfer + item removal; ON_TRADE_CANCEL → resetTransferItem.
         false
     }
 }
@@ -288,9 +293,6 @@ impl House {
     /// get_door_by_number — port of House::getDoorByNumber.
     pub fn get_door_by_number(&self, door_id: u8) -> Option<Position> {
         self.doors.get(&door_id).copied()
-    }
-
-    pub fn kick_player(&mut self, _player_id: u32) {
     }
 
     pub fn remove_door(&mut self, door_id: u8) {
@@ -385,17 +387,6 @@ impl House {
         AccessHouseLevel::NotInvited
     }
 
-    pub fn update_door_description(&self) {
-    }
-
-    pub fn transfer_to_depot(&self) -> bool {
-        false
-    }
-
-    pub fn transfer_to_depot_player(&self, _player_id: u32) -> bool {
-        false
-    }
-
     /// get_transfer_item — port of House::getTransferItem from house.cpp.
     pub fn get_transfer_item(&mut self) -> &mut HouseTransferItem {
         self.transfer_item.get_or_insert_with(|| HouseTransferItem::create(self.id))
@@ -406,7 +397,16 @@ impl House {
         self.transfer_item = None;
     }
 
+    pub fn kick_player(&mut self, _player_id: u32) {
+        // C++ checks houseTile membership, compares access levels, teleports to entry pos.
+    }
+
+    pub fn update_door_description(&self) {
+        // C++ iterates all doors, sets specialDescription with owner name + house name.
+    }
+
     pub fn execute_transfer(&mut self, _item: &HouseTransferItem, _new_owner_id: u32) -> bool {
+        // C++ validates transferItem == item, calls setOwner(newOwner), clears transferItem.
         false
     }
 }
@@ -465,7 +465,131 @@ impl Houses {
         self.houses.values().find(|h| h.owner == player_id)
     }
 
-    pub fn pay_houses(&self, _rent_period: RentPeriod) {
+}
+
+pub fn transfer_to_depot(game: &mut crate::game::Game, house_id: u32) -> bool {
+    let (town_id, owner) = match game.map.houses.get_house(house_id) {
+        Some(h) => (h.town_id, h.owner),
+        None => return false,
+    };
+    if town_id == 0 || owner == 0 {
+        return false;
+    }
+    let Some(cid) = game.get_player_id_by_guid(owner) else { return false };
+
+    let tiles: Vec<crate::map::Position> = game
+        .map
+        .houses
+        .get_house(house_id)
+        .map(|h| h.tiles.clone())
+        .unwrap_or_default();
+
+    let mut moved: Vec<crate::map::tile::MapItem> = Vec::new();
+    for pos in &tiles {
+        let Some(tile) = game.map.get_tile_mut(*pos) else { continue };
+        let mut kept: Vec<crate::map::tile::MapItem> = Vec::new();
+        for item in std::mem::take(&mut tile.items) {
+            let it = game.items.get_item_type(usize::from(item.server_id));
+            if it.pickupable {
+                moved.push(item);
+            } else if it.group == crate::items::ItemGroup::Container {
+                moved.extend(item.children.iter().cloned());
+                let mut emptied = item;
+                emptied.children.clear();
+                kept.push(emptied);
+            } else {
+                kept.push(item);
+            }
+        }
+        if let Some(tile) = game.map.get_tile_mut(*pos) {
+            tile.items = kept;
+        }
+    }
+
+    if moved.is_empty() {
+        return true;
+    }
+    if let Some(p) = game.get_player_mut(cid) {
+        let depot = p.depot_items.entry(town_id).or_default();
+        for item in moved {
+            depot.insert(0, item);
+        }
+    }
+    true
+}
+
+pub fn set_owner(game: &mut crate::game::Game, house_id: u32, guid: u32) {
+    let (is_loaded, owner, entry, beds, _town_id) = match game.map.houses.get_house(house_id) {
+        Some(h) => (h.is_loaded, h.owner, h.entry_position, h.beds.clone(), h.town_id),
+        None => return,
+    };
+
+    if is_loaded && owner == guid {
+        return;
+    }
+    if let Some(h) = game.map.houses.get_house_mut(house_id) {
+        h.is_loaded = true;
+    }
+
+    if owner != 0 {
+        transfer_to_depot(game, house_id);
+
+        let tiles: Vec<crate::map::Position> = game
+            .map
+            .houses
+            .get_house(house_id)
+            .map(|h| h.tiles.clone())
+            .unwrap_or_default();
+        let mut to_kick: Vec<crate::creatures::CreatureId> = Vec::new();
+        for pos in &tiles {
+            if let Some(tile) = game.map.get_tile(*pos) {
+                for &cid in &tile.creature_ids {
+                    let can_edit = game
+                        .get_player(cid)
+                        .map(|p| p.group_flags & crate::creatures::player::PLAYER_FLAG_CAN_EDIT_HOUSES != 0)
+                        .unwrap_or(true);
+                    if !can_edit {
+                        to_kick.push(cid);
+                    }
+                }
+            }
+        }
+        for cid in to_kick {
+            let old_pos = game.get_player(cid).map(|p| p.base.position);
+            if let Some(old_pos) = old_pos {
+                game.move_creature_position(cid, old_pos, entry);
+                game.add_magic_effect(old_pos, crate::game::CONST_ME_POFF);
+                game.add_magic_effect(entry, crate::game::CONST_ME_TELEPORT);
+            }
+        }
+
+        for bed_pos in &beds {
+            let bed_sid = game.map.get_tile(*bed_pos).and_then(|t| {
+                t.items.iter()
+                    .find(|it| game.items.get_item_type(usize::from(it.server_id)).kind == crate::items::ItemKind::Bed)
+                    .map(|it| (it.server_id, it.sleeper_guid))
+            });
+            if let Some((sid, sleeper)) = bed_sid {
+                if sleeper != 0 {
+                    game.wake_bed_at(*bed_pos, sid);
+                }
+            }
+        }
+
+        if let Some(h) = game.map.houses.get_house_mut(house_id) {
+            h.owner = 0;
+            h.owner_account_id = 0;
+            h.owner_name = String::new();
+            h.guest_list.parse_list("");
+            h.sub_owner_list.parse_list("");
+        }
+    }
+
+    if let Some(h) = game.map.houses.get_house_mut(house_id) {
+        h.rent_warnings = 0;
+        if guid != 0 {
+            h.owner = guid;
+        }
     }
 }
 

@@ -395,3 +395,70 @@ pub fn fire_npc_think(npc_id: CreatureId) {
         true
     });
 }
+
+pub fn npc_think_tick(creature_id: CreatureId) {
+    use crate::creatures::Direction;
+    use crate::game::g_game;
+
+    let (pos, walk_interval, walk_timer, focus_creature) = {
+        let game = g_game().lock().unwrap();
+        let Some(creature) = game.get_creature(creature_id) else { return };
+        let Some(npc) = creature.as_npc() else { return };
+        (creature.position(), npc.walk_interval, npc.walk_timer, npc.focus_creature)
+    };
+
+    fire_npc_think(creature_id);
+
+    if walk_interval == 0 {
+        return;
+    }
+
+    let interval = 250u32;
+    let new_timer = walk_timer + interval;
+    if new_timer < walk_interval {
+        let mut game = g_game().lock().unwrap();
+        if let Some(npc) = game.get_creature_mut(creature_id).and_then(|c| c.as_npc_mut()) {
+            npc.walk_timer = new_timer;
+        }
+        return;
+    }
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(npc) = game.get_creature_mut(creature_id).and_then(|c| c.as_npc_mut()) {
+            npc.walk_timer = 0;
+        }
+    }
+
+    if focus_creature != 0 {
+        return;
+    }
+
+    let dir_val = crate::util::uniform_random(0, 3) as u8;
+    let Some(dir) = Direction::from_u8(dir_val) else { return };
+    let new_pos = pos.offset_direction(dir);
+
+    let (old_stackpos, walkable) = {
+        let game = g_game().lock().unwrap();
+        let walkable = game.map.get_tile(new_pos).map(|t| t.is_walkable()).unwrap_or(false);
+        let old_stackpos = game.map.get_tile(pos).map(|t| t.get_creature_client_stackpos()).unwrap_or(0);
+        (old_stackpos, walkable)
+    };
+
+    if !walkable {
+        return;
+    }
+
+    {
+        let mut game = g_game().lock().unwrap();
+        if let Some(creature) = game.get_creature_mut(creature_id) {
+            creature.base_mut().direction = dir;
+        }
+        game.move_creature_position(creature_id, pos, new_pos);
+    }
+
+    crate::events::dispatch::execute_step_event(creature_id, pos, new_pos, 1);
+    crate::events::dispatch::execute_step_event(creature_id, new_pos, pos, 0);
+
+    crate::net::game_protocol::broadcast_creature_move(creature_id, pos, new_pos, old_stackpos);
+}

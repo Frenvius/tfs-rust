@@ -4483,7 +4483,11 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
     methods.set("getZone", lua.create_function(|_, this: LuaTable| -> LuaResult<u8> {
         let cid = get_creature_id(&this)?;
         let game = g_game().lock().unwrap();
-        Ok(game.get_creature(cid).map(|c| c.get_zone() as u8).unwrap_or(0))
+        Ok(game.get_creature(cid).map(|c| {
+            game.map.get_tile(c.position())
+                .map(|t| t.get_zone() as u8)
+                .unwrap_or(0)
+        }).unwrap_or(0))
     })?)?;
 
     methods.set("teleportTo", lua.create_function(|_, (this, pos_tbl, _push): (LuaTable, LuaTable, Option<bool>)| -> LuaResult<bool> {
@@ -4789,13 +4793,32 @@ fn register_creature_class(lua: &Lua) -> LuaResult<()> {
         Ok(false)
     })?)?;
 
-    methods.set("getPathTo", lua.create_function(|_lua, args: LuaMultiValue| -> LuaResult<LuaValue> {
+    methods.set("getPathTo", lua.create_function(|lua, args: LuaMultiValue| -> LuaResult<LuaValue> {
         let mut iter = args.into_iter();
         let this = match iter.next() { Some(LuaValue::Table(t)) => t, _ => return Ok(LuaValue::Boolean(false)) };
         let pos_table = match iter.next() { Some(LuaValue::Table(t)) => t, _ => return Ok(LuaValue::Boolean(false)) };
-        let _cid = get_creature_id(&this)?;
-        let _target = table_to_position(&pos_table)?;
-        Ok(LuaValue::Boolean(false))
+        let min_target_dist: i32 = match iter.next() { Some(LuaValue::Integer(n)) => n as i32, Some(LuaValue::Number(n)) => n as i32, _ => 0 };
+        let max_target_dist: i32 = match iter.next() { Some(LuaValue::Integer(n)) => n as i32, Some(LuaValue::Number(n)) => n as i32, _ => 1 };
+        let full_path_search: bool = match iter.next() { Some(LuaValue::Boolean(b)) => b, _ => true };
+        let clear_sight: bool = match iter.next() { Some(LuaValue::Boolean(b)) => b, _ => true };
+        let max_search_dist: i32 = match iter.next() { Some(LuaValue::Integer(n)) => n as i32, Some(LuaValue::Number(n)) => n as i32, _ => 0 };
+        let cid = get_creature_id(&this)?;
+        let target = table_to_position(&pos_table)?;
+        let game = g_game().lock().unwrap();
+        let start = match game.get_creature(cid) {
+            Some(c) => c.position(),
+            None => return Ok(LuaValue::Boolean(false)),
+        };
+        match crate::map::find_path(&game.map, start, target, min_target_dist, max_target_dist, full_path_search, clear_sight, max_search_dist) {
+            Some(dirs) => {
+                let t = lua.create_table()?;
+                for (i, d) in dirs.iter().rev().enumerate() {
+                    t.raw_set(i as i64 + 1, *d as u8)?;
+                }
+                Ok(LuaValue::Table(t))
+            }
+            None => Ok(LuaValue::Boolean(false)),
+        }
     })?)?;
 
     methods.set("move", lua.create_function(|_, args: LuaMultiValue| -> LuaResult<u32> {
@@ -10296,6 +10319,11 @@ fn register_weapon_class(lua: &Lua) -> LuaResult<()> {
         Ok(this)
     })?)?;
 
+    methods.set("id", lua.create_function(|_, (this, id): (LuaTable, u16)| -> LuaResult<LuaTable> {
+        this.set("_itemId", id)?;
+        Ok(this)
+    })?)?;
+
     methods.set("register", lua.create_function(|lua, this: LuaTable| -> LuaResult<bool> {
         let callback: Option<LuaFunction> = this.get("onUseWeapon").ok();
         if callback.is_none() {
@@ -10305,9 +10333,11 @@ fn register_weapon_class(lua: &Lua) -> LuaResult<()> {
             }
         }
 
+        let item_id: u16 = this.get("_itemId").unwrap_or(0);
+
         let mut registry = crate::events::registry::g_script_registry().lock()
             .expect("ScriptRegistry mutex poisoned");
-        let _script_id = if let Some(func) = callback {
+        let script_id = if let Some(func) = callback {
             let key = lua.create_registry_value(func)?;
             let id = registry.next_id();
             registry.lua_callbacks.insert(id, key);
@@ -10316,7 +10346,11 @@ fn register_weapon_class(lua: &Lua) -> LuaResult<()> {
             0
         };
 
-        tracing::debug!("[Lua] Weapon registered (from Lua)");
+        if item_id != 0 && script_id != 0 {
+            registry.weapons.insert(item_id, script_id);
+        }
+
+        tracing::debug!("[Lua] Weapon registered item_id={} script_id={}", item_id, script_id);
         Ok(true)
     })?)?;
 
